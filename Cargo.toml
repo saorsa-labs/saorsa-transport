@@ -1,0 +1,36 @@
+[package]
+name = "saorsa-transport"
+version = "0.1.0"
+edition = "2024"
+authors = ["Saorsa Labs <info@saorsalabs.com>"]
+license = "GPL-3.0"
+description = "Shared transport abstraction for the Saorsa ecosystem"
+repository = "https://github.com/dirvine/saorsa-transport"
+keywords = ["p2p", "transport", "quic", "networking"]
+categories = ["network-programming"]
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["sync", "rt", "macros"] }
+async-trait = "0.1"
+futures = "0.3"
+
+# Serialization
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+
+# Error handling
+thiserror = "1"
+
+# Logging
+tracing = "0.1"
+
+# Transport - using path for now, will switch to crates.io
+ant-quic = { path = "../ant-quic", default-features = false }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[features]
+default = []
