@@ -5,7 +5,7 @@ edition = "2024"
 authors = ["Saorsa Labs <info@saorsalabs.com>"]
 license = "GPL-3.0"
 description = "Shared transport abstraction for the Saorsa ecosystem"
-repository = "https://github.com/dirvine/saorsa-transport"
+repository = "https://github.com/saorsa-labs/saorsa-transport"
 keywords = ["p2p", "transport", "quic", "networking"]
 categories = ["network-programming"]
 
@@ -25,8 +25,8 @@ thiserror = "1"
 # Logging
 tracing = "0.1"
 
-# Transport - using path for now, will switch to crates.io
-ant-quic = { path = "../ant-quic", default-features = false }
+# Transport
+ant-quic = { version = "0.16", default-features = false }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
