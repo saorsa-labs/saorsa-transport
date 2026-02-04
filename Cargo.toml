@@ -1,6 +1,6 @@
 [package]
 name = "saorsa-transport"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 authors = ["Saorsa Labs <info@saorsalabs.com>"]
 license = "GPL-3.0"
@@ -26,7 +26,7 @@ thiserror = "1"
 tracing = "0.1"
 
 # Transport
-ant-quic = { version = "0.16", default-features = false }
+ant-quic = { version = "0.21", default-features = false }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
