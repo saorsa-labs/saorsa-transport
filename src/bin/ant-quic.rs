@@ -30,9 +30,7 @@
 
 use ant_quic::host_identity::{HostIdentity, auto_storage};
 use ant_quic::transport::TransportAddr;
-use ant_quic::{
-    ConnectionMethod, MtuConfig, P2pConfig, P2pEndpoint, P2pEvent, PeerId, TraversalPhase,
-};
+use ant_quic::{ConnectionMethod, MtuConfig, P2pConfig, P2pEndpoint, P2pEvent, TraversalPhase};
 use clap::{Parser, Subcommand};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -303,7 +301,6 @@ pub struct NodeMetricsReport {
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // Fields tracked for future use in detailed metrics
 struct PeerState {
-    peer_id: PeerId,
     remote_addr: TransportAddr,
     connected_at: Instant,
     bytes_sent: u64,
@@ -377,18 +374,16 @@ async fn main() -> anyhow::Result<()> {
     let endpoint = P2pEndpoint::new(config).await?;
 
     // Show local info
-    let peer_id = endpoint.peer_id();
     let public_key = endpoint.public_key_bytes();
 
     info!("═══════════════════════════════════════════════════════════════");
     info!("                    NODE IDENTITY");
     info!("═══════════════════════════════════════════════════════════════");
     if args.full_key {
-        info!("Peer ID (full): {}", hex::encode(peer_id.0));
+        info!("Public Key (ML-DSA-65): {}", hex::encode(public_key));
     } else {
-        info!("Peer ID: {}", format_peer_id(&peer_id));
+        info!("Identity: {}...", hex::encode(&public_key[..16]));
     }
-    info!("Public Key (ML-DSA-65): {}", hex::encode(public_key));
 
     if let Some(addr) = endpoint.local_addr() {
         info!("Local Address: {}", addr);
@@ -412,7 +407,7 @@ async fn main() -> anyhow::Result<()> {
     let stats_clone = stats.clone();
 
     // Track peer state for metrics
-    let peer_states: Arc<RwLock<HashMap<PeerId, PeerState>>> =
+    let peer_states: Arc<RwLock<HashMap<SocketAddr, PeerState>>> =
         Arc::new(RwLock::new(HashMap::new()));
 
     // Track discovered external addresses
@@ -476,7 +471,7 @@ async fn main() -> anyhow::Result<()> {
         let node_id = args
             .node_id
             .clone()
-            .unwrap_or_else(|| format_peer_id(&peer_id));
+            .unwrap_or_else(|| hex::encode(&public_key[..8]));
         let location = args.node_location.clone();
         let start_time = Instant::now();
 
@@ -552,29 +547,26 @@ async fn main() -> anyhow::Result<()> {
 
                 let peers = endpoint_counter.connected_peers().await;
                 for peer in peers {
-                    let data = counter.to_be_bytes();
-                    match endpoint_counter.send(&peer.peer_id, &data).await {
-                        Ok(()) => {
-                            stats_counter.counters_sent.fetch_add(1, Ordering::SeqCst);
-                            stats_counter
-                                .bytes_sent
-                                .fetch_add(data.len() as u64, Ordering::SeqCst);
-                            if json {
-                                println!(
-                                    r#"{{"event":"counter_sent","counter":{},"peer":"{}"}}"#,
-                                    counter,
-                                    hex::encode(&peer.peer_id.0[..8])
-                                );
-                            } else {
-                                info!(
-                                    "Sent counter {} to peer {}",
-                                    counter,
-                                    hex::encode(&peer.peer_id.0[..8])
-                                );
+                    if let Some(addr) = peer.remote_addr.as_socket_addr() {
+                        let data = counter.to_be_bytes();
+                        match endpoint_counter.send(&addr, &data).await {
+                            Ok(()) => {
+                                stats_counter.counters_sent.fetch_add(1, Ordering::SeqCst);
+                                stats_counter
+                                    .bytes_sent
+                                    .fetch_add(data.len() as u64, Ordering::SeqCst);
+                                if json {
+                                    println!(
+                                        r#"{{"event":"counter_sent","counter":{},"peer":"{}"}}"#,
+                                        counter, addr
+                                    );
+                                } else {
+                                    info!("Sent counter {} to peer {}", counter, addr);
+                                }
                             }
-                        }
-                        Err(e) => {
-                            debug!("Failed to send counter: {}", e);
+                            Err(e) => {
+                                debug!("Failed to send counter: {}", e);
+                            }
                         }
                     }
                 }
@@ -599,7 +591,7 @@ async fn main() -> anyhow::Result<()> {
                     _ = shutdown_echo.cancelled() => break,
                 };
                 match result {
-                    Ok((peer_id, data)) => {
+                    Ok((peer_addr, data)) => {
                         stats_echo
                             .bytes_received
                             .fetch_add(data.len() as u64, Ordering::SeqCst);
@@ -612,34 +604,25 @@ async fn main() -> anyhow::Result<()> {
                                 if json {
                                     println!(
                                         r#"{{"event":"counter_received","counter":{},"peer":"{}"}}"#,
-                                        counter,
-                                        hex::encode(&peer_id.0[..8])
+                                        counter, peer_addr
                                     );
                                 } else {
-                                    info!(
-                                        "Received counter {} from peer {}",
-                                        counter,
-                                        hex::encode(&peer_id.0[..8])
-                                    );
+                                    info!("Received counter {} from {}", counter, peer_addr);
                                 }
                             }
                         } else if json {
                             println!(
                                 r#"{{"event":"data_received","bytes":{},"peer":"{}"}}"#,
                                 data.len(),
-                                hex::encode(&peer_id.0[..8])
+                                peer_addr
                             );
                         } else {
-                            info!(
-                                "Received {} bytes from peer {}",
-                                data.len(),
-                                hex::encode(&peer_id.0[..8])
-                            );
+                            info!("Received {} bytes from {}", data.len(), peer_addr);
                         }
 
                         // Echo back if enabled
                         if echo_enabled {
-                            if let Err(e) = endpoint_echo.send(&peer_id, &data).await {
+                            if let Err(e) = endpoint_echo.send(&peer_addr, &data).await {
                                 debug!("Failed to echo: {}", e);
                             } else {
                                 stats_echo.echoes_sent.fetch_add(1, Ordering::SeqCst);
@@ -664,11 +647,7 @@ async fn main() -> anyhow::Result<()> {
             info!("Connecting to known peer at {}...", peer_addr);
             match endpoint.connect(*peer_addr).await {
                 Ok(peer) => {
-                    info!(
-                        "Connected to known peer: {} at {}",
-                        format_peer_id(&peer.peer_id),
-                        peer_addr
-                    );
+                    info!("Connected to known peer at {}", peer.remote_addr);
                     stats.connections_initiated.fetch_add(1, Ordering::SeqCst);
                 }
                 Err(e) => {
@@ -687,21 +666,18 @@ async fn main() -> anyhow::Result<()> {
                 peer_addr, args.connect_ipv6
             );
             match endpoint
-                .connect_with_fallback(Some(peer_addr), args.connect_ipv6, None, None)
+                .connect_with_fallback(Some(peer_addr), args.connect_ipv6, None)
                 .await
             {
                 Ok((peer, method)) => {
                     let method: ConnectionMethod = method;
-                    info!(
-                        "✓ Connected to peer {} via {}",
-                        format_peer_id(&peer.peer_id),
-                        method
-                    );
+                    let peer_addr = peer.remote_addr.as_socket_addr().unwrap_or(peer_addr);
+                    info!("Connected to {} via {}", peer_addr, method);
                     stats.connections_initiated.fetch_add(1, Ordering::SeqCst);
 
                     // Run throughput test if requested
                     if args.throughput_test {
-                        run_throughput_test(&endpoint, &peer.peer_id, args.test_size).await?;
+                        run_throughput_test(&endpoint, &peer_addr, args.test_size).await?;
                     }
                 }
                 Err(e) => {
@@ -713,12 +689,13 @@ async fn main() -> anyhow::Result<()> {
             info!("Connecting to peer at {}...", peer_addr);
             match endpoint.connect(peer_addr).await {
                 Ok(peer) => {
-                    info!("Connected to peer: {}", format_peer_id(&peer.peer_id));
+                    let remote = peer.remote_addr.as_socket_addr().unwrap_or(peer_addr);
+                    info!("Connected to peer at {}", remote);
                     stats.connections_initiated.fetch_add(1, Ordering::SeqCst);
 
                     // Run throughput test if requested
                     if args.throughput_test {
-                        run_throughput_test(&endpoint, &peer.peer_id, args.test_size).await?;
+                        run_throughput_test(&endpoint, &remote, args.test_size).await?;
                     }
                 }
                 Err(e) => {
@@ -749,11 +726,7 @@ async fn main() -> anyhow::Result<()> {
 
         match tokio::time::timeout(Duration::from_millis(100), endpoint.accept()).await {
             Ok(Some(peer)) => {
-                info!(
-                    "Accepted connection from peer: {} at {}",
-                    format_peer_id(&peer.peer_id),
-                    peer.remote_addr
-                );
+                info!("Accepted connection from {}", peer.remote_addr);
                 stats.connections_accepted.fetch_add(1, Ordering::SeqCst);
             }
             Ok(None) => {
@@ -792,60 +765,52 @@ async fn main() -> anyhow::Result<()> {
 async fn handle_event_with_state(
     event: &P2pEvent,
     stats: &RuntimeStats,
-    peer_states: &RwLock<HashMap<PeerId, PeerState>>,
+    peer_states: &RwLock<HashMap<SocketAddr, PeerState>>,
     external_addrs: &RwLock<Vec<TransportAddr>>,
     json: bool,
 ) {
     match event {
-        P2pEvent::PeerConnected {
-            peer_id,
-            addr,
-            side,
-        } => {
+        P2pEvent::PeerConnected { addr, side, .. } => {
             // Track peer state with connection direction
             let connection_type = if side.is_client() {
                 "outbound" // We connected to them
             } else {
                 "inbound" // They connected to us
             };
-            let state = PeerState {
-                peer_id: *peer_id,
-                remote_addr: addr.clone(),
-                connected_at: Instant::now(),
-                bytes_sent: 0,
-                bytes_received: 0,
-                connection_type: connection_type.to_string(),
-            };
-            peer_states.write().await.insert(*peer_id, state);
+            if let Some(socket_addr) = addr.as_socket_addr() {
+                let state = PeerState {
+                    remote_addr: addr.clone(),
+                    connected_at: Instant::now(),
+                    bytes_sent: 0,
+                    bytes_received: 0,
+                    connection_type: connection_type.to_string(),
+                };
+                peer_states.write().await.insert(socket_addr, state);
+            }
             stats.direct_connections.fetch_add(1, Ordering::SeqCst);
 
             if json {
                 println!(
-                    r#"{{"event":"peer_connected","peer_id":"{}","addr":"{}","direction":"{}"}}"#,
-                    format_peer_id(peer_id),
-                    addr,
-                    connection_type
+                    r#"{{"event":"peer_connected","addr":"{}","direction":"{}"}}"#,
+                    addr, connection_type
                 );
             } else {
-                info!("Peer connected: {} at {}", format_peer_id(peer_id), addr);
+                info!("Peer connected: {} ({})", addr, connection_type);
             }
         }
-        P2pEvent::PeerDisconnected { peer_id, reason } => {
+        P2pEvent::PeerDisconnected { addr, reason } => {
             // Remove peer state
-            peer_states.write().await.remove(peer_id);
+            if let Some(socket_addr) = addr.as_socket_addr() {
+                peer_states.write().await.remove(&socket_addr);
+            }
 
             if json {
                 println!(
-                    r#"{{"event":"peer_disconnected","peer_id":"{}","reason":"{:?}"}}"#,
-                    format_peer_id(peer_id),
-                    reason
+                    r#"{{"event":"peer_disconnected","addr":"{}","reason":"{:?}"}}"#,
+                    addr, reason
                 );
             } else {
-                info!(
-                    "Peer disconnected: {} ({:?})",
-                    format_peer_id(peer_id),
-                    reason
-                );
+                info!("Peer disconnected: {} ({:?})", addr, reason);
             }
         }
         P2pEvent::ExternalAddressDiscovered { addr } => {
@@ -868,42 +833,37 @@ async fn handle_event_with_state(
                 info!("External address discovered: {}", addr);
             }
         }
-        P2pEvent::NatTraversalProgress { peer_id, phase } => {
+        P2pEvent::NatTraversalProgress { addr, phase } => {
             if matches!(phase, TraversalPhase::Connected) {
                 stats
                     .nat_traversals_completed
                     .fetch_add(1, Ordering::SeqCst);
 
                 // Update connection type to nat_traversed
-                if let Some(state) = peer_states.write().await.get_mut(peer_id) {
+                if let Some(state) = peer_states.write().await.get_mut(addr) {
                     state.connection_type = "nat_traversed".to_string();
                 }
             }
             if json {
                 println!(
-                    r#"{{"event":"nat_traversal_progress","peer_id":"{}","phase":"{:?}"}}"#,
-                    format_peer_id(peer_id),
-                    phase
+                    r#"{{"event":"nat_traversal_progress","addr":"{}","phase":"{:?}"}}"#,
+                    addr, phase
                 );
             } else {
-                info!(
-                    "NAT traversal progress: {} - {:?}",
-                    format_peer_id(peer_id),
-                    phase
-                );
+                info!("NAT traversal progress: {} - {:?}", addr, phase);
             }
         }
-        P2pEvent::DataReceived { peer_id, bytes } => {
+        P2pEvent::DataReceived { addr, bytes } => {
             stats
                 .bytes_received
                 .fetch_add(*bytes as u64, Ordering::SeqCst);
 
             // Update peer bytes received
-            if let Some(state) = peer_states.write().await.get_mut(peer_id) {
+            if let Some(state) = peer_states.write().await.get_mut(addr) {
                 state.bytes_received += *bytes as u64;
             }
 
-            debug!("Received {} bytes from {}", bytes, format_peer_id(peer_id));
+            debug!("Received {} bytes from {}", bytes, addr);
         }
         _ => {
             debug!("Event: {:?}", event);
@@ -1021,7 +981,7 @@ fn print_final_stats(stats: &RuntimeStats, duration: Duration, json: bool) {
 
 async fn run_throughput_test(
     endpoint: &P2pEndpoint,
-    peer_id: &PeerId,
+    addr: &SocketAddr,
     data_size: usize,
 ) -> anyhow::Result<()> {
     info!("Starting throughput test ({} bytes)...", data_size);
@@ -1029,7 +989,7 @@ async fn run_throughput_test(
     let data = vec![0xABu8; data_size];
     let start = Instant::now();
 
-    match endpoint.send(peer_id, &data).await {
+    match endpoint.send(addr, &data).await {
         Ok(()) => {
             let elapsed = start.elapsed();
             let throughput = data_size as f64 / elapsed.as_secs_f64();
@@ -1046,11 +1006,6 @@ async fn run_throughput_test(
     }
 
     Ok(())
-}
-
-fn format_peer_id(peer_id: &PeerId) -> String {
-    let bytes = &peer_id.0;
-    hex::encode(&bytes[..8])
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -1145,7 +1100,7 @@ async fn build_metrics_report(
     start_time: Instant,
     endpoint: &P2pEndpoint,
     stats: &RuntimeStats,
-    peer_states: &RwLock<HashMap<PeerId, PeerState>>,
+    peer_states: &RwLock<HashMap<SocketAddr, PeerState>>,
     external_addrs: &RwLock<Vec<TransportAddr>>,
     prev_bytes: &mut u64,
     prev_time: &mut Instant,
@@ -1178,10 +1133,11 @@ async fn build_metrics_report(
     let peer_states_read = peer_states.read().await;
     let connected_peers: Vec<PeerInfo> = peers
         .iter()
-        .map(|p| {
-            let state = peer_states_read.get(&p.peer_id);
-            PeerInfo {
-                peer_id: hex::encode(&p.peer_id.0[..8]),
+        .filter_map(|p| {
+            let socket_addr = p.remote_addr.as_socket_addr()?;
+            let state = peer_states_read.get(&socket_addr);
+            Some(PeerInfo {
+                peer_id: socket_addr.to_string(),
                 remote_addr: p.remote_addr.to_string(),
                 connected_at: state
                     .map(|s| s.connected_at.elapsed().as_secs())
@@ -1191,7 +1147,7 @@ async fn build_metrics_report(
                 connection_type: state
                     .map(|s| s.connection_type.clone())
                     .unwrap_or_else(|| "direct".to_string()),
-            }
+            })
         })
         .collect();
 

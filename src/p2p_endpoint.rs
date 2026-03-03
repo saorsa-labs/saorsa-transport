@@ -32,7 +32,7 @@
 //!         .build()?;
 //!
 //!     let endpoint = P2pEndpoint::new(config).await?;
-//!     println!("Peer ID: {:?}", endpoint.peer_id());
+//!     println!("Public key: {:?}", endpoint.local_public_key());
 //!
 //!     // Subscribe to events
 //!     let mut events = endpoint.subscribe();
@@ -50,8 +50,6 @@
 //! ```
 
 use std::collections::HashMap;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -70,16 +68,15 @@ use crate::connection_strategy::{
 };
 use crate::constrained::ConnectionId as ConstrainedConnectionId;
 use crate::constrained::EngineEvent;
-use crate::crypto::raw_public_keys::key_utils::{
-    derive_peer_id_from_public_key, generate_ml_dsa_keypair,
-};
+use crate::crypto::raw_public_keys::key_utils::generate_ml_dsa_keypair;
 use crate::happy_eyeballs::{self, HappyEyeballsConfig};
 pub use crate::nat_traversal_api::TraversalPhase;
 use crate::nat_traversal_api::{
-    NatTraversalEndpoint, NatTraversalError, NatTraversalEvent, NatTraversalStatistics, PeerId,
+    NatTraversalEndpoint, NatTraversalError, NatTraversalEvent, NatTraversalStatistics,
 };
 use crate::transport::{ProtocolEngine, TransportAddr, TransportRegistry};
 use crate::unified_config::P2pConfig;
+use rustls;
 
 /// Event channel capacity
 const EVENT_CHANNEL_CAPACITY: usize = 256;
@@ -103,40 +100,17 @@ const HEALTH_CHECK_EVICTION_THRESHOLD: Duration = Duration::from_secs(60);
 
 use crate::SHUTDOWN_DRAIN_TIMEOUT;
 
-/// Derive a synthetic PeerId by hashing a `TransportAddr` display string.
+/// Extract the raw SPKI (SubjectPublicKeyInfo) bytes from a QUIC connection's
+/// peer identity, if TLS-based authentication was used.
 ///
-/// Used for constrained connections (BLE, LoRa) where no TLS-based identity exists.
-///
-/// **Note:** Uses `DefaultHasher`, whose output is not stable across Rust versions.
-/// These IDs are ephemeral within a single process and must not be persisted or
-/// compared across builds.
-fn peer_id_from_transport_addr(addr: &TransportAddr) -> PeerId {
-    let mut hasher = DefaultHasher::new();
-    format!("{}", addr).hash(&mut hasher);
-    let hash = hasher.finish();
-
-    let mut id = [0u8; 32];
-    id[..8].copy_from_slice(&hash.to_le_bytes());
-    id[8..16].copy_from_slice(&hash.to_be_bytes());
-    PeerId(id)
-}
-
-/// Derive a synthetic PeerId by hashing a `SocketAddr`.
-///
-/// Used when the peer's real identity (ML-DSA-65 key) is not yet known.
-///
-/// **Note:** Uses `DefaultHasher`, whose output is not stable across Rust versions.
-/// These IDs are ephemeral within a single process and must not be persisted or
-/// compared across builds.
-fn peer_id_from_socket_addr(addr: SocketAddr) -> PeerId {
-    let mut hasher = DefaultHasher::new();
-    addr.hash(&mut hasher);
-    let hash = hasher.finish();
-
-    let mut id = [0u8; 32];
-    id[..8].copy_from_slice(&hash.to_le_bytes());
-    id[8..10].copy_from_slice(&addr.port().to_le_bytes());
-    PeerId(id)
+/// Returns `None` for unauthenticated or constrained connections.
+fn extract_public_key_bytes_from_connection(
+    connection: &crate::high_level::Connection,
+) -> Option<Vec<u8>> {
+    let identity = connection.peer_identity()?;
+    let certs = identity.downcast_ref::<Vec<rustls::pki_types::CertificateDer<'static>>>()?;
+    let cert = certs.first()?;
+    Some(cert.as_ref().to_vec())
 }
 
 /// P2P endpoint - the primary API for ant-quic
@@ -148,8 +122,8 @@ pub struct P2pEndpoint {
     inner: Arc<NatTraversalEndpoint>,
 
     // v0.2: auth_manager removed - TLS handles peer authentication via ML-DSA-65
-    /// Connected peers with their addresses
-    connected_peers: Arc<RwLock<HashMap<PeerId, PeerConnection>>>,
+    /// Connected peers keyed by remote socket address
+    connected_peers: Arc<RwLock<HashMap<SocketAddr, PeerConnection>>>,
 
     /// Endpoint statistics
     stats: Arc<RwLock<EndpointStats>>,
@@ -160,10 +134,10 @@ pub struct P2pEndpoint {
     /// Event broadcaster
     event_tx: broadcast::Sender<P2pEvent>,
 
-    /// Our peer ID
-    peer_id: PeerId,
+    /// SPKI fingerprint of our own ML-DSA-65 public key (BLAKE3 hash)
+    our_fingerprint: [u8; 32],
 
-    /// Our ML-DSA-65 public key bytes (for identity sharing) - 1952 bytes
+    /// Our ML-DSA-65 public key SPKI bytes (for identity sharing)
     public_key: Vec<u8>,
 
     /// Shutdown token for cooperative cancellation
@@ -187,36 +161,36 @@ pub struct P2pEndpoint {
     /// engine (for BLE/LoRa) based on transport capabilities.
     router: Arc<RwLock<ConnectionRouter>>,
 
-    /// Mapping from PeerId to ConnectionId for constrained connections
+    /// Mapping from TransportAddr to ConnectionId for constrained connections
     ///
     /// When a peer is connected via a constrained transport (BLE, LoRa, etc.),
-    /// this map stores the ConstrainedEngine's ConnectionId for that peer.
+    /// this map stores the ConstrainedEngine's ConnectionId for that address.
     /// UDP/QUIC peers are NOT in this map - they use the standard QUIC connection.
-    constrained_connections: Arc<RwLock<HashMap<PeerId, ConstrainedConnectionId>>>,
+    constrained_connections: Arc<RwLock<HashMap<TransportAddr, ConstrainedConnectionId>>>,
 
-    /// Reverse lookup: ConnectionId → (PeerId, TransportAddr) for constrained connections
+    /// Reverse lookup: ConnectionId → TransportAddr for constrained connections
     ///
-    /// This enables mapping incoming constrained data back to the correct PeerId.
+    /// This enables mapping incoming constrained data back to the correct remote address.
     /// Registered when ConnectionAccepted/Established fires for constrained transports.
-    constrained_peer_addrs: Arc<RwLock<HashMap<ConstrainedConnectionId, (PeerId, TransportAddr)>>>,
+    constrained_peer_addrs: Arc<RwLock<HashMap<ConstrainedConnectionId, TransportAddr>>>,
 
     /// Channel sender for data received from QUIC reader tasks and constrained poller
-    data_tx: mpsc::Sender<(PeerId, Vec<u8>)>,
+    data_tx: mpsc::Sender<(SocketAddr, Vec<u8>)>,
 
     /// Channel receiver for data received from QUIC reader tasks and constrained poller
-    data_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<(PeerId, Vec<u8>)>>>,
+    data_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<(SocketAddr, Vec<u8>)>>>,
 
-    /// JoinSet tracking background reader tasks (each returns PeerId on exit)
-    reader_tasks: Arc<tokio::sync::Mutex<tokio::task::JoinSet<PeerId>>>,
+    /// JoinSet tracking background reader tasks (each returns SocketAddr on exit)
+    reader_tasks: Arc<tokio::sync::Mutex<tokio::task::JoinSet<SocketAddr>>>,
 
-    /// Per-peer abort handles for targeted reader task cancellation
-    reader_handles: Arc<RwLock<HashMap<PeerId, tokio::task::AbortHandle>>>,
+    /// Per-address abort handles for targeted reader task cancellation
+    reader_handles: Arc<RwLock<HashMap<SocketAddr, tokio::task::AbortHandle>>>,
 }
 
 impl std::fmt::Debug for P2pEndpoint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("P2pEndpoint")
-            .field("peer_id", &self.peer_id)
+            .field("public_key_len", &self.public_key.len())
             .field("config", &self.config)
             .finish_non_exhaustive()
     }
@@ -236,8 +210,8 @@ pub enum ConnectionHealth {
 /// Connection information for a peer
 #[derive(Debug, Clone)]
 pub struct PeerConnection {
-    /// Remote peer's ID
-    pub peer_id: PeerId,
+    /// Remote peer's ML-DSA-65 SPKI public key bytes (None for constrained/unauthenticated)
+    pub public_key: Option<Vec<u8>>,
 
     /// Remote address (supports all transport types)
     pub remote_addr: TransportAddr,
@@ -373,16 +347,18 @@ impl Default for EndpointStats {
 /// }
 /// ```
 ///
-/// ## Backward-compatible event handling
+/// ## Address-based event handling
 ///
-/// For code that only needs UDP support:
+/// Events use `SocketAddr` as the primary peer identifier:
 ///
 /// ```rust,ignore
 /// match event {
-///     P2pEvent::PeerConnected { peer_id, addr, .. } => {
+///     P2pEvent::PeerConnected { addr, public_key, .. } => {
 ///         if let Some(socket_addr) = addr.as_socket_addr() {
-///             // Works as before with SocketAddr
-///             println!("Peer {} connected from {}", peer_id, socket_addr);
+///             println!("Peer connected from {}", socket_addr);
+///             if let Some(pk) = &public_key {
+///                 println!("  Public key: {} bytes", pk.len());
+///             }
 ///         }
 ///     }
 ///     _ => {}
@@ -396,26 +372,26 @@ pub enum P2pEvent {
     /// transport types (UDP, BLE, LoRa, etc.). Use `addr.as_socket_addr()` to extract
     /// the [`SocketAddr`] for UDP connections, or pattern match for specific transports.
     PeerConnected {
-        /// The unique identifier of the connected peer
-        peer_id: PeerId,
         /// Remote transport address (supports UDP, BLE, LoRa, and other transports)
         addr: TransportAddr,
+        /// Remote peer's ML-DSA-65 SPKI public key bytes (None for constrained/unauthenticated)
+        public_key: Option<Vec<u8>>,
         /// Who initiated the connection (Client = we connected, Server = they connected)
         side: Side,
     },
 
     /// A peer has disconnected.
     PeerDisconnected {
-        /// The unique identifier of the disconnected peer
-        peer_id: PeerId,
+        /// Remote transport address of the disconnected peer
+        addr: TransportAddr,
         /// Reason for the disconnection
         reason: DisconnectReason,
     },
 
     /// NAT traversal progress update.
     NatTraversalProgress {
-        /// Target peer ID for the NAT traversal
-        peer_id: PeerId,
+        /// Target address for the NAT traversal
+        addr: SocketAddr,
         /// Current phase of NAT traversal
         phase: TraversalPhase,
     },
@@ -440,14 +416,16 @@ pub enum P2pEvent {
 
     /// Peer authenticated
     PeerAuthenticated {
-        /// Authenticated peer ID
-        peer_id: PeerId,
+        /// Authenticated peer address
+        addr: SocketAddr,
+        /// Authenticated peer's ML-DSA-65 SPKI public key bytes
+        public_key: Vec<u8>,
     },
 
     /// Data received from peer
     DataReceived {
-        /// Source peer ID
-        peer_id: PeerId,
+        /// Source peer address
+        addr: SocketAddr,
         /// Number of bytes received
         bytes: usize,
     },
@@ -455,8 +433,7 @@ pub enum P2pEvent {
     /// Data received from a constrained transport (BLE, LoRa, etc.)
     ///
     /// This event is generated when data arrives via a non-UDP transport that uses
-    /// the constrained protocol engine. The peer may not have a PeerId assigned yet
-    /// (early in the connection lifecycle).
+    /// the constrained protocol engine.
     ConstrainedDataReceived {
         /// Remote transport address (BLE device ID, LoRa address, etc.)
         remote_addr: TransportAddr,
@@ -510,12 +487,12 @@ pub enum EndpointError {
     Timeout,
 
     /// Peer not found
-    #[error("Peer not found: {0:?}")]
-    PeerNotFound(PeerId),
+    #[error("Peer not found at address: {0}")]
+    PeerNotFound(SocketAddr),
 
     /// Already connected
-    #[error("Already connected to peer: {0:?}")]
-    AlreadyConnected(PeerId),
+    #[error("Already connected to address: {0}")]
+    AlreadyConnected(SocketAddr),
 
     /// Shutdown in progress
     #[error("Endpoint is shutting down")]
@@ -537,34 +514,34 @@ pub enum EndpointError {
 ///
 /// Returns `true` if the peer was actually present in `connected_peers`.
 async fn do_cleanup_connection(
-    connected_peers: &RwLock<HashMap<PeerId, PeerConnection>>,
+    connected_peers: &RwLock<HashMap<SocketAddr, PeerConnection>>,
     inner: &NatTraversalEndpoint,
-    reader_handles: &RwLock<HashMap<PeerId, tokio::task::AbortHandle>>,
+    reader_handles: &RwLock<HashMap<SocketAddr, tokio::task::AbortHandle>>,
     stats: &RwLock<EndpointStats>,
     event_tx: &broadcast::Sender<P2pEvent>,
-    peer_id: &PeerId,
+    addr: &SocketAddr,
     reason: DisconnectReason,
 ) -> bool {
-    let removed = connected_peers.write().await.remove(peer_id);
-    let _ = inner.remove_connection(peer_id);
+    let removed = connected_peers.write().await.remove(addr);
+    let _ = inner.remove_connection(addr);
 
-    // Abort the background reader task for this peer
-    if let Some(handle) = reader_handles.write().await.remove(peer_id) {
+    // Abort the background reader task for this address
+    if let Some(handle) = reader_handles.write().await.remove(addr) {
         handle.abort();
     }
 
-    if removed.is_some() {
+    if let Some(peer_conn) = removed {
         {
             let mut s = stats.write().await;
             s.active_connections = s.active_connections.saturating_sub(1);
         }
 
         let _ = event_tx.send(P2pEvent::PeerDisconnected {
-            peer_id: *peer_id,
+            addr: peer_conn.remote_addr,
             reason,
         });
 
-        info!("Cleaned up connection for peer {:?}", peer_id);
+        info!("Cleaned up connection for addr {}", addr);
         true
     } else {
         false
@@ -581,9 +558,14 @@ impl P2pEndpoint {
                 EndpointError::Config(format!("Failed to generate ML-DSA-65 keypair: {e:?}"))
             })?,
         };
-        let peer_id = derive_peer_id_from_public_key(&public_key);
+        // SPKI fingerprint of our own public key (for identity/logging)
+        let our_fingerprint =
+            crate::crypto::raw_public_keys::pqc::fingerprint_public_key(&public_key);
 
-        info!("Creating P2P endpoint with peer ID: {:?}", peer_id);
+        info!(
+            "Creating P2P endpoint (fingerprint: {})",
+            hex::encode(&our_fingerprint[..8])
+        );
 
         // v0.2: auth_manager removed - TLS handles peer authentication via ML-DSA-65
         // Store public key bytes directly for identity sharing
@@ -614,9 +596,9 @@ impl P2pEndpoint {
                         stats_guard.nat_traversal_attempts += 1;
                     }
                     NatTraversalEvent::ConnectionEstablished {
-                        peer_id,
                         remote_address,
                         side,
+                        public_key,
                     } => {
                         stats_guard.nat_traversal_successes += 1;
                         stats_guard.active_connections += 1;
@@ -624,23 +606,25 @@ impl P2pEndpoint {
 
                         // Broadcast event with connection direction
                         let _ = event_tx.send(P2pEvent::PeerConnected {
-                            peer_id: *peer_id,
                             addr: TransportAddr::Udp(*remote_address),
+                            public_key: public_key.clone(),
                             side: *side,
                         });
                     }
-                    NatTraversalEvent::TraversalFailed { peer_id, .. } => {
+                    NatTraversalEvent::TraversalFailed { remote_address, .. } => {
                         stats_guard.failed_connections += 1;
                         let _ = event_tx.send(P2pEvent::NatTraversalProgress {
-                            peer_id: *peer_id,
+                            addr: *remote_address,
                             phase: TraversalPhase::Failed,
                         });
                     }
                     NatTraversalEvent::PhaseTransition {
-                        peer_id, to_phase, ..
+                        remote_address,
+                        to_phase,
+                        ..
                     } => {
                         let _ = event_tx.send(P2pEvent::NatTraversalProgress {
-                            peer_id: *peer_id,
+                            addr: *remote_address,
                             phase: *to_phase,
                         });
                     }
@@ -741,7 +725,7 @@ impl P2pEndpoint {
             stats,
             config,
             event_tx,
-            peer_id,
+            our_fingerprint,
             public_key: public_key_bytes,
             shutdown: CancellationToken::new(),
             pending_data: Arc::new(RwLock::new(BoundedPendingBuffer::default())),
@@ -766,20 +750,27 @@ impl P2pEndpoint {
         Ok(endpoint)
     }
 
-    /// Get the local peer ID
-    pub fn peer_id(&self) -> PeerId {
-        self.peer_id
+    /// Get the local ML-DSA-65 SPKI public key bytes
+    pub fn local_public_key(&self) -> &[u8] {
+        &self.public_key
     }
 
-    /// Get the underlying QUIC connection for a peer.
+    /// Get the underlying QUIC connection for a remote address.
     ///
-    /// This is used by the LinkTransport abstraction layer to wrap connections.
-    pub fn get_quic_connection(
+    /// Look up an existing QUIC connection by remote address.
+    ///
+    /// Returns `None` if we have no tracked connection for this address.
+    pub async fn get_quic_connection(
         &self,
-        peer_id: &PeerId,
+        addr: &SocketAddr,
     ) -> Result<Option<crate::high_level::Connection>, EndpointError> {
+        let peers = self.connected_peers.read().await;
+        if !peers.contains_key(addr) {
+            return Ok(None);
+        }
+        drop(peers);
         self.inner
-            .get_connection(peer_id)
+            .get_connection(addr)
             .map_err(EndpointError::NatTraversal)
     }
 
@@ -825,46 +816,22 @@ impl P2pEndpoint {
         }
 
         // Dedup check: if we already have a live connection to this address, return it.
-        // This prevents creating duplicate connections when connect_addr() is called
-        // multiple times to the same target (e.g. during reconnect loops).
         {
             let peers = self.connected_peers.read().await;
-            for (_, existing) in peers.iter() {
-                if existing.remote_addr == TransportAddr::Udp(addr) {
-                    // Verify the underlying QUIC connection is still alive
-                    if let Some(peer_id) = peers
-                        .iter()
-                        .find(|(_, p)| p.remote_addr == TransportAddr::Udp(addr))
-                        .map(|(id, _)| *id)
-                    {
-                        if self.inner.is_peer_connected(&peer_id) {
-                            info!(
-                                "connect: reusing existing live connection to {} (peer {:?})",
-                                addr, peer_id
-                            );
-                            return Ok(existing.clone());
-                        }
-                    }
-                    break;
+            if let Some(existing) = peers.get(&addr) {
+                // Verify the underlying QUIC connection is still alive
+                if self.inner.is_connected(&addr) {
+                    info!("connect: reusing existing live connection to {}", addr);
+                    return Ok(existing.clone());
                 }
             }
         }
-        // If a dead connection was found, is_peer_connected() already cleaned it up.
-        // Remove stale entry from connected_peers too.
+        // If a dead connection was found, remove stale entry.
         {
             let mut peers = self.connected_peers.write().await;
-            let stale_peer_ids: Vec<PeerId> = peers
-                .iter()
-                .filter(|(_, p)| p.remote_addr == TransportAddr::Udp(addr))
-                .filter(|(id, _)| !self.inner.is_peer_connected(id))
-                .map(|(id, _)| *id)
-                .collect();
-            for stale_id in &stale_peer_ids {
-                peers.remove(stale_id);
-                info!(
-                    "connect: removed stale connection entry for peer {:?} at {}",
-                    stale_id, addr
-                );
+            if peers.contains_key(&addr) && !self.inner.is_connected(&addr) {
+                peers.remove(&addr);
+                info!("connect: removed stale connection entry for {}", addr);
             }
         }
 
@@ -902,41 +869,32 @@ impl P2pEndpoint {
             }
         };
 
-        // Prefer peer ID derived from the authenticated public key.
-        let peer_id = self
-            .inner
-            .extract_peer_id_from_connection(&connection)
-            .await
-            .unwrap_or_else(|| peer_id_from_socket_addr(addr));
+        // Extract the public key from the TLS handshake
+        let remote_public_key = extract_public_key_bytes_from_connection(&connection);
 
         // Post-handshake dedup: if we already have a live connection to this
-        // peer (e.g. from a simultaneous open), just overwrite it with the new
-        // outgoing connection.  The accept() path does the same — both sides
-        // converge on the most recent healthy connection.  Previous attempts
-        // at deterministic tiebreaking (close one side, keep the other) caused
-        // cascading race conditions: retry storms, infinite accept loops, and
-        // "closed by peer: duplicate" errors.
-        if self.inner.is_peer_connected(&peer_id) {
+        // address, just overwrite it with the new outgoing connection.
+        if self.inner.is_connected(&addr) {
             debug!(
-                "connect: simultaneous open for peer {:?} — overwriting existing connection",
-                peer_id
+                "connect: simultaneous open for {} — overwriting existing connection",
+                addr
             );
         }
 
-        // Store connection
+        // Store connection in inner layer (keyed by remote SocketAddr)
         self.inner
-            .add_connection(peer_id, connection.clone())
+            .add_connection(addr, connection.clone())
             .map_err(EndpointError::NatTraversal)?;
 
         // Spawn handler (we initiated the connection = Client side)
         self.inner
-            .spawn_connection_handler(peer_id, connection, Side::Client)
+            .spawn_connection_handler(addr, connection, Side::Client)
             .map_err(EndpointError::NatTraversal)?;
 
         // Create peer connection record
         // v0.2: Peer is authenticated via TLS (ML-DSA-65) during handshake
         let peer_conn = PeerConnection {
-            peer_id,
+            public_key: remote_public_key.clone(),
             remote_addr: TransportAddr::Udp(addr),
             authenticated: true, // TLS handles authentication
             connected_at: Instant::now(),
@@ -948,15 +906,15 @@ impl P2pEndpoint {
         // Spawn background reader task BEFORE storing peer in connected_peers
         // This prevents a race where recv() called immediately after connect()
         // returns might miss early data if the peer sends before the task starts
-        if let Ok(Some(conn)) = self.inner.get_connection(&peer_id) {
-            self.spawn_reader_task(peer_id, conn).await;
+        if let Ok(Some(conn)) = self.inner.get_connection(&addr) {
+            self.spawn_reader_task(addr, conn).await;
         }
 
         // Store peer (reader task is already running, so no data loss window)
         self.connected_peers
             .write()
             .await
-            .insert(peer_id, peer_conn.clone());
+            .insert(addr, peer_conn.clone());
 
         // Update stats
         {
@@ -968,8 +926,8 @@ impl P2pEndpoint {
 
         // Broadcast event (we initiated the connection = Client side)
         let _ = self.event_tx.send(P2pEvent::PeerConnected {
-            peer_id,
             addr: TransportAddr::Udp(addr),
+            public_key: remote_public_key,
             side: Side::Client,
         });
 
@@ -1000,7 +958,6 @@ impl P2pEndpoint {
     pub async fn connect_transport(
         &self,
         addr: &TransportAddr,
-        peer_id: Option<PeerId>,
     ) -> Result<PeerConnection, EndpointError> {
         if self.shutdown.is_cancelled() {
             return Err(EndpointError::ShuttingDown);
@@ -1010,10 +967,7 @@ impl P2pEndpoint {
         let mut router = self.router.write().await;
         let engine = router.select_engine_for_addr(addr);
 
-        info!(
-            "Connecting to {} via {:?} engine (peer_id: {:?})",
-            addr, engine, peer_id
-        );
+        info!("Connecting to {} via {:?} engine", addr, engine);
 
         match engine {
             ProtocolEngine::Quic => {
@@ -1033,25 +987,25 @@ impl P2pEndpoint {
                     EndpointError::Connection(format!("Constrained connection failed: {}", e))
                 })?;
 
-                // Create a synthetic peer ID for constrained connections if not provided
-                let actual_peer_id = peer_id.unwrap_or_else(|| peer_id_from_transport_addr(addr));
+                // Use a synthetic socket address for constrained connections
+                let synthetic_addr = addr.to_synthetic_socket_addr();
 
                 let peer_conn = PeerConnection {
-                    peer_id: actual_peer_id,
+                    public_key: None, // Constrained connections don't have TLS auth yet
                     remote_addr: addr.clone(),
-                    authenticated: false, // Constrained connections don't have TLS auth yet
+                    authenticated: false,
                     connected_at: Instant::now(),
                     last_activity: Instant::now(),
                     last_health_ping_sent: None,
                     last_health_pong_received: None,
                 };
 
-                // Store peer
+                // Store peer keyed by synthetic address
                 drop(router); // Release lock before acquiring connected_peers lock
                 self.connected_peers
                     .write()
                     .await
-                    .insert(actual_peer_id, peer_conn.clone());
+                    .insert(synthetic_addr, peer_conn.clone());
 
                 // Update stats
                 {
@@ -1062,8 +1016,8 @@ impl P2pEndpoint {
 
                 // Broadcast event
                 let _ = self.event_tx.send(P2pEvent::PeerConnected {
-                    peer_id: actual_peer_id,
                     addr: addr.clone(),
+                    public_key: None,
                     side: Side::Client,
                 });
 
@@ -1087,72 +1041,65 @@ impl P2pEndpoint {
         self.router.read().await.stats().clone()
     }
 
-    /// Register a constrained connection for a peer
+    /// Register a constrained connection for a transport address
     ///
-    /// This associates a PeerId with a ConstrainedEngine ConnectionId, enabling
+    /// This associates a TransportAddr with a ConstrainedEngine ConnectionId, enabling
     /// send() to use the proper constrained protocol for reliable delivery.
     ///
     /// # Arguments
     ///
-    /// * `peer_id` - The peer's identity
+    /// * `addr` - The remote transport address
     /// * `conn_id` - The ConnectionId from the ConstrainedEngine
     ///
     /// # Returns
     ///
-    /// The previous ConnectionId if one was already registered for this peer.
+    /// The previous ConnectionId if one was already registered for this address.
     pub async fn register_constrained_connection(
         &self,
-        peer_id: PeerId,
+        addr: TransportAddr,
         conn_id: ConstrainedConnectionId,
     ) -> Option<ConstrainedConnectionId> {
         let old = self
             .constrained_connections
             .write()
             .await
-            .insert(peer_id, conn_id);
+            .insert(addr.clone(), conn_id);
         debug!(
-            "Registered constrained connection for peer {:?}: conn_id={:?}",
-            peer_id, conn_id
+            "Registered constrained connection for addr {}: conn_id={:?}",
+            addr, conn_id
         );
         old
     }
 
-    /// Unregister a constrained connection for a peer
+    /// Unregister a constrained connection for a transport address
     ///
     /// Call this when a constrained connection is closed or reset.
     ///
     /// # Returns
     ///
-    /// The ConnectionId if one was registered for this peer.
+    /// The ConnectionId if one was registered for this address.
     pub async fn unregister_constrained_connection(
         &self,
-        peer_id: &PeerId,
+        addr: &TransportAddr,
     ) -> Option<ConstrainedConnectionId> {
-        let removed = self.constrained_connections.write().await.remove(peer_id);
+        let removed = self.constrained_connections.write().await.remove(addr);
         if removed.is_some() {
-            debug!("Unregistered constrained connection for peer {:?}", peer_id);
+            debug!("Unregistered constrained connection for addr {}", addr);
         }
         removed
     }
 
-    /// Check if a peer has a constrained connection
-    pub async fn has_constrained_connection(&self, peer_id: &PeerId) -> bool {
-        self.constrained_connections
-            .read()
-            .await
-            .contains_key(peer_id)
+    /// Check if a transport address has a constrained connection
+    pub async fn has_constrained_connection(&self, addr: &TransportAddr) -> bool {
+        self.constrained_connections.read().await.contains_key(addr)
     }
 
-    /// Get the ConnectionId for a peer's constrained connection
+    /// Get the ConnectionId for a transport address's constrained connection
     pub async fn get_constrained_connection_id(
         &self,
-        peer_id: &PeerId,
+        addr: &TransportAddr,
     ) -> Option<ConstrainedConnectionId> {
-        self.constrained_connections
-            .read()
-            .await
-            .get(peer_id)
-            .copied()
+        self.constrained_connections.read().await.get(addr).copied()
     }
 
     /// Get the number of active constrained connections
@@ -1160,16 +1107,16 @@ impl P2pEndpoint {
         self.constrained_connections.read().await.len()
     }
 
-    /// Look up PeerId from constrained ConnectionId
-    pub async fn peer_id_from_constrained_conn(
+    /// Look up TransportAddr from constrained ConnectionId
+    pub async fn addr_from_constrained_conn(
         &self,
         conn_id: ConstrainedConnectionId,
-    ) -> Option<PeerId> {
+    ) -> Option<TransportAddr> {
         self.constrained_peer_addrs
             .read()
             .await
             .get(&conn_id)
-            .map(|(peer_id, _)| *peer_id)
+            .cloned()
     }
 
     /// Connect to a peer using dual-stack strategy (tries both IPv4 and IPv6 in parallel)
@@ -1196,7 +1143,6 @@ impl P2pEndpoint {
     ///
     /// # Arguments
     /// * `addresses` - List of candidate addresses (mix of IPv4 and IPv6)
-    /// * `peer_id` - Optional peer ID (for token persistence and 0-RTT/Fast Reconnect)
     ///
     /// # Returns
     /// Primary connection (IPv6 preferred if both succeed)
@@ -1207,7 +1153,6 @@ impl P2pEndpoint {
     pub async fn connect_dual_stack(
         &self,
         addresses: &[SocketAddr],
-        peer_id: Option<PeerId>,
     ) -> Result<PeerConnection, EndpointError> {
         if self.shutdown.is_cancelled() {
             return Err(EndpointError::ShuttingDown);
@@ -1227,10 +1172,9 @@ impl P2pEndpoint {
             .collect();
 
         info!(
-            "Dual-stack connect: {} IPv4, {} IPv6 addresses (PeerId: {:?})",
+            "Dual-stack connect: {} IPv4, {} IPv6 addresses",
             ipv4_addrs.len(),
             ipv6_addrs.len(),
-            peer_id
         );
 
         // Use "peer" as SNI for all P2P connections
@@ -1327,43 +1271,12 @@ impl P2pEndpoint {
         None
     }
 
-    /// Connect to a peer using cached information (addresses, tokens)
+    /// Connect to a peer by target address using NAT traversal
     ///
-    /// This method retrieves the peer from `BootstrapCache` and attempts to connect
-    /// using its known addresses. It leverages `connect_dual_stack` with the `PeerId`
-    /// to enable token-based 0-RTT/Fast Reconnect.
-    pub async fn connect_cached(&self, peer_id: PeerId) -> Result<PeerConnection, EndpointError> {
-        if self.shutdown.is_cancelled() {
-            return Err(EndpointError::ShuttingDown);
-        }
-
-        // Check if already connected
-        if let Some(conn) = self.connected_peers.read().await.get(&peer_id) {
-            return Ok(conn.clone());
-        }
-
-        // Retrieve from cache
-        let cached_peer = self
-            .bootstrap_cache
-            .get_peer(&peer_id)
-            .await
-            .ok_or(EndpointError::PeerNotFound(peer_id))?;
-
-        debug!(
-            "Connecting to cached peer {:?} ({} addresses)",
-            peer_id,
-            cached_peer.addresses.len()
-        );
-
-        // Try dual-stack connection with PeerId (triggers token usage)
-        self.connect_dual_stack(&cached_peer.addresses, Some(peer_id))
-            .await
-    }
-
-    /// Connect to a peer by ID using NAT traversal
-    pub async fn connect_to_peer(
+    /// Uses the inner NAT traversal layer to coordinate hole punching.
+    pub(crate) async fn connect_to_peer(
         &self,
-        peer_id: PeerId,
+        target_addr: SocketAddr,
         coordinator: Option<SocketAddr>,
     ) -> Result<PeerConnection, EndpointError> {
         if self.shutdown.is_cancelled() {
@@ -1380,19 +1293,19 @@ impl P2pEndpoint {
             .ok_or_else(|| EndpointError::Config("No coordinator available".to_string()))?;
 
         info!(
-            "Initiating NAT traversal to peer {:?} via coordinator {}",
-            peer_id, coord_addr
+            "Initiating NAT traversal to {} via coordinator {}",
+            target_addr, coord_addr
         );
 
         // Broadcast progress
         let _ = self.event_tx.send(P2pEvent::NatTraversalProgress {
-            peer_id,
+            addr: target_addr,
             phase: TraversalPhase::Discovery,
         });
 
-        // Initiate NAT traversal
+        // Initiate NAT traversal (inner layer now uses SocketAddr)
         self.inner
-            .initiate_nat_traversal(peer_id, coord_addr)
+            .initiate_nat_traversal(target_addr, coord_addr)
             .map_err(EndpointError::NatTraversal)?;
 
         // Poll for completion using event-driven notification instead of sleep loop
@@ -1416,15 +1329,15 @@ impl P2pEndpoint {
             for event in events {
                 match event {
                     NatTraversalEvent::ConnectionEstablished {
-                        peer_id: evt_peer,
                         remote_address,
-                        side: _, // We initiated this NAT traversal, side is Client
-                    } if evt_peer == peer_id => {
+                        public_key,
+                        ..
+                    } if remote_address == target_addr => {
                         // v0.2: Peer is authenticated via TLS (ML-DSA-65) during handshake
                         let peer_conn = PeerConnection {
-                            peer_id,
+                            public_key: public_key.clone(),
                             remote_addr: TransportAddr::Udp(remote_address),
-                            authenticated: true, // TLS handles authentication
+                            authenticated: true,
                             connected_at: Instant::now(),
                             last_activity: Instant::now(),
                             last_health_ping_sent: None,
@@ -1433,22 +1346,22 @@ impl P2pEndpoint {
 
                         // Spawn background reader task BEFORE storing in connected_peers
                         // to prevent race where recv() misses early data
-                        if let Ok(Some(conn)) = self.inner.get_connection(&peer_id) {
-                            self.spawn_reader_task(peer_id, conn).await;
+                        if let Ok(Some(conn)) = self.inner.get_connection(&target_addr) {
+                            self.spawn_reader_task(remote_address, conn).await;
                         }
 
                         self.connected_peers
                             .write()
                             .await
-                            .insert(peer_id, peer_conn.clone());
+                            .insert(remote_address, peer_conn.clone());
 
                         return Ok(peer_conn);
                     }
                     NatTraversalEvent::TraversalFailed {
-                        peer_id: evt_peer,
+                        remote_address,
                         error,
                         ..
-                    } if evt_peer == peer_id => {
+                    } if remote_address == target_addr => {
                         return Err(EndpointError::NatTraversal(error));
                     }
                     _ => {}
@@ -1510,7 +1423,6 @@ impl P2pEndpoint {
         target_ipv4: Option<SocketAddr>,
         target_ipv6: Option<SocketAddr>,
         strategy_config: Option<StrategyConfig>,
-        peer_id: Option<PeerId>,
     ) -> Result<(PeerConnection, ConnectionMethod), EndpointError> {
         if self.shutdown.is_cancelled() {
             return Err(EndpointError::ShuttingDown);
@@ -1560,8 +1472,8 @@ impl P2pEndpoint {
         let mut strategy = ConnectionStrategy::new(config);
 
         info!(
-            "Starting fallback connection: IPv4={:?}, IPv6={:?} (PeerId: {:?})",
-            target_ipv4, target_ipv6, peer_id
+            "Starting fallback connection: IPv4={:?}, IPv6={:?}",
+            target_ipv4, target_ipv6
         );
 
         // Collect direct addresses for Happy Eyeballs racing (RFC 8305)
@@ -1635,9 +1547,9 @@ impl P2pEndpoint {
                                 method, winning_addr
                             );
 
-                            // Complete the connection setup (peer ID, handlers, stats)
+                            // Complete the connection setup (handlers, stats)
                             let peer_conn = self
-                                .finalize_direct_connection(connection, winning_addr, peer_id)
+                                .finalize_direct_connection(connection, winning_addr)
                                 .await?;
                             return Ok((peer_conn, method));
                         }
@@ -1676,13 +1588,9 @@ impl P2pEndpoint {
                     );
 
                     // Use our existing NAT traversal infrastructure
-                    // If peer_id provided, use it. Otherwise derive from address.
-                    let target_peer_id =
-                        peer_id.unwrap_or_else(|| peer_id_from_socket_addr(target));
-
                     match timeout(
                         strategy.holepunch_timeout(),
-                        self.try_hole_punch(target, coordinator, target_peer_id),
+                        self.try_hole_punch(target, coordinator),
                     )
                     .await
                     {
@@ -1764,39 +1672,39 @@ impl P2pEndpoint {
     /// Finalize a direct QUIC connection established by Happy Eyeballs.
     ///
     /// Takes the raw QUIC `Connection` from the successful handshake and completes
-    /// the P2P connection setup: peer ID extraction, connection storage, handler
+    /// the P2P connection setup: public key extraction, connection storage, handler
     /// spawning, stats update, and event broadcast.
     async fn finalize_direct_connection(
         &self,
         connection: crate::high_level::Connection,
         addr: SocketAddr,
-        hint_peer_id: Option<PeerId>,
     ) -> Result<PeerConnection, EndpointError> {
-        // Extract authenticated peer ID from TLS, or derive from address/hint
-        let peer_id = self
-            .inner
-            .extract_peer_id_from_connection(&connection)
-            .await
-            .or(hint_peer_id)
-            .unwrap_or_else(|| peer_id_from_socket_addr(addr));
+        // Extract public key from TLS
+        let remote_public_key = extract_public_key_bytes_from_connection(&connection);
 
-        // Dedup check: if already connected to this peer, use tiebreaker
-        if self.inner.is_peer_connected(&peer_id) {
-            let local_id = self.inner.local_peer_id();
-            let we_keep_client = local_id < peer_id;
+        // Dedup check: if already connected to this address, use fingerprint tiebreaker
+        if self.inner.is_connected(&addr) {
+            // Use our SPKI fingerprint vs remote's for deterministic tiebreaking
+            let remote_fingerprint = remote_public_key
+                .as_deref()
+                .and_then(|pk| {
+                    crate::crypto::raw_public_keys::pqc::fingerprint_public_key_bytes(pk).ok()
+                })
+                .unwrap_or([0u8; 32]);
+            let we_keep_client = self.our_fingerprint < remote_fingerprint;
             if !we_keep_client {
-                // We have the higher PeerId: close this outgoing connection,
+                // We have the higher fingerprint: close this outgoing connection,
                 // keep the existing one (from accept path).
                 info!(
-                    "finalize_direct_connection: simultaneous open for peer {:?} — \
-                     our PeerId is higher, closing outgoing (keeping incoming)",
-                    peer_id
+                    "finalize_direct_connection: simultaneous open for {} — \
+                     closing outgoing (keeping incoming)",
+                    addr
                 );
                 connection.close(0u32.into(), b"duplicate");
                 // Wait briefly for the accept path to populate connected_peers
                 for _ in 0..10 {
                     let peers = self.connected_peers.read().await;
-                    if let Some(existing) = peers.get(&peer_id) {
+                    if let Some(existing) = peers.get(&addr) {
                         return Ok(existing.clone());
                     }
                     drop(peers);
@@ -1806,28 +1714,28 @@ impl P2pEndpoint {
                     "simultaneous open: peer connection not yet available, retry".into(),
                 ));
             }
-            // We have the lower PeerId: keep our outgoing connection,
+            // We have the lower fingerprint: keep our outgoing connection,
             // remove the old one from accept path.
             info!(
-                "finalize_direct_connection: simultaneous open for peer {:?} — \
-                 our PeerId is lower, keeping outgoing (replacing incoming)",
-                peer_id
+                "finalize_direct_connection: simultaneous open for {} — \
+                 keeping outgoing (replacing incoming)",
+                addr
             );
-            let _ = self.inner.remove_connection(&peer_id);
+            let _ = self.inner.remove_connection(&addr);
         }
 
-        // Store in NAT traversal layer
+        // Store in NAT traversal layer (keyed by remote SocketAddr)
         self.inner
-            .add_connection(peer_id, connection.clone())
+            .add_connection(addr, connection.clone())
             .map_err(EndpointError::NatTraversal)?;
 
         // Spawn connection handler (Client side - we initiated)
         self.inner
-            .spawn_connection_handler(peer_id, connection, Side::Client)
+            .spawn_connection_handler(addr, connection, Side::Client)
             .map_err(EndpointError::NatTraversal)?;
 
         let peer_conn = PeerConnection {
-            peer_id,
+            public_key: remote_public_key.clone(),
             remote_addr: TransportAddr::Udp(addr),
             authenticated: true,
             connected_at: Instant::now(),
@@ -1837,14 +1745,14 @@ impl P2pEndpoint {
         };
 
         // Spawn reader task before storing peer to prevent data loss race
-        if let Ok(Some(conn)) = self.inner.get_connection(&peer_id) {
-            self.spawn_reader_task(peer_id, conn).await;
+        if let Ok(Some(conn)) = self.inner.get_connection(&addr) {
+            self.spawn_reader_task(addr, conn).await;
         }
 
         self.connected_peers
             .write()
             .await
-            .insert(peer_id, peer_conn.clone());
+            .insert(addr, peer_conn.clone());
 
         {
             let mut stats = self.stats.write().await;
@@ -1854,8 +1762,8 @@ impl P2pEndpoint {
         }
 
         let _ = self.event_tx.send(P2pEvent::PeerConnected {
-            peer_id,
             addr: TransportAddr::Udp(addr),
+            public_key: remote_public_key,
             side: Side::Client,
         });
 
@@ -1867,7 +1775,6 @@ impl P2pEndpoint {
         &self,
         target: SocketAddr,
         coordinator: SocketAddr,
-        peer_id: PeerId,
     ) -> Result<PeerConnection, EndpointError> {
         // First ensure we're connected to the coordinator
         if !self.is_connected_to_addr(coordinator).await {
@@ -1875,9 +1782,10 @@ impl P2pEndpoint {
             self.connect(coordinator).await?;
         }
 
-        // Initiate NAT traversal
+        // Derive an inner PeerId for the NAT traversal layer from the target address
+        // Initiate NAT traversal (inner layer uses SocketAddr)
         self.inner
-            .initiate_nat_traversal(peer_id, coordinator)
+            .initiate_nat_traversal(target, coordinator)
             .map_err(EndpointError::NatTraversal)?;
 
         // Poll for completion with event-driven notification instead of sleep loop
@@ -1896,12 +1804,12 @@ impl P2pEndpoint {
             for event in events {
                 match event {
                     NatTraversalEvent::ConnectionEstablished {
-                        peer_id: evt_peer,
                         remote_address,
-                        side: _,
-                    } if evt_peer == peer_id || remote_address == target => {
+                        public_key,
+                        ..
+                    } if remote_address == target => {
                         let peer_conn = PeerConnection {
-                            peer_id: evt_peer,
+                            public_key: public_key.clone(),
                             remote_addr: TransportAddr::Udp(remote_address),
                             authenticated: true,
                             connected_at: Instant::now(),
@@ -1911,23 +1819,22 @@ impl P2pEndpoint {
                         };
 
                         // Spawn background reader task BEFORE storing in connected_peers
-                        // to prevent race where recv() misses early data
-                        if let Ok(Some(conn)) = self.inner.get_connection(&evt_peer) {
-                            self.spawn_reader_task(evt_peer, conn).await;
+                        if let Ok(Some(conn)) = self.inner.get_connection(&target) {
+                            self.spawn_reader_task(remote_address, conn).await;
                         }
 
                         self.connected_peers
                             .write()
                             .await
-                            .insert(evt_peer, peer_conn.clone());
+                            .insert(remote_address, peer_conn.clone());
 
                         return Ok(peer_conn);
                     }
                     NatTraversalEvent::TraversalFailed {
-                        peer_id: evt_peer,
+                        remote_address,
                         error,
                         ..
-                    } if evt_peer == peer_id => {
+                    } if remote_address == target => {
                         return Err(EndpointError::NatTraversal(error));
                     }
                     _ => {}
@@ -2001,28 +1908,14 @@ impl P2pEndpoint {
         };
 
         match result {
-            Ok((peer_id, connection)) => {
-                let remote_addr = connection.remote_address();
-                let mut resolved_peer_id = peer_id;
-
-                if let Some(actual_peer_id) = self
-                    .inner
-                    .extract_peer_id_from_connection(&connection)
-                    .await
-                {
-                    if actual_peer_id != peer_id {
-                        let _ = self.inner.remove_connection(&peer_id);
-                        let _ = self
-                            .inner
-                            .add_connection(actual_peer_id, connection.clone());
-                        resolved_peer_id = actual_peer_id;
-                    }
-                }
+            Ok((remote_addr, connection)) => {
+                // Extract public key from TLS handshake
+                let remote_public_key = extract_public_key_bytes_from_connection(&connection);
 
                 // They initiated the connection to us = Server side
                 if let Err(e) =
                     self.inner
-                        .spawn_connection_handler(resolved_peer_id, connection, Side::Server)
+                        .spawn_connection_handler(remote_addr, connection, Side::Server)
                 {
                     error!("Failed to spawn connection handler: {}", e);
                     return None;
@@ -2030,7 +1923,7 @@ impl P2pEndpoint {
 
                 // v0.2: Peer is authenticated via TLS (ML-DSA-65) during handshake
                 let peer_conn = PeerConnection {
-                    peer_id: resolved_peer_id,
+                    public_key: remote_public_key.clone(),
                     remote_addr: TransportAddr::Udp(remote_addr),
                     authenticated: true, // TLS handles authentication
                     connected_at: Instant::now(),
@@ -2041,14 +1934,14 @@ impl P2pEndpoint {
 
                 // Spawn background reader task BEFORE storing in connected_peers
                 // to prevent race where recv() misses early data
-                if let Ok(Some(conn)) = self.inner.get_connection(&resolved_peer_id) {
-                    self.spawn_reader_task(resolved_peer_id, conn).await;
+                if let Ok(Some(conn)) = self.inner.get_connection(&remote_addr) {
+                    self.spawn_reader_task(remote_addr, conn).await;
                 }
 
                 self.connected_peers
                     .write()
                     .await
-                    .insert(resolved_peer_id, peer_conn.clone());
+                    .insert(remote_addr, peer_conn.clone());
 
                 {
                     let mut stats = self.stats.write().await;
@@ -2058,8 +1951,8 @@ impl P2pEndpoint {
 
                 // They initiated the connection to us = Server side
                 let _ = self.event_tx.send(P2pEvent::PeerConnected {
-                    peer_id: resolved_peer_id,
                     addr: TransportAddr::Udp(remote_addr),
+                    public_key: remote_public_key,
                     side: Side::Server,
                 });
 
@@ -2081,36 +1974,36 @@ impl P2pEndpoint {
     /// - Updates stats and emits a disconnect event
     ///
     /// Safe to call even if the peer is not in all structures (idempotent).
-    async fn cleanup_connection(&self, peer_id: &PeerId, reason: DisconnectReason) {
+    async fn cleanup_connection(&self, addr: &SocketAddr, reason: DisconnectReason) {
         do_cleanup_connection(
             &*self.connected_peers,
             &*self.inner,
             &*self.reader_handles,
             &*self.stats,
             &self.event_tx,
-            peer_id,
+            addr,
             reason,
         )
         .await;
     }
 
-    /// Disconnect from a peer
-    pub async fn disconnect(&self, peer_id: &PeerId) -> Result<(), EndpointError> {
-        if self.connected_peers.read().await.contains_key(peer_id) {
-            self.cleanup_connection(peer_id, DisconnectReason::Normal)
+    /// Disconnect from a peer by address
+    pub async fn disconnect(&self, addr: &SocketAddr) -> Result<(), EndpointError> {
+        if self.connected_peers.read().await.contains_key(addr) {
+            self.cleanup_connection(addr, DisconnectReason::Normal)
                 .await;
             Ok(())
         } else {
-            Err(EndpointError::PeerNotFound(*peer_id))
+            Err(EndpointError::PeerNotFound(*addr))
         }
     }
 
-    /// Query the health status of a connection to a specific peer.
+    /// Query the health status of a connection to a specific address.
     ///
-    /// Returns `None` if the peer is not connected.
-    pub async fn connection_health(&self, peer_id: &PeerId) -> Option<ConnectionHealth> {
+    /// Returns `None` if the address is not connected.
+    pub async fn connection_health(&self, addr: &SocketAddr) -> Option<ConnectionHealth> {
         let peers = self.connected_peers.read().await;
-        let pc = peers.get(peer_id)?;
+        let pc = peers.get(addr)?;
 
         // Not yet probed — treat as healthy (just connected)
         let Some(ping_sent) = pc.last_health_ping_sent else {
@@ -2156,7 +2049,7 @@ impl P2pEndpoint {
     ///
     /// # Arguments
     ///
-    /// - `peer_id`: The target peer's identifier
+    /// - `addr`: The target peer's socket address
     /// - `data`: The payload to send
     ///
     /// # Errors
@@ -2166,17 +2059,17 @@ impl P2pEndpoint {
     /// - The peer is not connected
     /// - No suitable transport provider is available
     /// - The send operation fails
-    pub async fn send(&self, peer_id: &PeerId, data: &[u8]) -> Result<(), EndpointError> {
+    pub async fn send(&self, addr: &SocketAddr, data: &[u8]) -> Result<(), EndpointError> {
         if self.shutdown.is_cancelled() {
             return Err(EndpointError::ShuttingDown);
         }
 
-        // Get peer's transport address to determine which engine/transport to use
+        // Get peer's transport address
         let peer_info = self.connected_peers.read().await;
-        let transport_addr = peer_info
-            .get(peer_id)
-            .map(|conn| conn.remote_addr.clone())
-            .ok_or(EndpointError::PeerNotFound(*peer_id))?;
+        let peer_conn = peer_info
+            .get(addr)
+            .ok_or(EndpointError::PeerNotFound(*addr))?;
+        let transport_addr = peer_conn.remote_addr.clone();
         drop(peer_info); // Release read lock before async operations
 
         // Select protocol engine based on transport address
@@ -2190,9 +2083,9 @@ impl P2pEndpoint {
                 // Use existing QUIC connection (UDP transport)
                 let connection = self
                     .inner
-                    .get_connection(peer_id)
+                    .get_connection(addr)
                     .map_err(EndpointError::NatTraversal)?
-                    .ok_or(EndpointError::PeerNotFound(*peer_id))?;
+                    .ok_or(EndpointError::PeerNotFound(*addr))?;
 
                 let mut send_stream = connection
                     .open_uni()
@@ -2208,15 +2101,15 @@ impl P2pEndpoint {
                     .finish()
                     .map_err(|e| EndpointError::Connection(e.to_string()))?;
 
-                debug!("Sent {} bytes to peer {:?} via QUIC", data.len(), peer_id);
+                debug!("Sent {} bytes to {} via QUIC", data.len(), addr);
             }
             crate::transport::ProtocolEngine::Constrained => {
-                // Check if we have an established constrained connection for this peer
+                // Check if we have an established constrained connection for this address
                 let maybe_conn_id = self
                     .constrained_connections
                     .read()
                     .await
-                    .get(peer_id)
+                    .get(&transport_addr)
                     .copied();
 
                 if let Some(conn_id) = maybe_conn_id {
@@ -2238,23 +2131,22 @@ impl P2pEndpoint {
                     }
 
                     debug!(
-                        "Sent {} bytes to peer {:?} via constrained engine ({})",
+                        "Sent {} bytes to {} via constrained engine ({})",
                         data.len(),
-                        peer_id,
+                        addr,
                         transport_addr.transport_type()
                     );
                 } else {
                     // No established connection - send directly via transport
-                    // This path is used for initial connection or connectionless messages
                     self.transport_registry
                         .send(data, &transport_addr)
                         .await
                         .map_err(|e| EndpointError::Connection(e.to_string()))?;
 
                     debug!(
-                        "Sent {} bytes to peer {:?} via constrained transport (direct, {})",
+                        "Sent {} bytes to {} via constrained transport (direct, {})",
                         data.len(),
-                        peer_id,
+                        addr,
                         transport_addr.transport_type()
                     );
                 }
@@ -2262,7 +2154,7 @@ impl P2pEndpoint {
         }
 
         // Update last activity
-        if let Some(peer_conn) = self.connected_peers.write().await.get_mut(peer_id) {
+        if let Some(peer_conn) = self.connected_peers.write().await.get_mut(addr) {
             peer_conn.last_activity = Instant::now();
         }
 
@@ -2278,38 +2170,14 @@ impl P2pEndpoint {
     /// # Errors
     ///
     /// Returns `EndpointError::ShuttingDown` if the endpoint is shutting down.
-    pub async fn recv(&self) -> Result<(PeerId, Vec<u8>), EndpointError> {
+    pub async fn recv(&self) -> Result<(SocketAddr, Vec<u8>), EndpointError> {
         if self.shutdown.is_cancelled() {
             return Err(EndpointError::ShuttingDown);
         }
 
-        // Fast path: check pending data buffer (data buffered during authentication)
-        {
-            let mut pending = self.pending_data.write().await;
-            pending.cleanup_expired();
-
-            if let Some((peer_id, data)) = pending.pop_any() {
-                let data_len = data.len();
-                tracing::trace!(
-                    "Received {} bytes from peer {:?} (from pending buffer)",
-                    data_len,
-                    peer_id
-                );
-
-                // Update last_activity for the peer
-                if let Some(peer_conn) = self.connected_peers.write().await.get_mut(&peer_id) {
-                    peer_conn.last_activity = Instant::now();
-                }
-
-                // Emit DataReceived event
-                let _ = self.event_tx.send(P2pEvent::DataReceived {
-                    peer_id,
-                    bytes: data_len,
-                });
-
-                return Ok((peer_id, data));
-            }
-        }
+        // Note: pending data buffer (BoundedPendingBuffer) still uses PeerId internally.
+        // It is not consulted here; background reader tasks feed the data_rx channel
+        // using SocketAddr as the key.
 
         // Wait for data from the shared channel (fed by background reader tasks),
         // racing against the shutdown token so callers unblock promptly on shutdown.
@@ -2337,18 +2205,16 @@ impl P2pEndpoint {
         self.stats.read().await.clone()
     }
 
-    /// Get metrics for a specific connection
-    pub async fn connection_metrics(&self, peer_id: &PeerId) -> Option<ConnectionMetrics> {
-        let connection = self.inner.get_connection(peer_id).ok()??;
+    /// Get metrics for a specific connection by address
+    pub async fn connection_metrics(&self, addr: &SocketAddr) -> Option<ConnectionMetrics> {
+        let peers = self.connected_peers.read().await;
+        let peer_conn = peers.get(addr)?;
+        let last_activity = Some(peer_conn.last_activity);
+        drop(peers);
+
+        let connection = self.inner.get_connection(addr).ok()??;
         let stats = connection.stats();
         let rtt = connection.rtt();
-
-        let last_activity = self
-            .connected_peers
-            .read()
-            .await
-            .get(peer_id)
-            .map(|p| p.last_activity);
 
         Some(ConnectionMetrics {
             bytes_sent: stats.udp_tx.bytes,
@@ -2379,7 +2245,7 @@ impl P2pEndpoint {
 
         for addr in &known_peers {
             // Use connect_transport for all address types
-            match self.connect_transport(addr, None).await {
+            match self.connect_transport(addr).await {
                 Ok(_) => {
                     connected += 1;
                     info!("Connected to known peer {}", addr);
@@ -2420,17 +2286,17 @@ impl P2pEndpoint {
             .collect()
     }
 
-    /// Check if a peer is connected
-    pub async fn is_connected(&self, peer_id: &PeerId) -> bool {
-        self.connected_peers.read().await.contains_key(peer_id)
+    /// Check if an address is connected
+    pub async fn is_connected(&self, addr: &SocketAddr) -> bool {
+        self.connected_peers.read().await.contains_key(addr)
     }
 
-    /// Check if a peer is authenticated
-    pub async fn is_authenticated(&self, peer_id: &PeerId) -> bool {
+    /// Check if an address is authenticated
+    pub async fn is_authenticated(&self, addr: &SocketAddr) -> bool {
         self.connected_peers
             .read()
             .await
-            .get(peer_id)
+            .get(addr)
             .map(|p| p.authenticated)
             .unwrap_or(false)
     }
@@ -2447,9 +2313,9 @@ impl P2pEndpoint {
         self.reader_handles.write().await.clear();
 
         // Disconnect all peers
-        let peers: Vec<PeerId> = self.connected_peers.read().await.keys().copied().collect();
-        for peer_id in peers {
-            let _ = self.disconnect(&peer_id).await;
+        let addrs: Vec<SocketAddr> = self.connected_peers.read().await.keys().copied().collect();
+        for addr in addrs {
+            let _ = self.disconnect(&addr).await;
         }
 
         // Bounded timeout prevents blocking when the remote peer is unresponsive.
@@ -2476,7 +2342,7 @@ impl P2pEndpoint {
     /// and forwards received data into the shared `data_tx` channel.
     ///
     /// The task exits naturally when the connection is closed or the channel is dropped.
-    async fn spawn_reader_task(&self, peer_id: PeerId, connection: crate::high_level::Connection) {
+    async fn spawn_reader_task(&self, addr: SocketAddr, connection: crate::high_level::Connection) {
         let data_tx = self.data_tx.clone();
         let connected_peers = Arc::clone(&self.connected_peers);
         let event_tx = self.event_tx.clone();
@@ -2488,10 +2354,7 @@ impl P2pEndpoint {
                 let mut recv_stream = match connection.accept_uni().await {
                     Ok(stream) => stream,
                     Err(e) => {
-                        debug!(
-                            "Reader task for peer {:?} ending: accept_uni error: {}",
-                            peer_id, e
-                        );
+                        debug!("Reader task for {} ending: accept_uni error: {}", addr, e);
                         break;
                     }
                 };
@@ -2500,19 +2363,16 @@ impl P2pEndpoint {
                     Ok(data) if data.is_empty() => continue,
                     Ok(data) => data,
                     Err(e) => {
-                        debug!(
-                            "Reader task for peer {:?}: read_to_end error: {}",
-                            peer_id, e
-                        );
+                        debug!("Reader task for {}: read_to_end error: {}", addr, e);
                         break;
                     }
                 };
 
                 let data_len = data.len();
-                tracing::trace!("Reader task: {} bytes from peer {:?}", data_len, peer_id);
+                tracing::trace!("Reader task: {} bytes from {}", data_len, addr);
 
                 // Update last_activity
-                if let Some(peer_conn) = connected_peers.write().await.get_mut(&peer_id) {
+                if let Some(peer_conn) = connected_peers.write().await.get_mut(&addr) {
                     peer_conn.last_activity = Instant::now();
                 }
 
@@ -2522,7 +2382,7 @@ impl P2pEndpoint {
                 if data.len() == 2 && data[0] == HEALTH_CHECK_PREFIX {
                     if data[1] == HEALTH_PING[1] {
                         // Received PING — respond with PONG
-                        tracing::trace!("Health PING from peer {:?}, sending PONG", peer_id);
+                        tracing::trace!("Health PING from {}, sending PONG", addr);
                         if let Ok(mut send) = connection.open_uni().await {
                             let _ = send.write_all(&HEALTH_PONG).await;
                             let _ = send.finish();
@@ -2530,8 +2390,8 @@ impl P2pEndpoint {
                         continue;
                     } else if data[1] == HEALTH_PONG[1] {
                         // Received PONG — update health timestamp
-                        tracing::trace!("Health PONG from peer {:?}", peer_id);
-                        if let Some(peer_conn) = connected_peers.write().await.get_mut(&peer_id) {
+                        tracing::trace!("Health PONG from {}", addr);
+                        if let Some(peer_conn) = connected_peers.write().await.get_mut(&addr) {
                             peer_conn.last_health_pong_received = Some(Instant::now());
                         }
                         continue;
@@ -2542,27 +2402,21 @@ impl P2pEndpoint {
 
                 // Emit DataReceived event
                 let _ = event_tx.send(P2pEvent::DataReceived {
-                    peer_id,
+                    addr,
                     bytes: data_len,
                 });
 
                 // Send through channel; if the receiver is dropped, exit
-                if data_tx.send((peer_id, data)).await.is_err() {
-                    debug!(
-                        "Reader task for peer {:?}: channel closed, exiting",
-                        peer_id
-                    );
+                if data_tx.send((addr, data)).await.is_err() {
+                    debug!("Reader task for {}: channel closed, exiting", addr);
                     break;
                 }
             }
 
-            peer_id
+            addr
         });
 
-        self.reader_handles
-            .write()
-            .await
-            .insert(peer_id, abort_handle);
+        self.reader_handles.write().await.insert(addr, abort_handle);
     }
 
     /// Spawn a single background task that polls constrained transport events
@@ -2580,30 +2434,28 @@ impl P2pEndpoint {
         let shutdown = self.shutdown.clone();
 
         /// Register a new constrained peer in all lookup maps and emit a connect event.
-        async fn register_peer(
-            peer_id: PeerId,
+        async fn register_constrained_peer(
             connection_id: ConstrainedConnectionId,
             addr: &TransportAddr,
             side: Side,
-            constrained_connections: &RwLock<HashMap<PeerId, ConstrainedConnectionId>>,
-            constrained_peer_addrs: &RwLock<
-                HashMap<ConstrainedConnectionId, (PeerId, TransportAddr)>,
-            >,
-            connected_peers: &RwLock<HashMap<PeerId, PeerConnection>>,
+            constrained_connections: &RwLock<HashMap<TransportAddr, ConstrainedConnectionId>>,
+            constrained_peer_addrs: &RwLock<HashMap<ConstrainedConnectionId, TransportAddr>>,
+            connected_peers: &RwLock<HashMap<SocketAddr, PeerConnection>>,
             event_tx: &broadcast::Sender<P2pEvent>,
         ) {
+            let synthetic_addr = addr.to_synthetic_socket_addr();
             constrained_connections
                 .write()
                 .await
-                .insert(peer_id, connection_id);
+                .insert(addr.clone(), connection_id);
             constrained_peer_addrs
                 .write()
                 .await
-                .insert(connection_id, (peer_id, addr.clone()));
+                .insert(connection_id, addr.clone());
             connected_peers.write().await.insert(
-                peer_id,
+                synthetic_addr,
                 PeerConnection {
-                    peer_id,
+                    public_key: None,
                     remote_addr: addr.clone(),
                     authenticated: false,
                     connected_at: Instant::now(),
@@ -2613,8 +2465,8 @@ impl P2pEndpoint {
                 },
             );
             let _ = event_tx.send(P2pEvent::PeerConnected {
-                peer_id,
                 addr: addr.clone(),
+                public_key: None,
                 side,
             });
         }
@@ -2639,33 +2491,31 @@ impl P2pEndpoint {
                         connection_id,
                         data,
                     } => {
-                        let peer_id = constrained_peer_addrs
+                        let synthetic_addr = constrained_peer_addrs
                             .read()
                             .await
                             .get(&connection_id)
-                            .map(|(pid, _)| *pid)
-                            .unwrap_or_else(|| {
-                                peer_id_from_socket_addr(
-                                    wrapper.remote_addr.to_synthetic_socket_addr(),
-                                )
-                            });
+                            .map(|a| a.to_synthetic_socket_addr())
+                            .unwrap_or_else(|| wrapper.remote_addr.to_synthetic_socket_addr());
 
                         let data_len = data.len();
                         tracing::trace!(
-                            "Constrained poller: {} bytes from peer {:?}",
+                            "Constrained poller: {} bytes from {}",
                             data_len,
-                            peer_id
+                            synthetic_addr
                         );
 
-                        if let Some(peer_conn) = connected_peers.write().await.get_mut(&peer_id) {
+                        if let Some(peer_conn) =
+                            connected_peers.write().await.get_mut(&synthetic_addr)
+                        {
                             peer_conn.last_activity = Instant::now();
                         }
                         let _ = event_tx.send(P2pEvent::DataReceived {
-                            peer_id,
+                            addr: synthetic_addr,
                             bytes: data_len,
                         });
 
-                        if data_tx.send((peer_id, data)).await.is_err() {
+                        if data_tx.send((synthetic_addr, data)).await.is_err() {
                             debug!("Constrained poller: channel closed, exiting");
                             break;
                         }
@@ -2674,9 +2524,7 @@ impl P2pEndpoint {
                         connection_id,
                         remote_addr: _,
                     } => {
-                        let peer_id = peer_id_from_transport_addr(&wrapper.remote_addr);
-                        register_peer(
-                            peer_id,
+                        register_constrained_peer(
                             connection_id,
                             &wrapper.remote_addr,
                             Side::Server,
@@ -2694,9 +2542,7 @@ impl P2pEndpoint {
                             .get(&connection_id)
                             .is_none()
                         {
-                            let peer_id = peer_id_from_transport_addr(&wrapper.remote_addr);
-                            register_peer(
-                                peer_id,
+                            register_constrained_peer(
                                 connection_id,
                                 &wrapper.remote_addr,
                                 Side::Client,
@@ -2709,17 +2555,19 @@ impl P2pEndpoint {
                         }
                     }
                     EngineEvent::ConnectionClosed { connection_id } => {
-                        let peer_info = constrained_peer_addrs.write().await.remove(&connection_id);
-                        if let Some((peer_id, addr)) = peer_info {
-                            constrained_connections.write().await.remove(&peer_id);
-                            connected_peers.write().await.remove(&peer_id);
+                        let removed_addr =
+                            constrained_peer_addrs.write().await.remove(&connection_id);
+                        if let Some(addr) = removed_addr {
+                            let synthetic_addr = addr.to_synthetic_socket_addr();
+                            constrained_connections.write().await.remove(&addr);
+                            connected_peers.write().await.remove(&synthetic_addr);
                             let _ = event_tx.send(P2pEvent::PeerDisconnected {
-                                peer_id,
+                                addr,
                                 reason: DisconnectReason::RemoteClosed,
                             });
                             debug!(
-                                "Constrained poller: peer {:?} at {} disconnected",
-                                peer_id, addr
+                                "Constrained poller: peer at {} disconnected",
+                                synthetic_addr
                             );
                         }
                     }
@@ -2773,31 +2621,32 @@ impl P2pEndpoint {
                 }
 
                 // --- Phase A: Remove QUIC-dead connections ---
+                // Collect addrs for connections whose inner transport is dead.
 
-                let stale_peers: Vec<PeerId> = {
+                let stale_addrs: Vec<SocketAddr> = {
                     let peers = connected_peers.read().await;
                     peers
                         .keys()
-                        .filter(|id| !inner.is_peer_connected(id))
+                        .filter(|addr| !inner.is_connected(addr))
                         .copied()
                         .collect()
                 };
 
-                if !stale_peers.is_empty() {
+                if !stale_addrs.is_empty() {
                     info!(
                         "Stale connection reaper: removing {} dead connection(s)",
-                        stale_peers.len()
+                        stale_addrs.len()
                     );
                 }
 
-                for peer_id in &stale_peers {
+                for addr in &stale_addrs {
                     do_cleanup_connection(
                         &*connected_peers,
                         &*inner,
                         &*reader_handles,
                         &*stats,
                         &event_tx,
-                        peer_id,
+                        addr,
                         DisconnectReason::Timeout,
                     )
                     .await;
@@ -2805,25 +2654,22 @@ impl P2pEndpoint {
 
                 // --- Phase B: Health-check live connections ---
 
-                // Collect peers that are still alive at the QUIC level for probing.
-                let alive_peers: Vec<PeerId> = {
+                let alive_addrs: Vec<SocketAddr> = {
                     let peers = connected_peers.read().await;
                     peers
                         .keys()
-                        .filter(|id| inner.is_peer_connected(id))
+                        .filter(|addr| inner.is_connected(addr))
                         .copied()
                         .collect()
                 };
 
                 let now = Instant::now();
 
-                for peer_id in &alive_peers {
+                for addr in &alive_addrs {
                     // Check if this peer has missed too many health checks.
                     let should_evict = {
                         let peers = connected_peers.read().await;
-                        if let Some(pc) = peers.get(peer_id) {
-                            // Only evict if we've sent at least one PING and
-                            // haven't received a PONG within the threshold.
+                        if let Some(pc) = peers.get(addr) {
                             if let Some(ping_sent) = pc.last_health_ping_sent {
                                 let pong_time =
                                     pc.last_health_pong_received.unwrap_or(pc.connected_at);
@@ -2840,11 +2686,10 @@ impl P2pEndpoint {
 
                     if should_evict {
                         warn!(
-                            "Health check: peer {:?} unresponsive for {:?}, evicting phantom connection",
-                            peer_id, HEALTH_CHECK_EVICTION_THRESHOLD
+                            "Health check: {} unresponsive for {:?}, evicting phantom connection",
+                            addr, HEALTH_CHECK_EVICTION_THRESHOLD
                         );
-                        // Close the QUIC connection to force cleanup on both sides
-                        if let Ok(Some(conn)) = inner.get_connection(peer_id) {
+                        if let Ok(Some(conn)) = inner.get_connection(addr) {
                             conn.close(0u32.into(), b"health_check_failed");
                         }
                         let was_present = do_cleanup_connection(
@@ -2853,7 +2698,7 @@ impl P2pEndpoint {
                             &*reader_handles,
                             &*stats,
                             &event_tx,
-                            peer_id,
+                            addr,
                             DisconnectReason::ConnectionLost,
                         )
                         .await;
@@ -2863,25 +2708,20 @@ impl P2pEndpoint {
                         continue;
                     }
 
-                    // Send health PING to this peer
-                    if let Ok(Some(conn)) = inner.get_connection(peer_id) {
+                    // Send health PING
+                    if let Ok(Some(conn)) = inner.get_connection(addr) {
                         match conn.open_uni().await {
                             Ok(mut send) => {
                                 if send.write_all(&HEALTH_PING).await.is_ok() {
                                     let _ = send.finish();
-                                    // Record PING send time
-                                    if let Some(pc) = connected_peers.write().await.get_mut(peer_id)
-                                    {
+                                    if let Some(pc) = connected_peers.write().await.get_mut(addr) {
                                         pc.last_health_ping_sent = Some(Instant::now());
                                     }
-                                    tracing::trace!("Health PING sent to peer {:?}", peer_id);
+                                    tracing::trace!("Health PING sent to {}", addr);
                                 }
                             }
                             Err(e) => {
-                                debug!(
-                                    "Health check: failed to open stream to peer {:?}: {}",
-                                    peer_id, e
-                                );
+                                debug!("Health check: failed to open stream to {}: {}", addr, e);
                             }
                         }
                     }
@@ -2902,7 +2742,7 @@ impl Clone for P2pEndpoint {
             stats: Arc::clone(&self.stats),
             config: self.config.clone(),
             event_tx: self.event_tx.clone(),
-            peer_id: self.peer_id,
+            our_fingerprint: self.our_fingerprint,
             public_key: self.public_key.clone(),
             shutdown: self.shutdown.clone(),
             pending_data: Arc::clone(&self.pending_data),
@@ -2944,7 +2784,7 @@ mod tests {
     fn test_peer_connection_debug() {
         let socket_addr: SocketAddr = "127.0.0.1:8080".parse().expect("valid addr");
         let conn = PeerConnection {
-            peer_id: PeerId([0u8; 32]),
+            public_key: None,
             remote_addr: TransportAddr::Udp(socket_addr),
             authenticated: false,
             connected_at: Instant::now(),
@@ -2976,7 +2816,8 @@ mod tests {
         let err = EndpointError::Timeout;
         assert!(err.to_string().contains("timed out"));
 
-        let err = EndpointError::PeerNotFound(PeerId([0u8; 32]));
+        let addr: SocketAddr = "127.0.0.1:8080".parse().expect("valid addr");
+        let err = EndpointError::PeerNotFound(addr);
         assert!(err.to_string().contains("not found"));
     }
 
@@ -3055,19 +2896,19 @@ mod tests {
     fn test_peer_connected_event_with_udp() {
         let socket_addr: SocketAddr = "192.168.1.100:8080".parse().expect("valid addr");
         let event = P2pEvent::PeerConnected {
-            peer_id: PeerId([0xab; 32]),
             addr: TransportAddr::Udp(socket_addr),
+            public_key: None,
             side: Side::Client,
         };
 
         // Verify event fields
         if let P2pEvent::PeerConnected {
-            peer_id,
             addr,
+            public_key,
             side,
         } = event
         {
-            assert_eq!(peer_id.0, [0xab; 32]);
+            assert!(public_key.is_none());
             assert_eq!(addr, TransportAddr::Udp(socket_addr));
             assert!(side.is_client());
 
@@ -3084,22 +2925,22 @@ mod tests {
         // BLE MAC address (6 bytes)
         let device_id = [0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc];
         let event = P2pEvent::PeerConnected {
-            peer_id: PeerId([0xcd; 32]),
             addr: TransportAddr::Ble {
                 device_id,
                 service_uuid: None,
             },
+            public_key: None,
             side: Side::Server,
         };
 
         // Verify event fields
         if let P2pEvent::PeerConnected {
-            peer_id,
             addr,
+            public_key,
             side,
         } = event
         {
-            assert_eq!(peer_id.0, [0xcd; 32]);
+            assert!(public_key.is_none());
             assert!(side.is_server());
 
             // Verify as_socket_addr() returns None for BLE
@@ -3138,8 +2979,8 @@ mod tests {
     fn test_event_clone() {
         let socket_addr: SocketAddr = "10.0.0.1:9000".parse().expect("valid addr");
         let event = P2pEvent::PeerConnected {
-            peer_id: PeerId([0x11; 32]),
             addr: TransportAddr::Udp(socket_addr),
+            public_key: Some(vec![0x11; 32]),
             side: Side::Client,
         };
 
@@ -3147,18 +2988,18 @@ mod tests {
         let cloned = event.clone();
         if let (
             P2pEvent::PeerConnected {
-                peer_id: p1,
+                public_key: pk1,
                 addr: a1,
                 ..
             },
             P2pEvent::PeerConnected {
-                peer_id: p2,
+                public_key: pk2,
                 addr: a2,
                 ..
             },
         ) = (&event, &cloned)
         {
-            assert_eq!(p1.0, p2.0);
+            assert_eq!(pk1, pk2);
             assert_eq!(a1, a2);
         }
     }
@@ -3168,7 +3009,7 @@ mod tests {
         // Test with UDP
         let udp_addr: SocketAddr = "127.0.0.1:8080".parse().expect("valid addr");
         let udp_conn = PeerConnection {
-            peer_id: PeerId([0u8; 32]),
+            public_key: None,
             remote_addr: TransportAddr::Udp(udp_addr),
             authenticated: true,
             connected_at: Instant::now(),
@@ -3185,7 +3026,7 @@ mod tests {
         // Test with BLE
         let device_id = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
         let ble_conn = PeerConnection {
-            peer_id: PeerId([1u8; 32]),
+            public_key: None,
             remote_addr: TransportAddr::Ble {
                 device_id,
                 service_uuid: None,
@@ -3206,8 +3047,8 @@ mod tests {
     fn test_transport_addr_display_in_events() {
         let socket_addr: SocketAddr = "192.168.1.1:9001".parse().expect("valid addr");
         let event = P2pEvent::PeerConnected {
-            peer_id: PeerId([0xff; 32]),
             addr: TransportAddr::Udp(socket_addr),
+            public_key: None,
             side: Side::Client,
         };
 
@@ -3231,13 +3072,12 @@ mod tests {
     fn test_connection_tracking_udp() {
         use std::collections::HashMap;
 
-        // Simulate connection tracking with TransportAddr::Udp
-        let mut connections: HashMap<PeerId, PeerConnection> = HashMap::new();
+        // Simulate connection tracking with SocketAddr key
+        let mut connections: HashMap<SocketAddr, PeerConnection> = HashMap::new();
 
         let socket_addr: SocketAddr = "10.0.0.1:8080".parse().expect("valid addr");
-        let peer_id = PeerId([0x01; 32]);
         let conn = PeerConnection {
-            peer_id,
+            public_key: None,
             remote_addr: TransportAddr::Udp(socket_addr),
             authenticated: true,
             connected_at: Instant::now(),
@@ -3246,11 +3086,11 @@ mod tests {
             last_health_pong_received: None,
         };
 
-        connections.insert(peer_id, conn.clone());
+        connections.insert(socket_addr, conn.clone());
 
         // Verify connection is tracked
-        assert!(connections.contains_key(&peer_id));
-        let retrieved = connections.get(&peer_id).expect("connection exists");
+        assert!(connections.contains_key(&socket_addr));
+        let retrieved = connections.get(&socket_addr).expect("connection exists");
         assert_eq!(retrieved.remote_addr, TransportAddr::Udp(socket_addr));
         assert!(retrieved.authenticated);
     }
@@ -3259,16 +3099,17 @@ mod tests {
     fn test_connection_tracking_multi_transport() {
         use std::collections::HashMap;
 
-        // Simulate multiple connections on different transports
-        let mut connections: HashMap<PeerId, PeerConnection> = HashMap::new();
+        // Simulate multiple connections on different transports keyed by SocketAddr.
+        // For constrained transports (BLE) we use a synthetic SocketAddr via
+        // TransportAddr::to_synthetic_socket_addr().
+        let mut connections: HashMap<SocketAddr, PeerConnection> = HashMap::new();
 
         // UDP connection
         let udp_addr: SocketAddr = "192.168.1.100:9000".parse().expect("valid addr");
-        let peer1 = PeerId([0x01; 32]);
         connections.insert(
-            peer1,
+            udp_addr,
             PeerConnection {
-                peer_id: peer1,
+                public_key: None,
                 remote_addr: TransportAddr::Udp(udp_addr),
                 authenticated: true,
                 connected_at: Instant::now(),
@@ -3278,17 +3119,18 @@ mod tests {
             },
         );
 
-        // BLE connection (different peer)
-        let peer2 = PeerId([0x02; 32]);
+        // BLE connection (different peer) - use synthetic SocketAddr as key
         let ble_device = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
+        let ble_addr = TransportAddr::Ble {
+            device_id: ble_device,
+            service_uuid: None,
+        };
+        let ble_socket_key = ble_addr.to_synthetic_socket_addr();
         connections.insert(
-            peer2,
+            ble_socket_key,
             PeerConnection {
-                peer_id: peer2,
-                remote_addr: TransportAddr::Ble {
-                    device_id: ble_device,
-                    service_uuid: None,
-                },
+                public_key: None,
+                remote_addr: ble_addr,
                 authenticated: true,
                 connected_at: Instant::now(),
                 last_activity: Instant::now(),
@@ -3301,16 +3143,16 @@ mod tests {
         assert_eq!(connections.len(), 2);
         assert!(
             connections
-                .get(&peer1)
-                .unwrap()
+                .get(&udp_addr)
+                .expect("UDP connection exists")
                 .remote_addr
                 .as_socket_addr()
                 .is_some()
         );
         assert!(
             connections
-                .get(&peer2)
-                .unwrap()
+                .get(&ble_socket_key)
+                .expect("BLE connection exists")
                 .remote_addr
                 .as_socket_addr()
                 .is_none()
@@ -3318,25 +3160,20 @@ mod tests {
     }
 
     #[test]
-    fn test_connection_lookup_by_transport_addr() {
+    fn test_connection_lookup_by_socket_addr() {
         use std::collections::HashMap;
 
-        let mut connections: HashMap<PeerId, PeerConnection> = HashMap::new();
+        let mut connections: HashMap<SocketAddr, PeerConnection> = HashMap::new();
 
-        // Add multiple connections
-        let addrs = [
-            ("10.0.0.1:8080", [0x01; 32]),
-            ("10.0.0.2:8080", [0x02; 32]),
-            ("10.0.0.3:8080", [0x03; 32]),
-        ];
+        // Add multiple connections keyed by SocketAddr
+        let addrs = ["10.0.0.1:8080", "10.0.0.2:8080", "10.0.0.3:8080"];
 
-        for (addr_str, peer_bytes) in addrs {
+        for addr_str in addrs {
             let socket_addr: SocketAddr = addr_str.parse().expect("valid addr");
-            let peer_id = PeerId(peer_bytes);
             connections.insert(
-                peer_id,
+                socket_addr,
                 PeerConnection {
-                    peer_id,
+                    public_key: None,
                     remote_addr: TransportAddr::Udp(socket_addr),
                     authenticated: true,
                     connected_at: Instant::now(),
@@ -3347,13 +3184,15 @@ mod tests {
             );
         }
 
-        // Look up connection by transport address
+        // Direct lookup by SocketAddr
         let target: SocketAddr = "10.0.0.2:8080".parse().expect("valid addr");
-        let target_addr = TransportAddr::Udp(target);
-        let found = connections.values().find(|c| c.remote_addr == target_addr);
+        let found = connections.get(&target);
 
         assert!(found.is_some());
-        assert_eq!(found.unwrap().peer_id.0, [0x02; 32]);
+        assert_eq!(
+            found.expect("connection exists").remote_addr,
+            TransportAddr::Udp(target)
+        );
     }
 
     #[test]
@@ -3385,7 +3224,7 @@ mod tests {
     fn test_peer_connection_update_preserves_transport_addr() {
         let socket_addr: SocketAddr = "172.16.0.1:5000".parse().expect("valid addr");
         let mut conn = PeerConnection {
-            peer_id: PeerId([0xaa; 32]),
+            public_key: None,
             remote_addr: TransportAddr::Udp(socket_addr),
             authenticated: false,
             connected_at: Instant::now(),

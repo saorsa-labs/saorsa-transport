@@ -8,7 +8,6 @@
 //! Token persistence integration with BootstrapCache.
 
 use crate::bootstrap_cache::BootstrapCache;
-use crate::nat_traversal_api::PeerId;
 use crate::token::TokenStore;
 use bytes::Bytes;
 use std::collections::HashMap;
@@ -36,9 +35,9 @@ impl BootstrapTokenStore {
         let tokens = cache.get_all_tokens().await;
         let mut local = HashMap::new();
 
-        for (peer_id, token) in tokens {
-            // Key by PeerId hex string
-            let key = hex::encode(peer_id.0);
+        for (addr, token) in tokens {
+            // Key by SocketAddr string
+            let key = addr.to_string();
             local.insert(key, token);
         }
 
@@ -65,27 +64,22 @@ impl TokenStore for BootstrapTokenStore {
             warn!("Failed to acquire write lock on local token cache");
         }
 
-        // 2. Try to parse server_name as PeerId and update persistent cache
-        // server_name is expected to be hex-encoded PeerId
-        if let Ok(bytes) = hex::decode(server_name) {
-            if let Ok(arr) = <[u8; 32]>::try_from(bytes) {
-                let peer_id = PeerId(arr);
-                let cache = self.cache.clone();
-                let token_clone = token_vec;
+        // 2. Try to parse server_name as SocketAddr and update persistent cache
+        if let Ok(addr) = server_name.parse::<std::net::SocketAddr>() {
+            let cache = self.cache.clone();
+            let token_clone = token_vec;
 
-                // Spawn async task to update persistent cache
-                tokio::spawn(async move {
-                    cache.update_token(peer_id, token_clone).await;
-                });
-                return;
-            }
+            // Spawn async task to update persistent cache
+            tokio::spawn(async move {
+                cache.update_token(addr, token_clone).await;
+            });
+            return;
         }
 
-        // If server_name is not a PeerId (e.g. it's an IP), we can't persist it
-        // to a specific Peer entry easily unless we do a reverse lookup.
-        // For now, we only persist tokens if the SNI was the PeerId.
+        // If server_name is not a SocketAddr (e.g. it's a hostname), we can't persist it
+        // to a specific peer entry easily unless we do a reverse lookup.
         debug!(
-            "Received token for non-PeerId server name: {}, not persisting to disk",
+            "Received token for non-address server name: {}, not persisting to disk",
             server_name
         );
     }

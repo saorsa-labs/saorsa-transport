@@ -298,11 +298,10 @@ pub use bootstrap_cache::{
 pub mod host_identity;
 pub use host_identity::{EndpointKeyPolicy, HostIdentity, HostKeyStorage, StorageError};
 
-// Re-export crypto utilities for peer ID management (v0.2: Pure PQC with ML-DSA-65)
+// Re-export crypto utilities (v0.2: Pure PQC with ML-DSA-65)
 pub use crypto::raw_public_keys::key_utils::{
     ML_DSA_65_PUBLIC_KEY_SIZE, ML_DSA_65_SECRET_KEY_SIZE, MlDsaPublicKey, MlDsaSecretKey,
-    derive_peer_id_from_key_bytes, derive_peer_id_from_public_key, generate_ml_dsa_keypair,
-    verify_peer_id,
+    fingerprint_public_key, fingerprint_public_key_bytes, generate_ml_dsa_keypair,
 };
 
 // Re-export key types for backward compatibility
@@ -323,7 +322,7 @@ pub use endpoint::{
 };
 pub use nat_traversal_api::{
     BootstrapNode, CandidateAddress, NatTraversalConfig, NatTraversalEndpoint, NatTraversalError,
-    NatTraversalEvent, NatTraversalStatistics, PeerId,
+    NatTraversalEvent, NatTraversalStatistics,
 };
 
 // ============================================================================

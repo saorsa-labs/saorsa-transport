@@ -11,7 +11,6 @@ use super::config::BootstrapCacheConfig;
 use super::entry::{CachedPeer, ConnectionOutcome, PeerCapabilities, PeerSource};
 use super::persistence::{CacheData, CachePersistence};
 use super::selection::select_epsilon_greedy;
-use crate::nat_traversal_api::PeerId;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -105,9 +104,9 @@ impl BootstrapCache {
         self.data.read().await.peers.len()
     }
 
-    /// Get a specific peer from the cache
-    pub async fn get_peer(&self, peer_id: &PeerId) -> Option<CachedPeer> {
-        self.data.read().await.peers.get(&peer_id.0).cloned()
+    /// Get a specific peer from the cache by its primary address
+    pub async fn get_peer(&self, addr: &SocketAddr) -> Option<CachedPeer> {
+        self.data.read().await.peers.get(addr).cloned()
     }
 
     /// Select peers for bootstrap using epsilon-greedy strategy.
@@ -198,11 +197,13 @@ impl BootstrapCache {
         let mut data = self.data.write().await;
 
         // Evict lowest quality if at capacity
-        if data.peers.len() >= self.config.max_peers && !data.peers.contains_key(&peer.peer_id.0) {
+        if data.peers.len() >= self.config.max_peers
+            && !data.peers.contains_key(&peer.primary_address)
+        {
             self.evict_lowest_quality(&mut data);
         }
 
-        data.peers.insert(peer.peer_id.0, peer);
+        data.peers.insert(peer.primary_address, peer);
 
         let count = data.peers.len();
         drop(data);
@@ -213,19 +214,19 @@ impl BootstrapCache {
     }
 
     /// Add a seed peer (user-provided bootstrap node).
-    pub async fn add_seed(&self, peer_id: PeerId, addresses: Vec<SocketAddr>) {
-        let peer = CachedPeer::new(peer_id, addresses, PeerSource::Seed);
+    pub async fn add_seed(&self, addr: SocketAddr, addresses: Vec<SocketAddr>) {
+        let peer = CachedPeer::new(addr, addresses, PeerSource::Seed);
         self.upsert(peer).await;
     }
 
     /// Add a peer discovered from an active connection.
     pub async fn add_from_connection(
         &self,
-        peer_id: PeerId,
+        addr: SocketAddr,
         addresses: Vec<SocketAddr>,
         caps: Option<PeerCapabilities>,
     ) {
-        let mut peer = CachedPeer::new(peer_id, addresses, PeerSource::Connection);
+        let mut peer = CachedPeer::new(addr, addresses, PeerSource::Connection);
         if let Some(caps) = caps {
             peer.capabilities = caps;
         }
@@ -233,10 +234,10 @@ impl BootstrapCache {
     }
 
     /// Record a connection attempt result.
-    pub async fn record_outcome(&self, peer_id: &PeerId, outcome: ConnectionOutcome) {
+    pub async fn record_outcome(&self, addr: &SocketAddr, outcome: ConnectionOutcome) {
         let mut data = self.data.write().await;
 
-        if let Some(peer) = data.peers.get_mut(&peer_id.0) {
+        if let Some(peer) = data.peers.get_mut(addr) {
             if outcome.success {
                 peer.record_success(
                     outcome.rtt_ms.unwrap_or(100),
@@ -252,9 +253,9 @@ impl BootstrapCache {
     }
 
     /// Record successful connection.
-    pub async fn record_success(&self, peer_id: &PeerId, rtt_ms: u32) {
+    pub async fn record_success(&self, addr: &SocketAddr, rtt_ms: u32) {
         self.record_outcome(
-            peer_id,
+            addr,
             ConnectionOutcome {
                 success: true,
                 rtt_ms: Some(rtt_ms),
@@ -265,9 +266,9 @@ impl BootstrapCache {
     }
 
     /// Record failed connection.
-    pub async fn record_failure(&self, peer_id: &PeerId) {
+    pub async fn record_failure(&self, addr: &SocketAddr) {
         self.record_outcome(
-            peer_id,
+            addr,
             ConnectionOutcome {
                 success: false,
                 rtt_ms: None,
@@ -278,47 +279,47 @@ impl BootstrapCache {
     }
 
     /// Update peer capabilities.
-    pub async fn update_capabilities(&self, peer_id: &PeerId, caps: PeerCapabilities) {
+    pub async fn update_capabilities(&self, addr: &SocketAddr, caps: PeerCapabilities) {
         let mut data = self.data.write().await;
 
-        if let Some(peer) = data.peers.get_mut(&peer_id.0) {
+        if let Some(peer) = data.peers.get_mut(addr) {
             peer.capabilities = caps;
             peer.calculate_quality(&self.config.weights);
         }
     }
 
-    /// Get a specific peer.
-    pub async fn get(&self, peer_id: &PeerId) -> Option<CachedPeer> {
-        self.data.read().await.peers.get(&peer_id.0).cloned()
+    /// Get a specific peer by address.
+    pub async fn get(&self, addr: &SocketAddr) -> Option<CachedPeer> {
+        self.data.read().await.peers.get(addr).cloned()
     }
 
     /// Update the address validation token for a peer
-    pub async fn update_token(&self, peer_id: PeerId, token: Vec<u8>) {
+    pub async fn update_token(&self, addr: SocketAddr, token: Vec<u8>) {
         let mut data = self.data.write().await;
-        if let Some(peer) = data.peers.get_mut(&peer_id.0) {
+        if let Some(peer) = data.peers.get_mut(&addr) {
             peer.token = Some(token);
         }
     }
 
     /// Get all tokens from cached peers (for initializing TokenStore)
-    pub async fn get_all_tokens(&self) -> std::collections::HashMap<PeerId, Vec<u8>> {
+    pub async fn get_all_tokens(&self) -> std::collections::HashMap<SocketAddr, Vec<u8>> {
         self.data
             .read()
             .await
             .peers
             .values()
-            .filter_map(|p| p.token.clone().map(|t| (p.peer_id, t)))
+            .filter_map(|p| p.token.clone().map(|t| (p.primary_address, t)))
             .collect()
     }
 
     /// Check if peer exists in cache.
-    pub async fn contains(&self, peer_id: &PeerId) -> bool {
-        self.data.read().await.peers.contains_key(&peer_id.0)
+    pub async fn contains(&self, addr: &SocketAddr) -> bool {
+        self.data.read().await.peers.contains_key(addr)
     }
 
     /// Remove a peer from cache.
-    pub async fn remove(&self, peer_id: &PeerId) -> Option<CachedPeer> {
-        self.data.write().await.peers.remove(&peer_id.0)
+    pub async fn remove(&self, addr: &SocketAddr) -> Option<CachedPeer> {
+        self.data.write().await.peers.remove(addr)
     }
 
     /// Save cache to disk.
@@ -475,14 +476,14 @@ impl BootstrapCache {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        let to_remove: Vec<[u8; 32]> = sorted
+        let to_remove: Vec<SocketAddr> = sorted
             .into_iter()
             .take(evict_count)
-            .map(|(id, _)| *id)
+            .map(|(addr, _)| *addr)
             .collect();
 
-        for id in to_remove {
-            data.peers.remove(&id);
+        for addr in to_remove {
+            data.peers.remove(&addr);
         }
 
         debug!("Evicted {} lowest quality peers", evict_count);
@@ -517,15 +518,13 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let cache = create_test_cache(&temp_dir).await;
 
-        let peer_id = PeerId([1u8; 32]);
-        cache
-            .add_seed(peer_id, vec!["127.0.0.1:9000".parse().unwrap()])
-            .await;
+        let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        cache.add_seed(addr, vec![addr]).await;
 
         assert_eq!(cache.peer_count().await, 1);
-        assert!(cache.contains(&peer_id).await);
+        assert!(cache.contains(&addr).await);
 
-        let peer = cache.get(&peer_id).await.unwrap();
+        let peer = cache.get(&addr).await.unwrap();
         assert_eq!(peer.addresses.len(), 1);
     }
 
@@ -536,12 +535,8 @@ mod tests {
 
         // Add peers with different quality
         for i in 0..10usize {
-            let peer_id = PeerId([i as u8; 32]);
-            let mut peer = CachedPeer::new(
-                peer_id,
-                vec![format!("127.0.0.1:{}", 9000 + i).parse().unwrap()],
-                PeerSource::Seed,
-            );
+            let addr: SocketAddr = format!("127.0.0.1:{}", 9000 + i).parse().unwrap();
+            let mut peer = CachedPeer::new(addr, vec![addr], PeerSource::Seed);
             peer.quality_score = i as f64 / 10.0;
             cache.upsert(peer).await;
         }
@@ -555,13 +550,12 @@ mod tests {
     #[tokio::test]
     async fn test_persistence() {
         let temp_dir = TempDir::new().unwrap();
+        let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
 
         // Create and populate cache
         {
             let cache = create_test_cache(&temp_dir).await;
-            cache
-                .add_seed(PeerId([1; 32]), vec!["127.0.0.1:9000".parse().unwrap()])
-                .await;
+            cache.add_seed(addr, vec![addr]).await;
             cache.save().await.unwrap();
         }
 
@@ -569,7 +563,7 @@ mod tests {
         {
             let cache = create_test_cache(&temp_dir).await;
             assert_eq!(cache.peer_count().await, 1);
-            assert!(cache.contains(&PeerId([1; 32])).await);
+            assert!(cache.contains(&addr).await);
         }
     }
 
@@ -578,21 +572,19 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let cache = create_test_cache(&temp_dir).await;
 
-        let peer_id = PeerId([1; 32]);
-        cache
-            .add_seed(peer_id, vec!["127.0.0.1:9000".parse().unwrap()])
-            .await;
+        let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        cache.add_seed(addr, vec![addr]).await;
 
         // Initial quality should be neutral
-        let peer = cache.get(&peer_id).await.unwrap();
+        let peer = cache.get(&addr).await.unwrap();
         let initial_quality = peer.quality_score;
 
         // Record successes - quality should improve
         for _ in 0..5 {
-            cache.record_success(&peer_id, 50).await;
+            cache.record_success(&addr, 50).await;
         }
 
-        let peer = cache.get(&peer_id).await.unwrap();
+        let peer = cache.get(&addr).await.unwrap();
         assert!(peer.quality_score > initial_quality);
         assert!(peer.success_rate() > 0.9);
     }
@@ -609,12 +601,8 @@ mod tests {
 
         // Add 15 peers
         for i in 0..15u8 {
-            let peer_id = PeerId([i; 32]);
-            let mut peer = CachedPeer::new(
-                peer_id,
-                vec![format!("127.0.0.1:{}", 9000 + i as u16).parse().unwrap()],
-                PeerSource::Seed,
-            );
+            let addr: SocketAddr = format!("127.0.0.1:{}", 9000 + i as u16).parse().unwrap();
+            let mut peer = CachedPeer::new(addr, vec![addr], PeerSource::Seed);
             peer.quality_score = i as f64 / 15.0;
             cache.upsert(peer).await;
         }
@@ -629,25 +617,18 @@ mod tests {
         let cache = create_test_cache(&temp_dir).await;
 
         // Add some peers with capabilities
-        let mut peer1 = CachedPeer::new(
-            PeerId([1; 32]),
-            vec!["127.0.0.1:9001".parse().unwrap()],
-            PeerSource::Seed,
-        );
+        let addr1: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+        let mut peer1 = CachedPeer::new(addr1, vec![addr1], PeerSource::Seed);
         peer1.capabilities.supports_relay = true;
         cache.upsert(peer1).await;
 
-        let mut peer2 = CachedPeer::new(
-            PeerId([2; 32]),
-            vec!["127.0.0.1:9002".parse().unwrap()],
-            PeerSource::Seed,
-        );
+        let addr2: SocketAddr = "127.0.0.1:9002".parse().unwrap();
+        let mut peer2 = CachedPeer::new(addr2, vec![addr2], PeerSource::Seed);
         peer2.capabilities.supports_coordination = true;
         cache.upsert(peer2).await;
 
-        cache
-            .add_seed(PeerId([3; 32]), vec!["127.0.0.1:9003".parse().unwrap()])
-            .await;
+        let addr3: SocketAddr = "127.0.0.1:9003".parse().unwrap();
+        cache.add_seed(addr3, vec![addr3]).await;
 
         let stats = cache.stats().await;
         assert_eq!(stats.total_peers, 3);
@@ -663,11 +644,8 @@ mod tests {
 
         // Add mix of relay and non-relay peers
         for i in 0..10u8 {
-            let mut peer = CachedPeer::new(
-                PeerId([i; 32]),
-                vec![format!("127.0.0.1:{}", 9000 + i as u16).parse().unwrap()],
-                PeerSource::Seed,
-            );
+            let addr: SocketAddr = format!("127.0.0.1:{}", 9000 + i as u16).parse().unwrap();
+            let mut peer = CachedPeer::new(addr, vec![addr], PeerSource::Seed);
             peer.capabilities.supports_relay = i % 2 == 0;
             peer.quality_score = i as f64 / 10.0;
             cache.upsert(peer).await;

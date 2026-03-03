@@ -24,7 +24,7 @@ use crate::crypto::raw_public_keys::pqc::{
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt as _;
 
-use crate::{high_level::Connection, nat_traversal_api::PeerId};
+use crate::high_level::Connection;
 use thiserror::Error;
 
 /// Errors that can occur during trust operations such as pinning, rotation, and channel binding.
@@ -67,20 +67,27 @@ pub struct PinRecord {
 
 /// A trait for storing and retrieving pinned peer fingerprints.
 /// Implementations must be thread-safe (Send + Sync) for concurrent access.
+///
+/// Peers are identified by their SPKI fingerprint (`[u8; 32]`), not by PeerId.
 pub trait PinStore: Send + Sync {
-    /// Load the pin record for a given peer, if one exists.
-    /// Returns None if the peer has not been pinned yet.
-    fn load(&self, peer: &PeerId) -> Result<Option<PinRecord>, TrustError>;
+    /// Load the pin record for a given SPKI fingerprint, if one exists.
+    /// Returns None if the fingerprint has not been pinned yet.
+    fn load(&self, fingerprint: &[u8; 32]) -> Result<Option<PinRecord>, TrustError>;
     /// Save the first (initial) fingerprint for a peer.
-    /// Fails if the peer is already pinned.
-    fn save_first(&self, peer: &PeerId, fpr: [u8; 32]) -> Result<(), TrustError>;
+    /// Fails if the fingerprint is already pinned.
+    fn save_first(&self, fingerprint: &[u8; 32], fpr: [u8; 32]) -> Result<(), TrustError>;
     /// Rotate a peer's fingerprint from old to new, updating the pin record.
     /// Validates that the old fingerprint matches the current one.
-    fn rotate(&self, peer: &PeerId, old: [u8; 32], new: [u8; 32]) -> Result<(), TrustError>;
+    fn rotate(
+        &self,
+        fingerprint: &[u8; 32],
+        old: [u8; 32],
+        new: [u8; 32],
+    ) -> Result<(), TrustError>;
 }
 
 /// A filesystem-based implementation of PinStore that persists pin records as JSON files.
-/// Each peer's record is stored in a separate file named after the peer's hex-encoded ID.
+/// Each peer's record is stored in a separate file named after the hex-encoded SPKI fingerprint.
 #[derive(Clone)]
 pub struct FsPinStore {
     dir: Arc<PathBuf>,
@@ -96,15 +103,15 @@ impl FsPinStore {
         }
     }
 
-    fn path_for(&self, peer: &PeerId) -> PathBuf {
-        let hex = hex::encode(peer.0);
+    fn path_for(&self, fingerprint: &[u8; 32]) -> PathBuf {
+        let hex = hex::encode(fingerprint);
         self.dir.join(format!("{hex}.json"))
     }
 }
 
 impl PinStore for FsPinStore {
-    fn load(&self, peer: &PeerId) -> Result<Option<PinRecord>, TrustError> {
-        let path = self.path_for(peer);
+    fn load(&self, fingerprint: &[u8; 32]) -> Result<Option<PinRecord>, TrustError> {
+        let path = self.path_for(fingerprint);
         if !path.exists() {
             return Ok(None);
         }
@@ -112,8 +119,8 @@ impl PinStore for FsPinStore {
         Ok(Some(serde_json::from_slice(&data)?))
     }
 
-    fn save_first(&self, peer: &PeerId, fpr: [u8; 32]) -> Result<(), TrustError> {
-        if self.load(peer)?.is_some() {
+    fn save_first(&self, fingerprint: &[u8; 32], fpr: [u8; 32]) -> Result<(), TrustError> {
+        if self.load(fingerprint)?.is_some() {
             return Err(TrustError::AlreadyPinned);
         }
         let rec = PinRecord {
@@ -121,13 +128,18 @@ impl PinStore for FsPinStore {
             previous_fingerprint: None,
         };
         let data = serde_json::to_vec_pretty(&rec)?;
-        fs::write(self.path_for(peer), data)?;
+        fs::write(self.path_for(fingerprint), data)?;
         Ok(())
     }
 
-    fn rotate(&self, peer: &PeerId, old: [u8; 32], new: [u8; 32]) -> Result<(), TrustError> {
-        let path = self.path_for(peer);
-        let Some(mut rec) = self.load(peer)? else {
+    fn rotate(
+        &self,
+        fingerprint: &[u8; 32],
+        old: [u8; 32],
+        new: [u8; 32],
+    ) -> Result<(), TrustError> {
+        let path = self.path_for(fingerprint);
+        let Some(mut rec) = self.load(fingerprint)? else {
             return Err(TrustError::NotPinned);
         };
         if rec.current_fingerprint != old {
@@ -148,14 +160,14 @@ impl PinStore for FsPinStore {
 /// All methods have default empty implementations for optional overriding.
 pub trait EventSink: Send + Sync {
     /// Called when a peer is first seen and pinned (TOFU operation).
-    /// Provides the peer ID and their initial fingerprint.
-    fn on_first_seen(&self, _peer: &PeerId, _fpr: &[u8; 32]) {}
+    /// Provides the SPKI fingerprint used as the pin key and the initial fingerprint value.
+    fn on_first_seen(&self, _fingerprint: &[u8; 32], _fpr: &[u8; 32]) {}
     /// Called when a peer's key is rotated from old to new fingerprint.
     /// Provides both the old and new fingerprints.
     fn on_rotation(&self, _old: &[u8; 32], _new: &[u8; 32]) {}
-    /// Called when channel binding verification succeeds for a peer.
-    /// Provides the peer ID that was successfully verified.
-    fn on_binding_verified(&self, _peer: &PeerId) {}
+    /// Called when channel binding verification succeeds.
+    /// Provides the SPKI fingerprint of the verified peer.
+    fn on_binding_verified(&self, _fingerprint: &[u8; 32]) {}
 }
 
 /// A test utility that collects and records trust-related events for verification.
@@ -167,20 +179,20 @@ pub struct EventCollector {
 
 #[derive(Default)]
 struct CollectorState {
-    first_seen: Option<(PeerId, [u8; 32])>,
+    first_seen: Option<([u8; 32], [u8; 32])>,
     rotation: Option<([u8; 32], [u8; 32])>,
     binding_verified: bool,
 }
 
 impl EventCollector {
-    /// Check if the `on_first_seen` event was called with the specified peer and fingerprint.
-    pub fn first_seen_called_with(&self, p: &PeerId, f: &[u8; 32]) -> bool {
+    /// Check if the `on_first_seen` event was called with the specified fingerprint and fpr.
+    pub fn first_seen_called_with(&self, fingerprint: &[u8; 32], f: &[u8; 32]) -> bool {
         self.inner
             .lock()
             .map(|s| {
                 s.first_seen
                     .as_ref()
-                    .map(|(pp, ff)| pp == p && ff == f)
+                    .map(|(fp, ff)| fp == fingerprint && ff == f)
                     .unwrap_or(false)
             })
             .unwrap_or(false)
@@ -195,9 +207,9 @@ impl EventCollector {
 }
 
 impl EventSink for EventCollector {
-    fn on_first_seen(&self, peer: &PeerId, fpr: &[u8; 32]) {
+    fn on_first_seen(&self, fingerprint: &[u8; 32], fpr: &[u8; 32]) {
         if let Ok(mut g) = self.inner.lock() {
-            g.first_seen = Some((*peer, *fpr));
+            g.first_seen = Some((*fingerprint, *fpr));
         }
     }
     fn on_rotation(&self, old: &[u8; 32], new: &[u8; 32]) {
@@ -205,7 +217,7 @@ impl EventSink for EventCollector {
             g.rotation = Some((*old, *new));
         }
     }
-    fn on_binding_verified(&self, _peer: &PeerId) {
+    fn on_binding_verified(&self, _fingerprint: &[u8; 32]) {
         if let Ok(mut g) = self.inner.lock() {
             g.binding_verified = true;
         }
@@ -311,31 +323,26 @@ fn fingerprint_spki(spki: &[u8]) -> [u8; 32] {
     *blake3::hash(spki).as_bytes()
 }
 
-fn peer_id_from_spki(spki: &[u8]) -> PeerId {
-    PeerId(fingerprint_spki(spki))
-}
-
 /// Register a peer for the first time, performing TOFU pinning if allowed by policy.
-/// Computes the peer ID from the SPKI fingerprint and either loads existing pin or creates new one.
-/// Returns the peer ID regardless of whether pinning occurred.
+/// Computes the SPKI fingerprint and either loads existing pin or creates new one.
+/// Returns the fingerprint regardless of whether pinning occurred.
 pub fn register_first_seen(
     store: &dyn PinStore,
     policy: &TransportPolicy,
     spki: &[u8],
-) -> Result<PeerId, TrustError> {
-    let peer = peer_id_from_spki(spki);
+) -> Result<[u8; 32], TrustError> {
     let fpr = fingerprint_spki(spki);
-    match store.load(&peer)? {
-        Some(_) => Ok(peer),
+    match store.load(&fpr)? {
+        Some(_) => Ok(fpr),
         None => {
             if !policy.allow_tofu {
                 return Err(TrustError::ChannelBinding("TOFU disallowed"));
             }
-            store.save_first(&peer, fpr)?;
+            store.save_first(&fpr, fpr)?;
             if let Some(sink) = &policy.sink {
-                sink.on_first_seen(&peer, &fpr);
+                sink.on_first_seen(&fpr, &fpr);
             }
-            Ok(peer)
+            Ok(fpr)
         }
     }
 }
@@ -355,7 +362,6 @@ pub fn sign_continuity(old_sk: &MlDsaSecretKey, new_fpr: &[u8; 32]) -> Vec<u8> {
 pub fn register_rotation(
     store: &dyn PinStore,
     policy: &TransportPolicy,
-    peer: &PeerId,
     old_fpr: &[u8; 32],
     new_spki: &[u8],
     continuity_sig: &[u8],
@@ -369,7 +375,7 @@ pub fn register_rotation(
             return Err(TrustError::ContinuityRequired);
         }
     }
-    store.rotate(peer, *old_fpr, new_fpr)?;
+    store.rotate(old_fpr, *old_fpr, new_fpr)?;
     if let Some(sink) = &policy.sink {
         sink.on_rotation(old_fpr, &new_fpr);
     }
@@ -401,22 +407,21 @@ pub fn sign_exporter(
 
 /// Verify a binding signature against a pinned SubjectPublicKeyInfo (SPKI).
 ///
-/// - Validates the SPKI matches the current pin for the derived peer ID.
+/// - Validates the SPKI matches the current pin for the derived fingerprint.
 /// - Verifies the ML-DSA-65 signature over the exporter using the SPKI's key.
-/// - Emits `OnBindingVerified` on success and returns the `PeerId`.
+/// - Emits `OnBindingVerified` on success and returns the SPKI fingerprint.
 pub fn verify_binding(
     store: &dyn PinStore,
     policy: &TransportPolicy,
     spki: &[u8],
     exporter: &[u8; 32],
     signature: &[u8],
-) -> Result<PeerId, TrustError> {
-    // Compute IDs/fingerprints
-    let peer = peer_id_from_spki(spki);
+) -> Result<[u8; 32], TrustError> {
+    // Compute fingerprint
     let fpr = fingerprint_spki(spki);
 
     // Check pin
-    let Some(rec) = store.load(&peer)? else {
+    let Some(rec) = store.load(&fpr)? else {
         return Err(TrustError::NotPinned);
     };
     if rec.current_fingerprint != fpr {
@@ -432,9 +437,9 @@ pub fn verify_binding(
         .map_err(|_| TrustError::ChannelBinding("sig verify"))?;
 
     if let Some(sink) = &policy.sink {
-        sink.on_binding_verified(&peer);
+        sink.on_binding_verified(&fpr);
     }
-    Ok(peer)
+    Ok(fpr)
 }
 
 /// Perform a simple exporter-based channel binding. Minimal stub that derives exporter
@@ -457,14 +462,13 @@ pub async fn perform_channel_binding(
 
     // In a complete implementation, we would:
     // - extract peer SPKI from the session
-    // - compute PeerId and check PinStore
-    // - exchange signatures over the exporter using ML-DSA/Ed25519
+    // - compute fingerprint and check PinStore
+    // - exchange signatures over the exporter using ML-DSA
     // - verify signature against pinned SPKI
     // For now, we simply signal success if exporter is derivable.
     if let Some(sink) = &policy.sink {
-        // Best-effort: derive a pseudo PeerId from exporter for event association in tests
-        let peer = PeerId(out);
-        sink.on_binding_verified(&peer);
+        // Best-effort: use exporter bytes as pseudo-fingerprint for event association in tests
+        sink.on_binding_verified(&out);
     }
     let _ = store; // placeholder; real check will consult pins
     Ok(())
@@ -476,7 +480,7 @@ pub fn perform_channel_binding_from_exporter(
     policy: &TransportPolicy,
 ) -> Result<(), TrustError> {
     if let Some(sink) = &policy.sink {
-        sink.on_binding_verified(&PeerId(*exporter));
+        sink.on_binding_verified(exporter);
     }
     Ok(())
 }
@@ -530,11 +534,12 @@ pub async fn send_binding(
 }
 
 /// Receive and verify a binding message over a unidirectional stream using ML-DSA-65.
+/// Returns the SPKI fingerprint of the verified peer.
 pub async fn recv_verify_binding(
     conn: &Connection,
     store: &dyn PinStore,
     policy: &TransportPolicy,
-) -> Result<PeerId, TrustError> {
+) -> Result<[u8; 32], TrustError> {
     let mut stream = conn
         .accept_uni()
         .await

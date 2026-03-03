@@ -28,8 +28,6 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use crate::nat_traversal_api::PeerId;
-
 /// Detected NAT type for the node
 ///
 /// NAT type affects connectivity - some types are easier to traverse than others.
@@ -102,8 +100,8 @@ impl std::fmt::Display for NatType {
 #[derive(Debug, Clone)]
 pub struct NodeStatus {
     // --- Identity ---
-    /// This node's peer ID (derived from public key)
-    pub peer_id: PeerId,
+    /// This node's ML-DSA-65 SPKI public key bytes (None if not yet available)
+    pub public_key: Option<Vec<u8>>,
 
     /// Local bind address
     pub local_addr: SocketAddr,
@@ -184,7 +182,7 @@ pub struct NodeStatus {
 impl Default for NodeStatus {
     fn default() -> Self {
         Self {
-            peer_id: PeerId([0u8; 32]),
+            public_key: None,
             local_addr: "0.0.0.0:0".parse().unwrap_or_else(|_| {
                 SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0)
             }),

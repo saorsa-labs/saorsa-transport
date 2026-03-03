@@ -11,7 +11,6 @@
 //!
 //! This module provides:
 //! - ML-DSA-65 key generation for Pure PQC identity
-//! - PeerId derivation from ML-DSA-65 public keys
 //! - SPKI (SubjectPublicKeyInfo) ASN.1 encoding/decoding for ML-DSA-65
 //! - Signature verification for TLS 1.3 authentication
 //!
@@ -55,23 +54,20 @@ pub const ML_DSA_65_SIGNATURE_SIZE: usize = 3309;
 /// Generate a new ML-DSA-65 keypair for Pure PQC identity
 ///
 /// This is the PRIMARY and ONLY identity generation function.
-/// Returns (public_key, secret_key) for use in TLS authentication and PeerId derivation.
+/// Returns (public_key, secret_key) for use in TLS authentication.
 pub fn generate_ml_dsa_keypair() -> Result<(MlDsa65PublicKey, MlDsa65SecretKey), PqcError> {
     let ml_dsa = MlDsa65::new();
     ml_dsa.generate_keypair()
 }
 
-/// Derive a PeerId from an ML-DSA-65 public key using BLAKE3 hash
+/// Compute a BLAKE3 fingerprint of an ML-DSA-65 public key.
 ///
-/// Pure PQC peer identification using ML-DSA-65 public keys.
-///
-/// The BLAKE3 hash ensures:
+/// Returns a 32-byte fingerprint suitable for use as a cryptographic identity
+/// (e.g., TOFU pin key, token binding). The BLAKE3 hash ensures:
 /// - Uniform 32-byte distribution
 /// - Collision resistance
-/// - No direct key exposure in the peer ID
-pub fn derive_peer_id_from_public_key(
-    public_key: &MlDsa65PublicKey,
-) -> crate::nat_traversal_api::PeerId {
+/// - No direct key exposure in the fingerprint
+pub fn fingerprint_public_key(public_key: &MlDsa65PublicKey) -> [u8; 32] {
     let key_bytes = public_key.as_bytes();
 
     // Create the input data with domain separator
@@ -80,26 +76,13 @@ pub fn derive_peer_id_from_public_key(
     input.extend_from_slice(key_bytes);
 
     // Hash the input using BLAKE3
-    let hash = blake3::hash(&input);
-
-    crate::nat_traversal_api::PeerId(*hash.as_bytes())
+    *blake3::hash(&input).as_bytes()
 }
 
-/// Derive a PeerId from raw ML-DSA-65 public key bytes (1952 bytes)
-pub fn derive_peer_id_from_key_bytes(
-    key_bytes: &[u8],
-) -> Result<crate::nat_traversal_api::PeerId, PqcError> {
+/// Compute a BLAKE3 fingerprint from raw ML-DSA-65 public key bytes (1952 bytes)
+pub fn fingerprint_public_key_bytes(key_bytes: &[u8]) -> Result<[u8; 32], PqcError> {
     let public_key = MlDsa65PublicKey::from_bytes(key_bytes)?;
-    Ok(derive_peer_id_from_public_key(&public_key))
-}
-
-/// Verify that a peer ID was correctly derived from an ML-DSA-65 public key
-pub fn verify_peer_id(
-    peer_id: &crate::nat_traversal_api::PeerId,
-    public_key: &MlDsa65PublicKey,
-) -> bool {
-    let derived_id = derive_peer_id_from_public_key(public_key);
-    *peer_id == derived_id
+    Ok(fingerprint_public_key(&public_key))
 }
 
 // =============================================================================
@@ -431,42 +414,31 @@ mod tests {
     }
 
     #[test]
-    fn test_derive_peer_id() {
+    fn test_fingerprint_public_key() {
         let (public_key, _) = generate_ml_dsa_keypair().unwrap();
 
         // Deterministic
-        let peer_id1 = derive_peer_id_from_public_key(&public_key);
-        let peer_id2 = derive_peer_id_from_public_key(&public_key);
-        assert_eq!(peer_id1, peer_id2);
+        let fpr1 = fingerprint_public_key(&public_key);
+        let fpr2 = fingerprint_public_key(&public_key);
+        assert_eq!(fpr1, fpr2);
 
-        // Different keys produce different peer IDs
+        // Different keys produce different fingerprints
         let (public_key2, _) = generate_ml_dsa_keypair().unwrap();
-        let peer_id3 = derive_peer_id_from_public_key(&public_key2);
-        assert_ne!(peer_id1, peer_id3);
+        let fpr3 = fingerprint_public_key(&public_key2);
+        assert_ne!(fpr1, fpr3);
     }
 
     #[test]
-    fn test_derive_peer_id_from_key_bytes() {
+    fn test_fingerprint_public_key_bytes() {
         let (public_key, _) = generate_ml_dsa_keypair().unwrap();
         let key_bytes = public_key.as_bytes();
 
-        let peer_id1 = derive_peer_id_from_public_key(&public_key);
-        let peer_id2 = derive_peer_id_from_key_bytes(key_bytes).unwrap();
-        assert_eq!(peer_id1, peer_id2);
+        let fpr1 = fingerprint_public_key(&public_key);
+        let fpr2 = fingerprint_public_key_bytes(key_bytes).unwrap();
+        assert_eq!(fpr1, fpr2);
 
         // Invalid key bytes should fail
-        assert!(derive_peer_id_from_key_bytes(&[0u8; 100]).is_err());
-    }
-
-    #[test]
-    fn test_verify_peer_id() {
-        let (public_key, _) = generate_ml_dsa_keypair().unwrap();
-        let peer_id = derive_peer_id_from_public_key(&public_key);
-
-        assert!(verify_peer_id(&peer_id, &public_key));
-
-        let (other_key, _) = generate_ml_dsa_keypair().unwrap();
-        assert!(!verify_peer_id(&peer_id, &other_key));
+        assert!(fingerprint_public_key_bytes(&[0u8; 100]).is_err());
     }
 
     #[test]

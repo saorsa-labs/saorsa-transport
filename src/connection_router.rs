@@ -70,7 +70,7 @@ use crate::constrained::{
     ConstrainedTransport, ConstrainedTransportConfig,
 };
 use crate::high_level::Connection as QuicConnection;
-use crate::nat_traversal_api::{NatTraversalEndpoint, NatTraversalError, PeerId};
+use crate::nat_traversal_api::{NatTraversalEndpoint, NatTraversalError};
 use crate::transport::{ProtocolEngine, TransportAddr, TransportCapabilities, TransportRegistry};
 
 /// Error type for connection routing operations
@@ -226,8 +226,6 @@ pub enum RoutedConnection {
         remote: TransportAddr,
         /// Connection identifier
         connection_id: u64,
-        /// Peer ID of the remote peer
-        peer_id: PeerId,
         /// The actual QUIC connection handle
         connection: QuicConnection,
     },
@@ -249,13 +247,11 @@ impl fmt::Debug for RoutedConnection {
             Self::Quic {
                 remote,
                 connection_id,
-                peer_id,
                 ..
             } => f
                 .debug_struct("RoutedConnection::Quic")
                 .field("remote", remote)
                 .field("connection_id", connection_id)
-                .field("peer_id", peer_id)
                 .finish_non_exhaustive(),
             Self::Constrained {
                 remote,
@@ -308,11 +304,10 @@ impl RoutedConnection {
 
     /// Get the peer ID for this connection
     ///
-    /// Returns Some(peer_id) for QUIC connections, None for constrained connections
-    /// (constrained connections don't have peer IDs in the same sense)
-    pub fn peer_id(&self) -> Option<&PeerId> {
+    /// Returns the remote SocketAddr for QUIC connections, None for constrained connections.
+    pub fn remote_socket_addr(&self) -> Option<SocketAddr> {
         match self {
-            Self::Quic { peer_id, .. } => Some(peer_id),
+            Self::Quic { remote, .. } => remote.as_socket_addr(),
             Self::Constrained { .. } => None,
         }
     }
@@ -1103,21 +1098,17 @@ impl ConnectionRouter {
     pub async fn connect_async(
         &mut self,
         remote: &TransportAddr,
-        peer_id: Option<PeerId>,
         server_name: Option<&str>,
     ) -> Result<RoutedConnection, RouterError> {
         let engine = self.select_engine_for_addr(remote);
 
         match engine {
             ProtocolEngine::Quic => {
-                // QUIC requires peer_id and server_name
-                let peer_id = peer_id.ok_or_else(|| RouterError::Quic {
-                    reason: "peer_id required for QUIC connections".into(),
-                })?;
+                // QUIC requires server_name
                 let server_name = server_name.ok_or_else(|| RouterError::Quic {
                     reason: "server_name required for QUIC connections".into(),
                 })?;
-                self.connect_quic_async(remote, peer_id, server_name).await
+                self.connect_quic_async(remote, server_name).await
             }
             ProtocolEngine::Constrained => {
                 // Constrained connections are sync, so we can just call the sync version
@@ -1126,19 +1117,17 @@ impl ConnectionRouter {
         }
     }
 
-    /// Connect to a QUIC peer by peer ID and address
+    /// Connect to a QUIC peer by address
     ///
     /// Convenience method for QUIC connections that doesn't require engine selection
     /// (assumes QUIC is appropriate for the given address).
     pub async fn connect_peer(
         &mut self,
-        peer_id: PeerId,
         remote_addr: SocketAddr,
         server_name: &str,
     ) -> Result<RoutedConnection, RouterError> {
         let transport_addr = TransportAddr::Udp(remote_addr);
-        self.connect_quic_async(&transport_addr, peer_id, server_name)
-            .await
+        self.connect_quic_async(&transport_addr, server_name).await
     }
 
     /// Connect using the QUIC engine (sync version)
@@ -1162,7 +1151,6 @@ impl ConnectionRouter {
     pub async fn connect_quic_async(
         &mut self,
         remote: &TransportAddr,
-        peer_id: PeerId,
         server_name: &str,
     ) -> Result<RoutedConnection, RouterError> {
         let endpoint = self
@@ -1176,9 +1164,7 @@ impl ConnectionRouter {
         })?;
 
         // Connect through the NAT traversal endpoint
-        let connection = endpoint
-            .connect_to_peer(peer_id, server_name, socket_addr)
-            .await?;
+        let connection = endpoint.connect_to(server_name, socket_addr).await?;
 
         // Assign connection ID and update stats
         let connection_id = self.next_quic_id;
@@ -1187,7 +1173,6 @@ impl ConnectionRouter {
 
         tracing::info!(
             connection_id,
-            peer = ?peer_id,
             remote = %socket_addr,
             "QUIC connection established via router"
         );
@@ -1195,7 +1180,6 @@ impl ConnectionRouter {
         Ok(RoutedConnection::Quic {
             remote: remote.clone(),
             connection_id,
-            peer_id,
             connection,
         })
     }
@@ -1308,10 +1292,8 @@ impl ConnectionRouter {
             .as_ref()
             .ok_or(RouterError::EndpointNotInitialized)?;
 
-        let (peer_id, connection) = endpoint.accept_connection().await?;
+        let (remote_addr, connection) = endpoint.accept_connection().await?;
 
-        // Get remote address from the connection
-        let remote_addr = connection.remote_address();
         let transport_addr = TransportAddr::Udp(remote_addr);
 
         // Assign connection ID and update stats
@@ -1321,7 +1303,6 @@ impl ConnectionRouter {
 
         tracing::info!(
             connection_id,
-            peer = ?peer_id,
             remote = %remote_addr,
             "Accepted incoming QUIC connection via router"
         );
@@ -1329,7 +1310,6 @@ impl ConnectionRouter {
         Ok(RoutedConnection::Quic {
             remote: transport_addr,
             connection_id,
-            peer_id,
             connection,
         })
     }
@@ -1831,7 +1811,7 @@ mod tests {
         assert!(conn.is_constrained());
         assert!(!conn.is_quic());
         assert!(conn.quic_connection().is_none());
-        assert!(conn.peer_id().is_none());
+        assert!(conn.remote_socket_addr().is_none());
         assert_eq!(conn.remote_addr(), &addr);
 
         // Connection ID should be valid

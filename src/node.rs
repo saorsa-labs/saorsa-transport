@@ -53,7 +53,6 @@ use tokio::sync::broadcast;
 use tracing::info;
 
 use crate::host_identity::HostIdentity;
-use crate::nat_traversal_api::PeerId;
 use crate::node_config::NodeConfig;
 use crate::node_event::NodeEvent;
 use crate::node_status::{NatType, NodeStatus};
@@ -133,7 +132,6 @@ pub struct Node {
 impl std::fmt::Debug for Node {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Node")
-            .field("peer_id", &self.peer_id())
             .field("local_addr", &self.local_addr())
             .finish_non_exhaustive()
     }
@@ -282,7 +280,7 @@ impl Node {
             .await
             .map_err(NodeError::Endpoint)?;
 
-        info!("Node created with peer ID: {:?}", endpoint.peer_id());
+        info!("Node created with local addr: {:?}", endpoint.local_addr());
 
         let inner = Arc::new(endpoint);
 
@@ -328,49 +326,35 @@ impl Node {
     fn convert_event(p2p_event: P2pEvent) -> Option<NodeEvent> {
         match p2p_event {
             P2pEvent::PeerConnected {
-                peer_id,
                 addr,
+                public_key,
                 side: _,
             } => Some(NodeEvent::PeerConnected {
-                peer_id,
                 addr,
+                public_key,
                 direct: true, // P2pEvent doesn't distinguish, assume direct
             }),
-            P2pEvent::PeerDisconnected { peer_id, reason } => Some(NodeEvent::PeerDisconnected {
-                peer_id,
-                reason: reason.into(), // Use From trait
+            P2pEvent::PeerDisconnected { addr, reason } => Some(NodeEvent::PeerDisconnected {
+                addr: addr.to_synthetic_socket_addr(),
+                reason: reason.into(),
             }),
             P2pEvent::ExternalAddressDiscovered { addr } => {
                 Some(NodeEvent::ExternalAddressDiscovered { addr })
             }
-            P2pEvent::DataReceived { peer_id, bytes } => Some(NodeEvent::DataReceived {
-                peer_id,
-                stream_id: 0, // P2pEvent doesn't track stream IDs
+            P2pEvent::DataReceived { addr, bytes } => Some(NodeEvent::DataReceived {
+                addr,
+                stream_id: 0,
                 bytes,
             }),
             P2pEvent::ConstrainedDataReceived {
                 remote_addr,
                 connection_id,
                 data,
-            } => {
-                // For constrained data, derive a synthetic peer ID from the transport address
-                let synthetic_peer_id = {
-                    use std::collections::hash_map::DefaultHasher;
-                    use std::hash::{Hash, Hasher};
-                    let synthetic_addr = remote_addr.to_synthetic_socket_addr();
-                    let mut hasher = DefaultHasher::new();
-                    synthetic_addr.hash(&mut hasher);
-                    let hash = hasher.finish();
-                    let mut peer_id_bytes = [0u8; 32];
-                    peer_id_bytes[..8].copy_from_slice(&hash.to_le_bytes());
-                    PeerId(peer_id_bytes)
-                };
-                Some(NodeEvent::DataReceived {
-                    peer_id: synthetic_peer_id,
-                    stream_id: connection_id as u64,
-                    bytes: data.len(),
-                })
-            }
+            } => Some(NodeEvent::DataReceived {
+                addr: remote_addr.to_synthetic_socket_addr(),
+                stream_id: connection_id as u64,
+                bytes: data.len(),
+            }),
             // Events without direct NodeEvent equivalents are ignored
             P2pEvent::NatTraversalProgress { .. }
             | P2pEvent::BootstrapStatus { .. }
@@ -379,14 +363,6 @@ impl Node {
     }
 
     // === Identity ===
-
-    /// Get this node's peer ID
-    ///
-    /// The peer ID is derived from the Ed25519 public key and is
-    /// the unique identifier for this node on the network.
-    pub fn peer_id(&self) -> PeerId {
-        self.inner.peer_id()
-    }
 
     /// Get the local bind address
     ///
@@ -438,23 +414,6 @@ impl Node {
         self.inner.connect(addr).await.map_err(NodeError::Endpoint)
     }
 
-    /// Connect to a peer by ID
-    ///
-    /// This uses NAT traversal to find and connect to the peer.
-    /// A coordinator (known peer) is used to help with hole punching.
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// let conn = node.connect(peer_id).await?;
-    /// ```
-    pub async fn connect(&self, peer_id: PeerId) -> Result<PeerConnection, NodeError> {
-        self.inner
-            .connect_to_peer(peer_id, None)
-            .await
-            .map_err(NodeError::Endpoint)
-    }
-
     /// Accept an incoming connection
     ///
     /// Waits for and accepts the next incoming connection.
@@ -490,10 +449,10 @@ impl Node {
             .map_err(NodeError::Endpoint)
     }
 
-    /// Disconnect from a peer
-    pub async fn disconnect(&self, peer_id: &PeerId) -> Result<(), NodeError> {
+    /// Disconnect from a peer by address
+    pub async fn disconnect(&self, addr: &SocketAddr) -> Result<(), NodeError> {
         self.inner
-            .disconnect(peer_id)
+            .disconnect(addr)
             .await
             .map_err(NodeError::Endpoint)
     }
@@ -503,30 +462,32 @@ impl Node {
         self.inner.connected_peers().await
     }
 
-    /// Check if connected to a peer
-    pub async fn is_connected(&self, peer_id: &PeerId) -> bool {
-        self.inner.is_connected(peer_id).await
+    /// Check if connected to a peer by address
+    pub async fn is_connected(&self, addr: &SocketAddr) -> bool {
+        self.inner.is_connected(addr).await
     }
 
     /// Query the health status of a connection to a specific peer.
     ///
     /// Returns `None` if the peer is not connected.
-    pub async fn connection_health(&self, peer_id: &PeerId) -> Option<crate::ConnectionHealth> {
-        self.inner.connection_health(peer_id).await
+    pub async fn connection_health(&self, addr: &SocketAddr) -> Option<crate::ConnectionHealth> {
+        self.inner.connection_health(addr).await
     }
 
     // === Messaging ===
 
-    /// Send data to a peer
-    pub async fn send(&self, peer_id: &PeerId, data: &[u8]) -> Result<(), NodeError> {
+    /// Send data to a peer by address
+    pub async fn send(&self, addr: &SocketAddr, data: &[u8]) -> Result<(), NodeError> {
         self.inner
-            .send(peer_id, data)
+            .send(addr, data)
             .await
             .map_err(NodeError::Endpoint)
     }
 
     /// Receive data from any peer
-    pub async fn recv(&self) -> Result<(PeerId, Vec<u8>), NodeError> {
+    ///
+    /// Returns the sender's address and the received data.
+    pub async fn recv(&self) -> Result<(SocketAddr, Vec<u8>), NodeError> {
         self.inner.recv().await.map_err(NodeError::Endpoint)
     }
 
@@ -610,7 +571,8 @@ impl Node {
         let mut total_rtt = Duration::ZERO;
         let mut rtt_count = 0u32;
         for peer in &connected_peers {
-            if let Some(metrics) = self.inner.connection_metrics(&peer.peer_id).await {
+            let peer_addr = peer.remote_addr.to_synthetic_socket_addr();
+            if let Some(metrics) = self.inner.connection_metrics(&peer_addr).await {
                 if let Some(rtt) = metrics.rtt {
                     total_rtt += rtt;
                     rtt_count += 1;
@@ -624,7 +586,7 @@ impl Node {
         };
 
         NodeStatus {
-            peer_id: self.peer_id(),
+            public_key: Some(self.public_key_bytes().to_vec()),
             local_addr: local_addr.unwrap_or_else(|| {
                 "0.0.0.0:0".parse().unwrap_or_else(|_| {
                     SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0)
@@ -762,7 +724,6 @@ impl Clone for Node {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::derive_peer_id_from_public_key;
 
     #[tokio::test]
     async fn test_node_new_default() {
@@ -772,9 +733,9 @@ mod tests {
         let node = node.unwrap();
         assert!(node.is_running());
 
-        // Peer ID should be valid (non-zero)
-        let peer_id = node.peer_id();
-        assert_ne!(peer_id.0, [0u8; 32]);
+        // Public key should be valid (non-empty)
+        let pk = node.public_key_bytes();
+        assert!(!pk.is_empty());
 
         node.shutdown().await;
     }
@@ -817,7 +778,7 @@ mod tests {
         let status = node.status().await;
 
         // Check status fields are populated
-        assert_ne!(status.peer_id.0, [0u8; 32]);
+        assert!(status.public_key.is_some());
         assert_eq!(status.connected_peers, 0); // No connections yet
 
         node.shutdown().await;
@@ -837,8 +798,8 @@ mod tests {
         let node1 = Node::new().await.unwrap();
         let node2 = node1.clone();
 
-        // Both should have same peer ID
-        assert_eq!(node1.peer_id(), node2.peer_id());
+        // Both should have same public key
+        assert_eq!(node1.public_key_bytes(), node2.public_key_bytes());
 
         node1.shutdown().await;
         // node2 still references the same Arc, so shutdown already happened
@@ -849,24 +810,23 @@ mod tests {
         let node = Node::new().await.unwrap();
         let debug_str = format!("{:?}", node);
         assert!(debug_str.contains("Node"));
-        assert!(debug_str.contains("peer_id"));
 
         node.shutdown().await;
     }
 
     #[tokio::test]
     async fn test_node_identity() {
-        use crate::crypto::raw_public_keys::key_utils::derive_peer_id_from_key_bytes;
+        use crate::crypto::raw_public_keys::pqc::fingerprint_public_key_bytes;
 
         let node = Node::new().await.unwrap();
 
         // Verify identity methods
-        let peer_id = node.peer_id();
         let public_key = node.public_key_bytes();
+        assert!(!public_key.is_empty());
 
-        // Peer ID should be derived from public key (ML-DSA-65)
-        let derived = derive_peer_id_from_key_bytes(public_key).unwrap();
-        assert_eq!(peer_id, derived);
+        // SPKI fingerprint should be derivable from the public key bytes
+        let fingerprint = fingerprint_public_key_bytes(public_key).unwrap();
+        assert_ne!(fingerprint, [0u8; 32]);
 
         node.shutdown().await;
     }
@@ -899,14 +859,12 @@ mod tests {
 
         // Generate an ML-DSA-65 keypair
         let (public_key, secret_key) = generate_ml_dsa_keypair().unwrap();
-        let expected_peer_id = derive_peer_id_from_public_key(&public_key);
         let expected_public_key_bytes = public_key.as_bytes().to_vec();
 
         // Create node with the keypair
         let node = Node::with_keypair(public_key, secret_key).await.unwrap();
 
-        // Verify the node uses the same identity
-        assert_eq!(node.peer_id(), expected_peer_id);
+        // Verify the node uses the same public key
         assert_eq!(node.public_key_bytes(), expected_public_key_bytes);
 
         node.shutdown().await;
@@ -918,15 +876,13 @@ mod tests {
 
         // Generate an ML-DSA-65 keypair
         let (public_key, secret_key) = generate_ml_dsa_keypair().unwrap();
-        let expected_peer_id = derive_peer_id_from_public_key(&public_key);
         let expected_public_key_bytes = public_key.as_bytes().to_vec();
 
         // Create node via config with keypair
         let config = NodeConfig::with_keypair(public_key, secret_key);
         let node = Node::with_config(config).await.unwrap();
 
-        // Verify the node uses the same identity
-        assert_eq!(node.peer_id(), expected_peer_id);
+        // Verify the node uses the same public key
         assert_eq!(node.public_key_bytes(), expected_public_key_bytes);
 
         node.shutdown().await;
@@ -965,7 +921,6 @@ mod tests {
         let node1 = Node::with_host_identity(&host, network_id, &temp_dir)
             .await
             .unwrap();
-        let peer_id_1 = node1.peer_id();
         let public_key_1 = node1.public_key_bytes().to_vec();
 
         // Verify the node is running
@@ -978,11 +933,9 @@ mod tests {
         let node2 = Node::with_host_identity(&host, network_id, &temp_dir)
             .await
             .unwrap();
-        let peer_id_2 = node2.peer_id();
         let public_key_2 = node2.public_key_bytes().to_vec();
 
-        // Verify both nodes have the same identity
-        assert_eq!(peer_id_1, peer_id_2);
+        // Verify both nodes have the same public key
         assert_eq!(public_key_1, public_key_2);
 
         node2.shutdown().await;
@@ -1007,15 +960,15 @@ mod tests {
         let node1 = Node::with_host_identity(&host, b"network-1", &temp_dir)
             .await
             .unwrap();
-        let peer_id_1 = node1.peer_id();
+        let public_key_1 = node1.public_key_bytes().to_vec();
 
         let node2 = Node::with_host_identity(&host, b"network-2", &temp_dir)
             .await
             .unwrap();
-        let peer_id_2 = node2.peer_id();
+        let public_key_2 = node2.public_key_bytes().to_vec();
 
         // Different networks should have different identities (privacy)
-        assert_ne!(peer_id_1, peer_id_2);
+        assert_ne!(public_key_1, public_key_2);
 
         node1.shutdown().await;
         node2.shutdown().await;

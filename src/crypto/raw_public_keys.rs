@@ -35,9 +35,9 @@ use tracing::{debug, info, warn};
 // Re-export Pure PQC types from pqc module
 pub use pqc::{
     ML_DSA_65_PUBLIC_KEY_SIZE, ML_DSA_65_SECRET_KEY_SIZE, ML_DSA_65_SIGNATURE_SIZE,
-    PqcRawPublicKeyVerifier, create_subject_public_key_info, derive_peer_id_from_key_bytes,
-    derive_peer_id_from_public_key, extract_public_key_from_spki, generate_ml_dsa_keypair,
-    supported_signature_schemes, verify_peer_id, verify_signature,
+    PqcRawPublicKeyVerifier, create_subject_public_key_info, extract_public_key_from_spki,
+    fingerprint_public_key, fingerprint_public_key_bytes, generate_ml_dsa_keypair,
+    supported_signature_schemes, verify_signature,
 };
 
 use crate::crypto::pqc::{
@@ -644,8 +644,8 @@ impl RawPublicKeyConfigBuilder {
 pub mod key_utils {
     pub use super::pqc::{
         ML_DSA_65_PUBLIC_KEY_SIZE, ML_DSA_65_SECRET_KEY_SIZE, ML_DSA_65_SIGNATURE_SIZE,
-        MlDsaPublicKey, MlDsaSecretKey, MlDsaSignature, derive_peer_id_from_key_bytes,
-        derive_peer_id_from_public_key, generate_ml_dsa_keypair, verify_peer_id,
+        MlDsaPublicKey, MlDsaSecretKey, MlDsaSignature, fingerprint_public_key,
+        fingerprint_public_key_bytes, generate_ml_dsa_keypair,
     };
 
     /// Type alias for ML-DSA-65 public key
@@ -660,28 +660,6 @@ pub mod key_utils {
     /// Returns (public_key, secret_key) for use in TLS and peer identification.
     pub fn generate_keypair() -> Result<(MlDsa65PublicKey, MlDsa65SecretKey), PqcError> {
         generate_ml_dsa_keypair()
-    }
-
-    /// Derive a peer ID from an ML-DSA-65 public key
-    pub fn peer_id_from_public_key(
-        public_key: &MlDsa65PublicKey,
-    ) -> crate::nat_traversal_api::PeerId {
-        derive_peer_id_from_public_key(public_key)
-    }
-
-    /// Derive a peer ID from raw ML-DSA-65 public key bytes
-    pub fn peer_id_from_key_bytes(
-        key_bytes: &[u8],
-    ) -> Result<crate::nat_traversal_api::PeerId, PqcError> {
-        derive_peer_id_from_key_bytes(key_bytes)
-    }
-
-    /// Verify that a peer ID was correctly derived from a public key
-    pub fn verify_peer_id_matches(
-        peer_id: &crate::nat_traversal_api::PeerId,
-        public_key: &MlDsa65PublicKey,
-    ) -> bool {
-        verify_peer_id(peer_id, public_key)
     }
 }
 
@@ -797,30 +775,19 @@ mod tests {
     }
 
     #[test]
-    fn test_peer_id_derivation() {
+    fn test_fingerprint_derivation() {
         let (public_key, _) = generate_ml_dsa_keypair().unwrap();
 
-        let peer_id1 = derive_peer_id_from_public_key(&public_key);
-        let peer_id2 = derive_peer_id_from_public_key(&public_key);
+        let fpr1 = fingerprint_public_key(&public_key);
+        let fpr2 = fingerprint_public_key(&public_key);
 
         // Deterministic
-        assert_eq!(peer_id1, peer_id2);
+        assert_eq!(fpr1, fpr2);
 
-        // Different keys produce different IDs
+        // Different keys produce different fingerprints
         let (public_key2, _) = generate_ml_dsa_keypair().unwrap();
-        let peer_id3 = derive_peer_id_from_public_key(&public_key2);
-        assert_ne!(peer_id1, peer_id3);
-    }
-
-    #[test]
-    fn test_verify_peer_id() {
-        let (public_key, _) = generate_ml_dsa_keypair().unwrap();
-        let peer_id = derive_peer_id_from_public_key(&public_key);
-
-        assert!(verify_peer_id(&peer_id, &public_key));
-
-        let (other_key, _) = generate_ml_dsa_keypair().unwrap();
-        assert!(!verify_peer_id(&peer_id, &other_key));
+        let fpr3 = fingerprint_public_key(&public_key2);
+        assert_ne!(fpr1, fpr3);
     }
 
     #[test]
@@ -837,10 +804,8 @@ mod tests {
         assert_eq!(public_key.as_bytes().len(), ML_DSA_65_PUBLIC_KEY_SIZE);
         assert_eq!(secret_key.as_bytes().len(), ML_DSA_65_SECRET_KEY_SIZE);
 
-        let peer_id = key_utils::peer_id_from_public_key(&public_key);
-        assert!(key_utils::verify_peer_id_matches(&peer_id, &public_key));
-
-        let peer_id2 = key_utils::peer_id_from_key_bytes(public_key.as_bytes()).unwrap();
-        assert_eq!(peer_id, peer_id2);
+        let fpr = key_utils::fingerprint_public_key(&public_key);
+        let fpr2 = key_utils::fingerprint_public_key_bytes(public_key.as_bytes()).unwrap();
+        assert_eq!(fpr, fpr2);
     }
 }

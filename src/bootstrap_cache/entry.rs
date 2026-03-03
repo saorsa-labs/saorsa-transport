@@ -7,7 +7,6 @@
 
 //! Cached peer entry types.
 
-use crate::nat_traversal_api::PeerId;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -16,11 +15,10 @@ use std::time::{Duration, SystemTime};
 /// A cached peer entry with quality metrics
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedPeer {
-    /// Unique peer identifier (serialized as bytes)
-    #[serde(with = "peer_id_serde")]
-    pub peer_id: PeerId,
+    /// Primary address used to identify and reach this peer
+    pub primary_address: SocketAddr,
 
-    /// Known socket addresses for this peer
+    /// Additional known socket addresses for this peer
     pub addresses: Vec<SocketAddr>,
 
     /// Peer capabilities and features
@@ -199,11 +197,10 @@ pub struct ConnectionOutcome {
 /// This tracks known relays that can reach a given peer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelayPathHint {
-    /// EndpointId of the relay peer
-    #[serde(with = "peer_id_serde")]
-    pub relay_endpoint_id: PeerId,
+    /// Primary socket address of the relay peer
+    pub relay_address: SocketAddr,
 
-    /// Known socket addresses for the relay
+    /// Additional known socket addresses for the relay
     pub relay_locators: Vec<SocketAddr>,
 
     /// Observed round-trip latency through this relay in milliseconds
@@ -214,11 +211,15 @@ pub struct RelayPathHint {
 }
 
 impl CachedPeer {
-    /// Create a new peer entry
-    pub fn new(peer_id: PeerId, addresses: Vec<SocketAddr>, source: PeerSource) -> Self {
+    /// Create a new peer entry keyed by its primary address.
+    pub fn new(
+        primary_address: SocketAddr,
+        addresses: Vec<SocketAddr>,
+        source: PeerSource,
+    ) -> Self {
         let now = SystemTime::now();
         Self {
-            peer_id,
+            primary_address,
             addresses,
             capabilities: PeerCapabilities::default(),
             first_seen: now,
@@ -358,47 +359,20 @@ impl CachedPeer {
     }
 }
 
-/// Serde helper for PeerId serialization
-mod peer_id_serde {
-    use super::PeerId;
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-
-    pub fn serialize<S>(peer_id: &PeerId, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        hex::encode(peer_id.0).serialize(serializer)
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<PeerId, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        let bytes = hex::decode(&s).map_err(serde::de::Error::custom)?;
-        if bytes.len() != 32 {
-            return Err(serde::de::Error::custom("PeerId must be 32 bytes"));
-        }
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&bytes);
-        Ok(PeerId(arr))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn test_addr() -> SocketAddr {
+        "127.0.0.1:9000".parse().unwrap()
+    }
+
     #[test]
     fn test_cached_peer_new() {
-        let peer_id = PeerId([1u8; 32]);
-        let peer = CachedPeer::new(
-            peer_id,
-            vec!["127.0.0.1:9000".parse().unwrap()],
-            PeerSource::Seed,
-        );
+        let addr = test_addr();
+        let peer = CachedPeer::new(addr, vec![addr], PeerSource::Seed);
 
-        assert_eq!(peer.peer_id, peer_id);
+        assert_eq!(peer.primary_address, addr);
         assert_eq!(peer.addresses.len(), 1);
         assert_eq!(peer.source, PeerSource::Seed);
         assert!((peer.quality_score - 0.5).abs() < f64::EPSILON);
@@ -406,11 +380,7 @@ mod tests {
 
     #[test]
     fn test_record_success() {
-        let mut peer = CachedPeer::new(
-            PeerId([1u8; 32]),
-            vec!["127.0.0.1:9000".parse().unwrap()],
-            PeerSource::Seed,
-        );
+        let mut peer = CachedPeer::new(test_addr(), vec![test_addr()], PeerSource::Seed);
 
         peer.record_success(100, None);
         assert_eq!(peer.stats.success_count, 1);
@@ -428,11 +398,7 @@ mod tests {
 
     #[test]
     fn test_record_failure() {
-        let mut peer = CachedPeer::new(
-            PeerId([1u8; 32]),
-            vec!["127.0.0.1:9000".parse().unwrap()],
-            PeerSource::Seed,
-        );
+        let mut peer = CachedPeer::new(test_addr(), vec![test_addr()], PeerSource::Seed);
 
         peer.record_failure();
         assert_eq!(peer.stats.failure_count, 1);
@@ -441,11 +407,7 @@ mod tests {
 
     #[test]
     fn test_success_rate() {
-        let mut peer = CachedPeer::new(
-            PeerId([1u8; 32]),
-            vec!["127.0.0.1:9000".parse().unwrap()],
-            PeerSource::Seed,
-        );
+        let mut peer = CachedPeer::new(test_addr(), vec![test_addr()], PeerSource::Seed);
 
         // No attempts = 0.5
         assert!((peer.success_rate() - 0.5).abs() < f64::EPSILON);
@@ -460,11 +422,7 @@ mod tests {
     #[test]
     fn test_quality_calculation() {
         let weights = super::super::config::QualityWeights::default();
-        let mut peer = CachedPeer::new(
-            PeerId([1u8; 32]),
-            vec!["127.0.0.1:9000".parse().unwrap()],
-            PeerSource::Seed,
-        );
+        let mut peer = CachedPeer::new(test_addr(), vec![test_addr()], PeerSource::Seed);
 
         // Initial quality should be moderate (untested peer)
         peer.calculate_quality(&weights);
@@ -480,16 +438,13 @@ mod tests {
 
     #[test]
     fn test_peer_serialization() {
-        let peer = CachedPeer::new(
-            PeerId([0xab; 32]),
-            vec!["127.0.0.1:9000".parse().unwrap()],
-            PeerSource::Seed,
-        );
+        let addr = test_addr();
+        let peer = CachedPeer::new(addr, vec![addr], PeerSource::Seed);
 
         let json = serde_json::to_string(&peer).unwrap();
         let deserialized: CachedPeer = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(deserialized.peer_id, peer.peer_id);
+        assert_eq!(deserialized.primary_address, peer.primary_address);
         assert_eq!(deserialized.addresses, peer.addresses);
         assert_eq!(deserialized.source, peer.source);
     }

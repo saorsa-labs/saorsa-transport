@@ -303,16 +303,17 @@ pub fn select_by_strategy(
 mod tests {
     use super::*;
     use crate::bootstrap_cache::entry::PeerSource;
-    use crate::nat_traversal_api::PeerId;
+    use std::net::SocketAddr;
+
+    fn test_addr_for_id(id: u16) -> SocketAddr {
+        format!("127.0.0.1:{}", 9000 + id).parse().unwrap()
+    }
 
     fn create_test_peers(count: usize) -> Vec<CachedPeer> {
         (0..count)
             .map(|i| {
-                let mut peer = CachedPeer::new(
-                    PeerId([i as u8; 32]),
-                    vec![format!("127.0.0.1:{}", 9000 + i).parse().unwrap()],
-                    PeerSource::Seed,
-                );
+                let addr = test_addr_for_id(i as u16);
+                let mut peer = CachedPeer::new(addr, vec![addr], PeerSource::Seed);
                 // Higher index = higher quality
                 peer.quality_score = i as f64 / count as f64;
                 peer
@@ -352,10 +353,13 @@ mod tests {
 
         for _ in 0..10 {
             let selection = select_epsilon_greedy(&peers, 10, 0.5);
-            if selection.iter().map(|p| p.peer_id).collect::<Vec<_>>()
+            if selection
+                .iter()
+                .map(|p| p.primary_address)
+                .collect::<Vec<_>>()
                 != first_selection
                     .iter()
-                    .map(|p| p.peer_id)
+                    .map(|p| p.primary_address)
                     .collect::<Vec<_>>()
             {
                 has_variation = true;
@@ -414,10 +418,13 @@ mod tests {
 
         for _ in 0..10 {
             let selection = select_by_strategy(&peers, 10, SelectionStrategy::Random);
-            if selection.iter().map(|p| p.peer_id).collect::<Vec<_>>()
+            if selection
+                .iter()
+                .map(|p| p.primary_address)
+                .collect::<Vec<_>>()
                 != first_selection
                     .iter()
-                    .map(|p| p.peer_id)
+                    .map(|p| p.primary_address)
                     .collect::<Vec<_>>()
             {
                 has_variation = true;
@@ -433,7 +440,8 @@ mod tests {
         ipv4_addrs: Vec<&str>,
         ipv6_addrs: Vec<&str>,
     ) -> CachedPeer {
-        let mut peer = CachedPeer::new(PeerId([id; 32]), vec![], PeerSource::Seed);
+        let addr = test_addr_for_id(id as u16);
+        let mut peer = CachedPeer::new(addr, vec![], PeerSource::Seed);
         peer.quality_score = quality;
         peer.capabilities.supports_relay = true;
 
@@ -466,10 +474,10 @@ mod tests {
         assert_eq!(selected.len(), 2);
 
         // Should include dual-stack and IPv4-only, NOT IPv6-only
-        let ids: Vec<u8> = selected.iter().map(|p| p.peer_id.0[0]).collect();
-        assert!(ids.contains(&1)); // dual-stack
-        assert!(ids.contains(&2)); // IPv4-only
-        assert!(!ids.contains(&3)); // IPv6-only excluded
+        let ports: Vec<u16> = selected.iter().map(|p| p.primary_address.port()).collect();
+        assert!(ports.contains(&9001)); // dual-stack (id=1)
+        assert!(ports.contains(&9002)); // IPv4-only (id=2)
+        assert!(!ports.contains(&9003)); // IPv6-only excluded (id=3)
     }
 
     #[test]
@@ -487,10 +495,10 @@ mod tests {
         assert_eq!(selected.len(), 2);
 
         // Should include dual-stack and IPv6-only, NOT IPv4-only
-        let ids: Vec<u8> = selected.iter().map(|p| p.peer_id.0[0]).collect();
-        assert!(ids.contains(&1)); // dual-stack
-        assert!(!ids.contains(&2)); // IPv4-only excluded
-        assert!(ids.contains(&3)); // IPv6-only
+        let ports: Vec<u16> = selected.iter().map(|p| p.primary_address.port()).collect();
+        assert!(ports.contains(&9001)); // dual-stack (id=1)
+        assert!(!ports.contains(&9002)); // IPv4-only excluded (id=2)
+        assert!(ports.contains(&9003)); // IPv6-only (id=3)
     }
 
     #[test]
@@ -504,11 +512,11 @@ mod tests {
 
         // Without preference, higher quality first
         let selected = select_relays_for_target(&peers, 10, true, false);
-        assert_eq!(selected[0].peer_id.0[0], 2); // IPv4-only first (higher quality)
+        assert_eq!(selected[0].primary_address.port(), 9002); // IPv4-only first (higher quality, id=2)
 
         // With dual-stack preference, dual-stack first despite lower quality
         let selected = select_relays_for_target(&peers, 10, true, true);
-        assert_eq!(selected[0].peer_id.0[0], 1); // Dual-stack first
+        assert_eq!(selected[0].primary_address.port(), 9001); // Dual-stack first (id=1)
     }
 
     #[test]
@@ -546,7 +554,8 @@ mod tests {
         )];
 
         // Add a non-relay peer with high quality
-        let mut non_relay = CachedPeer::new(PeerId([2; 32]), vec![], PeerSource::Seed);
+        let non_relay_addr: SocketAddr = "127.0.0.1:9002".parse().unwrap();
+        let mut non_relay = CachedPeer::new(non_relay_addr, vec![], PeerSource::Seed);
         non_relay.quality_score = 0.99;
         non_relay.capabilities.supports_relay = false;
         non_relay
@@ -558,7 +567,7 @@ mod tests {
         let selected = select_relays_for_target(&peers, 10, true, false);
         assert_eq!(selected.len(), 2);
         // Relay-capable peer should be preferred even if lower quality.
-        assert_eq!(selected[0].peer_id.0[0], 1);
+        assert_eq!(selected[0].primary_address.port(), 9001); // id=1 relay peer
     }
 
     #[test]

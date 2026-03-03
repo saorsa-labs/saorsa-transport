@@ -25,7 +25,7 @@
 //!     let transport = P2pLinkTransport::new(config).await?;
 //!
 //!     // Use as LinkTransport
-//!     let local_peer = transport.local_peer();
+//!     let local_key = transport.local_public_key();
 //!     let peers = transport.peer_table();
 //!
 //!     // Dial with protocol
@@ -54,7 +54,6 @@ use crate::link_transport::{
     LinkError, LinkEvent, LinkRecvStream, LinkResult, LinkSendStream, LinkTransport, ProtocolId,
     StreamFilter, StreamType,
 };
-use crate::nat_traversal_api::PeerId;
 use crate::p2p_endpoint::{P2pEndpoint, P2pEvent};
 use crate::unified_config::P2pConfig;
 
@@ -66,8 +65,8 @@ use crate::unified_config::P2pConfig;
 pub struct P2pLinkConn {
     /// The underlying QUIC connection.
     inner: HighLevelConnection,
-    /// Remote peer ID.
-    peer_id: PeerId,
+    /// Remote peer's authenticated ML-DSA-65 SPKI public key bytes (None for constrained transports).
+    public_key: Option<Vec<u8>>,
     /// Remote address.
     remote_addr: SocketAddr,
     /// Connection start time.
@@ -76,10 +75,14 @@ pub struct P2pLinkConn {
 
 impl P2pLinkConn {
     /// Create a new connection wrapper.
-    pub fn new(inner: HighLevelConnection, peer_id: PeerId, remote_addr: SocketAddr) -> Self {
+    pub fn new(
+        inner: HighLevelConnection,
+        public_key: Option<Vec<u8>>,
+        remote_addr: SocketAddr,
+    ) -> Self {
         Self {
             inner,
-            peer_id,
+            public_key,
             remote_addr,
             connected_at: std::time::Instant::now(),
         }
@@ -92,12 +95,12 @@ impl P2pLinkConn {
 }
 
 impl LinkConn for P2pLinkConn {
-    fn peer(&self) -> PeerId {
-        self.peer_id
-    }
-
     fn remote_addr(&self) -> SocketAddr {
         self.remote_addr
+    }
+
+    fn peer_public_key(&self) -> Option<Vec<u8>> {
+        self.public_key.clone()
     }
 
     fn open_uni(&self) -> BoxFuture<'_, LinkResult<Box<dyn LinkSendStream>>> {
@@ -418,8 +421,8 @@ impl LinkRecvStream for P2pRecvStream {
 struct LinkTransportState {
     /// Registered protocols.
     protocols: Vec<ProtocolId>,
-    /// Peer capabilities cache.
-    capabilities: HashMap<PeerId, Capabilities>,
+    /// Peer capabilities cache, keyed by remote socket address.
+    capabilities: HashMap<SocketAddr, Capabilities>,
     /// Event broadcaster for LinkEvents.
     event_tx: broadcast::Sender<LinkEvent>,
 }
@@ -484,26 +487,30 @@ impl P2pLinkTransport {
                 Ok(event) => {
                     let link_event = match event {
                         P2pEvent::PeerConnected {
-                            peer_id,
                             addr,
+                            public_key,
                             side: _,
                         } => {
-                            // Extract SocketAddr for Capabilities (currently UDP-only)
+                            // Extract SocketAddr (currently UDP-only)
                             let socket_addr = addr.as_socket_addr().unwrap_or_else(|| {
                                 // Fallback for non-UDP transports - use unspecified address
                                 SocketAddr::from(([0, 0, 0, 0], 0))
                             });
                             let caps = Capabilities::new_connected(socket_addr);
-                            // Update capabilities cache
+                            // Update capabilities cache keyed by address
                             if let Ok(mut state) = state.write() {
-                                state.capabilities.insert(peer_id, caps.clone());
+                                state.capabilities.insert(socket_addr, caps.clone());
                             }
                             Some(LinkEvent::PeerConnected {
-                                peer: peer_id,
+                                addr: socket_addr,
+                                public_key,
                                 caps,
                             })
                         }
-                        P2pEvent::PeerDisconnected { peer_id, reason } => {
+                        P2pEvent::PeerDisconnected { addr, reason } => {
+                            let socket_addr = addr
+                                .as_socket_addr()
+                                .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
                             let disconnect_reason = match reason {
                                 crate::p2p_endpoint::DisconnectReason::Normal => {
                                     DisconnectReason::LocalClose
@@ -528,12 +535,12 @@ impl P2pLinkTransport {
                             };
                             // Update capabilities cache
                             if let Ok(mut state) = state.write() {
-                                if let Some(caps) = state.capabilities.get_mut(&peer_id) {
+                                if let Some(caps) = state.capabilities.get_mut(&socket_addr) {
                                     caps.is_connected = false;
                                 }
                             }
                             Some(LinkEvent::PeerDisconnected {
-                                peer: peer_id,
+                                addr: socket_addr,
                                 reason: disconnect_reason,
                             })
                         }
@@ -569,15 +576,15 @@ impl P2pLinkTransport {
 impl LinkTransport for P2pLinkTransport {
     type Conn = P2pLinkConn;
 
-    fn local_peer(&self) -> PeerId {
-        self.endpoint.peer_id()
+    fn local_public_key(&self) -> Vec<u8> {
+        self.endpoint.public_key_bytes().to_vec()
     }
 
     fn external_address(&self) -> Option<SocketAddr> {
         self.endpoint.external_addr()
     }
 
-    fn peer_table(&self) -> Vec<(PeerId, Capabilities)> {
+    fn peer_table(&self) -> Vec<(SocketAddr, Capabilities)> {
         self.state
             .read()
             .map(|state| {
@@ -590,11 +597,11 @@ impl LinkTransport for P2pLinkTransport {
             .unwrap_or_default()
     }
 
-    fn peer_capabilities(&self, peer: &PeerId) -> Option<Capabilities> {
+    fn peer_capabilities(&self, addr: &SocketAddr) -> Option<Capabilities> {
         self.state
             .read()
             .ok()
-            .and_then(|state| state.capabilities.get(peer).cloned())
+            .and_then(|state| state.capabilities.get(addr).cloned())
     }
 
     fn subscribe(&self) -> broadcast::Receiver<LinkEvent> {
@@ -618,27 +625,33 @@ impl LinkTransport for P2pLinkTransport {
             |endpoint| async move {
                 // Wait for an incoming connection
                 if let Some(peer_conn) = endpoint.accept().await {
-                    // Get the underlying QUIC connection
-                    if let Some(conn) = endpoint
-                        .get_quic_connection(&peer_conn.peer_id)
-                        .ok()
-                        .flatten()
-                    {
-                        // Extract SocketAddr from TransportAddr for LinkConn trait compatibility
-                        let socket_addr = peer_conn
-                            .remote_addr
-                            .as_socket_addr()
-                            .unwrap_or_else(|| conn.remote_address());
-                        let link_conn = P2pLinkConn::new(conn, peer_conn.peer_id, socket_addr);
-                        Some((Ok(link_conn), endpoint))
-                    } else {
-                        // Connection not found, try again
-                        Some((
-                            Err(LinkError::ConnectionFailed(
-                                "Connection not found".to_string(),
-                            )),
-                            endpoint,
-                        ))
+                    // Extract SocketAddr from TransportAddr
+                    let socket_addr = peer_conn
+                        .remote_addr
+                        .as_socket_addr()
+                        .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
+
+                    // Get the underlying QUIC connection by address
+                    match endpoint.get_quic_connection(&socket_addr).await {
+                        Ok(Some(conn)) => {
+                            // Extract peer public key from TLS identity
+                            let public_key = conn
+                                .peer_identity()
+                                .and_then(|id| id.downcast::<Vec<u8>>().ok())
+                                .map(|boxed| *boxed);
+                            let link_conn = P2pLinkConn::new(conn, public_key, socket_addr);
+                            Some((Ok(link_conn), endpoint))
+                        }
+                        Ok(None) => {
+                            // Connection not found, try again
+                            Some((
+                                Err(LinkError::ConnectionFailed(
+                                    "Connection not found".to_string(),
+                                )),
+                                endpoint,
+                            ))
+                        }
+                        Err(e) => Some((Err(LinkError::ConnectionFailed(e.to_string())), endpoint)),
                     }
                 } else {
                     // Endpoint is shutting down
@@ -648,41 +661,6 @@ impl LinkTransport for P2pLinkTransport {
         ))
     }
 
-    fn dial(&self, peer: PeerId, _proto: ProtocolId) -> BoxFuture<'_, LinkResult<Self::Conn>> {
-        Box::pin(async move {
-            // Look up peer address from capabilities
-            let addr = self.state.read().ok().and_then(|state| {
-                state
-                    .capabilities
-                    .get(&peer)
-                    .and_then(|caps| caps.observed_addrs.first().copied())
-            });
-
-            match addr {
-                Some(addr) => {
-                    // Connect through P2pEndpoint
-                    let peer_conn = self
-                        .endpoint
-                        .connect(addr)
-                        .await
-                        .map_err(|e| LinkError::ConnectionFailed(e.to_string()))?;
-
-                    // Get the underlying QUIC connection
-                    let conn = self
-                        .endpoint
-                        .get_quic_connection(&peer_conn.peer_id)
-                        .map_err(|e| LinkError::ConnectionFailed(e.to_string()))?
-                        .ok_or_else(|| {
-                            LinkError::ConnectionFailed("Connection not found".to_string())
-                        })?;
-
-                    Ok(P2pLinkConn::new(conn, peer_conn.peer_id, addr))
-                }
-                None => Err(LinkError::PeerNotFound(format!("{:?}", peer))),
-            }
-        })
-    }
-
     fn dial_addr(
         &self,
         addr: SocketAddr,
@@ -690,20 +668,27 @@ impl LinkTransport for P2pLinkTransport {
     ) -> BoxFuture<'_, LinkResult<Self::Conn>> {
         Box::pin(async move {
             // Connect through P2pEndpoint
-            let peer_conn = self
+            let _peer_conn = self
                 .endpoint
                 .connect(addr)
                 .await
                 .map_err(|e| LinkError::ConnectionFailed(e.to_string()))?;
 
-            // Get the underlying QUIC connection
+            // Get the underlying QUIC connection by address
             let conn = self
                 .endpoint
-                .get_quic_connection(&peer_conn.peer_id)
+                .get_quic_connection(&addr)
+                .await
                 .map_err(|e| LinkError::ConnectionFailed(e.to_string()))?
                 .ok_or_else(|| LinkError::ConnectionFailed("Connection not found".to_string()))?;
 
-            Ok(P2pLinkConn::new(conn, peer_conn.peer_id, addr))
+            // Extract peer public key from TLS identity
+            let public_key = conn
+                .peer_identity()
+                .and_then(|id| id.downcast::<Vec<u8>>().ok())
+                .map(|boxed| *boxed);
+
+            Ok(P2pLinkConn::new(conn, public_key, addr))
         })
     }
 
@@ -728,11 +713,11 @@ impl LinkTransport for P2pLinkTransport {
         }
     }
 
-    fn is_connected(&self, peer: &PeerId) -> bool {
+    fn is_connected(&self, addr: &SocketAddr) -> bool {
         self.state
             .read()
             .ok()
-            .and_then(|state| state.capabilities.get(peer).map(|caps| caps.is_connected))
+            .and_then(|state| state.capabilities.get(addr).map(|caps| caps.is_connected))
             .unwrap_or(false)
     }
 
@@ -836,10 +821,10 @@ pub struct SharedTransport<T: LinkTransport> {
     transport: Arc<T>,
     /// Registered protocol handlers, keyed by stream type.
     handlers: Arc<TokioRwLock<HashMap<StreamType, Arc<BoxedHandler>>>>,
-    /// Connected peers with their connections.
-    connections: Arc<TokioRwLock<HashMap<PeerId, Arc<T::Conn>>>>,
-    /// Peer state tracking.
-    peers: Arc<TokioRwLock<HashMap<PeerId, PeerState>>>,
+    /// Connected peers with their connections, keyed by remote socket address.
+    connections: Arc<TokioRwLock<HashMap<SocketAddr, Arc<T::Conn>>>>,
+    /// Peer state tracking, keyed by remote socket address.
+    peers: Arc<TokioRwLock<HashMap<SocketAddr, PeerState>>>,
     /// Transport state machine.
     state: TokioRwLock<TransportState>,
     /// Shutdown signal sender.
@@ -881,9 +866,9 @@ where
         }
     }
 
-    /// Get the local peer ID.
-    pub fn local_peer(&self) -> PeerId {
-        self.transport.local_peer()
+    /// Get the local ML-DSA-65 public key bytes.
+    pub fn local_public_key(&self) -> Vec<u8> {
+        self.transport.local_public_key()
     }
 
     /// Get the underlying transport.
@@ -1043,9 +1028,9 @@ where
         // Close all connections
         {
             let connections = self.connections.read().await;
-            for (peer, conn) in connections.iter() {
+            for (addr, conn) in connections.iter() {
                 conn.close(0, "transport shutdown");
-                debug!(peer = ?peer, "Closed connection");
+                debug!(addr = %addr, "Closed connection");
             }
         }
 
@@ -1065,62 +1050,61 @@ where
         self.peers.read().await.len()
     }
 
-    /// Get all connected peer IDs.
-    pub async fn connected_peers(&self) -> Vec<PeerId> {
+    /// Get all connected peer addresses.
+    pub async fn connected_peers(&self) -> Vec<SocketAddr> {
         self.peers.read().await.keys().copied().collect()
     }
 
-    /// Check if a peer is connected.
+    /// Check if a peer at the given address is connected.
     #[allow(dead_code)]
-    pub async fn is_peer_connected(&self, peer: &PeerId) -> bool {
-        self.peers.read().await.contains_key(peer)
+    pub async fn is_peer_connected(&self, addr: &SocketAddr) -> bool {
+        self.peers.read().await.contains_key(addr)
     }
 
     /// Add a connection (for incoming connections).
     #[allow(dead_code)]
-    pub async fn add_connection(&self, peer: PeerId, conn: T::Conn, addr: SocketAddr) {
+    pub async fn add_connection(&self, addr: SocketAddr, conn: T::Conn) {
         {
             let mut connections = self.connections.write().await;
-            connections.insert(peer, Arc::new(conn));
+            connections.insert(addr, Arc::new(conn));
         }
         {
             let mut peers = self.peers.write().await;
-            peers.insert(peer, PeerState::with_addr(addr));
+            peers.insert(addr, PeerState::with_addr(addr));
         }
-        debug!(peer = ?peer, addr = %addr, "Added connection");
+        debug!(addr = %addr, "Added connection");
     }
 
-    /// Remove a peer connection.
+    /// Remove a peer connection by address.
     #[allow(dead_code)]
-    pub async fn remove_peer(&self, peer: &PeerId) {
-        self.connections.write().await.remove(peer);
-        self.peers.write().await.remove(peer);
-        debug!(peer = ?peer, "Removed peer");
+    pub async fn remove_peer(&self, addr: &SocketAddr) {
+        self.connections.write().await.remove(addr);
+        self.peers.write().await.remove(addr);
+        debug!(addr = %addr, "Removed peer");
     }
 
     /// Connect to a peer by address.
     #[allow(dead_code)]
-    pub async fn connect(&self, addr: SocketAddr) -> LinkResult<PeerId> {
+    pub async fn connect(&self, addr: SocketAddr) -> LinkResult<()> {
         let conn = self.transport.dial_addr(addr, ProtocolId::DEFAULT).await?;
-        let peer = conn.peer();
-        self.add_connection(peer, conn, addr).await;
-        Ok(peer)
+        self.add_connection(addr, conn).await;
+        Ok(())
     }
 
     /// Send data to a peer on a bidirectional stream, receive response.
     #[allow(dead_code)]
     pub async fn send(
         &self,
-        peer: PeerId,
+        addr: &SocketAddr,
         stream_type: StreamType,
         data: Bytes,
     ) -> LinkResult<Option<Bytes>> {
         let conn = {
             let connections = self.connections.read().await;
-            connections.get(&peer).cloned()
+            connections.get(addr).cloned()
         };
 
-        let conn = conn.ok_or_else(|| LinkError::PeerNotFound(format!("{:?}", peer)))?;
+        let conn = conn.ok_or_else(|| LinkError::PeerNotFound(format!("{}", addr)))?;
 
         let (mut send, mut recv) = conn.open_bi_typed(stream_type).await?;
         send.write_all(&data).await?;
@@ -1129,7 +1113,7 @@ where
         // Update stats
         {
             let mut peers = self.peers.write().await;
-            if let Some(state) = peers.get_mut(&peer) {
+            if let Some(state) = peers.get_mut(addr) {
                 state.messages_sent += 1;
                 state.last_activity = std::time::Instant::now();
             }
@@ -1148,16 +1132,16 @@ where
     #[allow(dead_code)]
     pub async fn send_uni(
         &self,
-        peer: PeerId,
+        addr: &SocketAddr,
         stream_type: StreamType,
         data: Bytes,
     ) -> LinkResult<()> {
         let conn = {
             let connections = self.connections.read().await;
-            connections.get(&peer).cloned()
+            connections.get(addr).cloned()
         };
 
-        let conn = conn.ok_or_else(|| LinkError::PeerNotFound(format!("{:?}", peer)))?;
+        let conn = conn.ok_or_else(|| LinkError::PeerNotFound(format!("{}", addr)))?;
 
         let mut send = conn.open_uni_typed(stream_type).await?;
         send.write_all(&data).await?;
@@ -1166,7 +1150,7 @@ where
         // Update stats
         {
             let mut peers = self.peers.write().await;
-            if let Some(state) = peers.get_mut(&peer) {
+            if let Some(state) = peers.get_mut(addr) {
                 state.messages_sent += 1;
                 state.last_activity = std::time::Instant::now();
             }
@@ -1194,11 +1178,10 @@ where
                 result = incoming.next() => {
                     match result {
                         Some(Ok(conn)) => {
-                            let peer = conn.peer();
                             let remote_addr = conn.remote_addr();
 
-                            info!(peer = ?peer, addr = %remote_addr, "Accepted connection");
-                            self.add_connection(peer, conn, remote_addr).await;
+                            info!(addr = %remote_addr, "Accepted connection");
+                            self.add_connection(remote_addr, conn).await;
 
                             // Spawn connection handler loop
                             let handlers = Arc::clone(&self.handlers);
@@ -1209,7 +1192,7 @@ where
 
                             tokio::spawn(async move {
                                 Self::run_connection_accept(
-                                    peer,
+                                    remote_addr,
                                     handlers,
                                     peers,
                                     connections,
@@ -1236,25 +1219,28 @@ where
     /// Run the accept loop for a single connection.
     #[allow(dead_code)]
     async fn run_connection_accept(
-        peer: PeerId,
+        addr: SocketAddr,
         handlers: Arc<TokioRwLock<HashMap<StreamType, Arc<BoxedHandler>>>>,
-        peers: Arc<TokioRwLock<HashMap<PeerId, PeerState>>>,
-        connections: Arc<TokioRwLock<HashMap<PeerId, Arc<T::Conn>>>>,
+        peers: Arc<TokioRwLock<HashMap<SocketAddr, PeerState>>>,
+        connections: Arc<TokioRwLock<HashMap<SocketAddr, Arc<T::Conn>>>>,
         mut shutdown_rx: broadcast::Receiver<()>,
         max_message_size: usize,
     ) {
         let conn = {
             let connections = connections.read().await;
-            connections.get(&peer).cloned()
+            connections.get(&addr).cloned()
         };
 
         let conn = match conn {
             Some(c) => c,
             None => {
-                warn!(peer = ?peer, "Connection not found for accept loop");
+                warn!(addr = %addr, "Connection not found for accept loop");
                 return;
             }
         };
+
+        // Extract the public key for handler dispatch
+        let public_key = conn.peer_public_key();
 
         // Build filter from registered handlers
         let filter = {
@@ -1271,7 +1257,7 @@ where
         loop {
             tokio::select! {
                 _ = shutdown_rx.recv() => {
-                    debug!(peer = ?peer, "Connection accept loop shutting down");
+                    debug!(addr = %addr, "Connection accept loop shutting down");
                     break;
                 }
                 result = stream.next() => {
@@ -1279,11 +1265,13 @@ where
                         Some(Ok((stream_type, send, recv))) => {
                             let handlers_clone = Arc::clone(&handlers);
                             let peers_clone = Arc::clone(&peers);
+                            let pk = public_key.clone();
                             tokio::spawn(async move {
                                 Self::handle_bi_stream(
                                     handlers_clone,
                                     peers_clone,
-                                    peer,
+                                    addr,
+                                    pk,
                                     stream_type,
                                     send,
                                     recv,
@@ -1292,10 +1280,10 @@ where
                             });
                         }
                         Some(Err(e)) => {
-                            warn!(peer = ?peer, error = %e, "Error accepting stream");
+                            warn!(addr = %addr, error = %e, "Error accepting stream");
                         }
                         None => {
-                            debug!(peer = ?peer, "Connection closed");
+                            debug!(addr = %addr, "Connection closed");
                             break;
                         }
                     }
@@ -1308,8 +1296,9 @@ where
     #[allow(dead_code)]
     async fn handle_bi_stream(
         handlers: Arc<TokioRwLock<HashMap<StreamType, Arc<BoxedHandler>>>>,
-        peers: Arc<TokioRwLock<HashMap<PeerId, PeerState>>>,
-        peer: PeerId,
+        peers: Arc<TokioRwLock<HashMap<SocketAddr, PeerState>>>,
+        addr: SocketAddr,
+        public_key: Option<Vec<u8>>,
         stream_type: StreamType,
         mut send: Box<dyn LinkSendStream>,
         mut recv: Box<dyn LinkRecvStream>,
@@ -1318,7 +1307,7 @@ where
         // Update peer stats
         {
             let mut peers_guard = peers.write().await;
-            if let Some(state) = peers_guard.get_mut(&peer) {
+            if let Some(state) = peers_guard.get_mut(&addr) {
                 state.messages_received += 1;
                 state.last_activity = std::time::Instant::now();
             }
@@ -1328,7 +1317,7 @@ where
         let data = match recv.read_to_end(max_message_size).await {
             Ok(data) => Bytes::from(data),
             Err(e) => {
-                warn!(peer = ?peer, error = %e, "Failed to read stream");
+                warn!(addr = %addr, error = %e, "Failed to read stream");
                 return;
             }
         };
@@ -1342,16 +1331,19 @@ where
         let handler = match handler {
             Some(h) => h,
             None => {
-                warn!(peer = ?peer, stream_type = %stream_type, "No handler for stream type");
+                warn!(addr = %addr, stream_type = %stream_type, "No handler for stream type");
                 return;
             }
         };
 
-        // Dispatch to handler
-        match handler.handle_stream(peer, stream_type, data).await {
+        // Dispatch to handler with addr + public key instead of PeerId
+        match handler
+            .handle_stream(addr, public_key.as_deref(), stream_type, data)
+            .await
+        {
             Ok(Some(response)) => {
                 if let Err(e) = send.write_all(&response).await {
-                    warn!(peer = ?peer, error = %e, "Failed to send response");
+                    warn!(addr = %addr, error = %e, "Failed to send response");
                 }
                 let _ = send.finish();
             }
@@ -1359,7 +1351,7 @@ where
                 let _ = send.finish();
             }
             Err(e) => {
-                error!(peer = ?peer, error = %e, "Handler error");
+                error!(addr = %addr, error = %e, "Handler error");
                 let _ = send.finish();
             }
         }
@@ -1419,16 +1411,16 @@ mod tests {
         // === Mock Infrastructure ===
 
         struct MockConn {
-            peer: PeerId,
+            public_key: Option<Vec<u8>>,
             addr: SocketAddr,
         }
 
         impl LinkConn for MockConn {
-            fn peer(&self) -> PeerId {
-                self.peer
-            }
             fn remote_addr(&self) -> SocketAddr {
                 self.addr
+            }
+            fn peer_public_key(&self) -> Option<Vec<u8>> {
+                self.public_key.clone()
             }
             fn open_uni(&self) -> BoxFuture<'_, LinkResult<Box<dyn LinkSendStream>>> {
                 Box::pin(async { Err(LinkError::ConnectionClosed) })
@@ -1482,23 +1474,26 @@ mod tests {
             }
         }
 
+        /// Mock public key bytes used in tests.
+        const MOCK_PUBLIC_KEY: [u8; 32] = [1u8; 32];
+
         struct MockTransport {
-            local: PeerId,
+            local_key: Vec<u8>,
         }
 
         impl LinkTransport for MockTransport {
             type Conn = MockConn;
 
-            fn local_peer(&self) -> PeerId {
-                self.local
+            fn local_public_key(&self) -> Vec<u8> {
+                self.local_key.clone()
             }
             fn external_address(&self) -> Option<SocketAddr> {
                 None
             }
-            fn peer_table(&self) -> Vec<(PeerId, Capabilities)> {
+            fn peer_table(&self) -> Vec<(SocketAddr, Capabilities)> {
                 vec![]
             }
-            fn peer_capabilities(&self, _: &PeerId) -> Option<Capabilities> {
+            fn peer_capabilities(&self, _: &SocketAddr) -> Option<Capabilities> {
                 None
             }
             fn subscribe(&self) -> broadcast::Receiver<LinkEvent> {
@@ -1509,23 +1504,25 @@ mod tests {
             fn accept(&self, _: ProtocolId) -> Incoming<Self::Conn> {
                 Box::pin(futures_util::stream::empty())
             }
-            fn dial(&self, _: PeerId, _: ProtocolId) -> BoxFuture<'_, LinkResult<Self::Conn>> {
-                Box::pin(async { Err(LinkError::PeerNotFound("mock".into())) })
-            }
             fn dial_addr(
                 &self,
                 addr: SocketAddr,
                 _: ProtocolId,
             ) -> BoxFuture<'_, LinkResult<Self::Conn>> {
-                let local = self.local;
-                Box::pin(async move { Ok(MockConn { peer: local, addr }) })
+                let key = self.local_key.clone();
+                Box::pin(async move {
+                    Ok(MockConn {
+                        public_key: Some(key),
+                        addr,
+                    })
+                })
             }
             fn supported_protocols(&self) -> Vec<ProtocolId> {
                 vec![ProtocolId::DEFAULT]
             }
             fn register_protocol(&self, _: ProtocolId) {}
             fn unregister_protocol(&self, _: ProtocolId) {}
-            fn is_connected(&self, _: &PeerId) -> bool {
+            fn is_connected(&self, _: &SocketAddr) -> bool {
                 false
             }
             fn active_connections(&self) -> usize {
@@ -1558,9 +1555,10 @@ mod tests {
 
             async fn handle_stream(
                 &self,
-                _: PeerId,
-                _: StreamType,
-                _: Bytes,
+                _remote_addr: SocketAddr,
+                _public_key: Option<&[u8]>,
+                _stream_type: StreamType,
+                _data: Bytes,
             ) -> LinkResult<Option<Bytes>> {
                 self.call_count.fetch_add(1, Ordering::SeqCst);
                 Ok(Some(Bytes::from_static(b"response")))
@@ -1576,15 +1574,15 @@ mod tests {
         #[test]
         fn test_shared_transport_creation() {
             let transport = SharedTransport::new(MockTransport {
-                local: PeerId::from([1u8; 32]),
+                local_key: MOCK_PUBLIC_KEY.to_vec(),
             });
-            assert_eq!(transport.local_peer(), PeerId::from([1u8; 32]));
+            assert_eq!(transport.local_public_key(), MOCK_PUBLIC_KEY.to_vec());
         }
 
         #[tokio::test]
         async fn test_register_handler() {
             let transport = SharedTransport::new(MockTransport {
-                local: PeerId::from([1u8; 32]),
+                local_key: MOCK_PUBLIC_KEY.to_vec(),
             });
             let handler = MockHandler::new(vec![StreamType::Membership, StreamType::PubSub]);
 
@@ -1598,7 +1596,7 @@ mod tests {
         #[tokio::test]
         async fn test_duplicate_handler_error() {
             let transport = SharedTransport::new(MockTransport {
-                local: PeerId::from([1u8; 32]),
+                local_key: MOCK_PUBLIC_KEY.to_vec(),
             });
 
             let handler1 = MockHandler::new(vec![StreamType::Membership]);
@@ -1616,7 +1614,7 @@ mod tests {
         #[tokio::test]
         async fn test_transport_lifecycle() {
             let transport = SharedTransport::new(MockTransport {
-                local: PeerId::from([1u8; 32]),
+                local_key: MOCK_PUBLIC_KEY.to_vec(),
             });
 
             assert!(!transport.is_running().await);
@@ -1637,7 +1635,7 @@ mod tests {
         #[tokio::test]
         async fn test_build_stream_filter() {
             let transport = SharedTransport::new(MockTransport {
-                local: PeerId::from([1u8; 32]),
+                local_key: MOCK_PUBLIC_KEY.to_vec(),
             });
 
             let handler1 = MockHandler::new(vec![StreamType::Membership, StreamType::PubSub]);
@@ -1656,7 +1654,7 @@ mod tests {
         #[tokio::test]
         async fn test_registered_types() {
             let transport = SharedTransport::new(MockTransport {
-                local: PeerId::from([1u8; 32]),
+                local_key: MOCK_PUBLIC_KEY.to_vec(),
             });
 
             let handler = MockHandler::new(vec![StreamType::Membership, StreamType::DhtQuery]);
@@ -1671,7 +1669,7 @@ mod tests {
         #[tokio::test]
         async fn test_get_handler() {
             let transport = SharedTransport::new(MockTransport {
-                local: PeerId::from([1u8; 32]),
+                local_key: MOCK_PUBLIC_KEY.to_vec(),
             });
             let handler = MockHandler::new(vec![StreamType::DhtStore]);
 
@@ -1688,7 +1686,7 @@ mod tests {
         #[tokio::test]
         async fn test_peer_count() {
             let transport = SharedTransport::new(MockTransport {
-                local: PeerId::from([1u8; 32]),
+                local_key: MOCK_PUBLIC_KEY.to_vec(),
             });
             transport.start().await.unwrap();
 
@@ -1699,7 +1697,7 @@ mod tests {
         #[tokio::test]
         async fn test_unregister_handler() {
             let transport = SharedTransport::new(MockTransport {
-                local: PeerId::from([1u8; 32]),
+                local_key: MOCK_PUBLIC_KEY.to_vec(),
             });
             let handler = MockHandler::new(vec![StreamType::Membership, StreamType::PubSub]);
 

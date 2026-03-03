@@ -55,11 +55,11 @@
 //!     tokio::spawn(async move {
 //!         while let Ok(event) = events.recv().await {
 //!             match event {
-//!                 LinkEvent::PeerConnected { peer, caps } => {
-//!                     println!("New peer: {:?}, relay: {}", peer, caps.supports_relay);
+//!                 LinkEvent::PeerConnected { addr, public_key, caps } => {
+//!                     println!("New peer at {addr}, has key: {}, relay: {}", public_key.is_some(), caps.supports_relay);
 //!                 }
-//!                 LinkEvent::PeerDisconnected { peer, reason } => {
-//!                     println!("Lost peer: {:?}, reason: {:?}", peer, reason);
+//!                 LinkEvent::PeerDisconnected { addr, reason } => {
+//!                     println!("Lost peer at {addr}, reason: {reason:?}");
 //!                 }
 //!                 _ => {}
 //!             }
@@ -73,7 +73,7 @@
 //!         while let Some(result) = incoming.next().await {
 //!             match result {
 //!                 Ok(conn) => {
-//!                     println!("Accepted connection from {:?}", conn.peer());
+//!                     println!("Accepted connection from {:?}", conn.remote_addr());
 //!                     // Handle connection...
 //!                 }
 //!                 Err(e) => eprintln!("Accept error: {}", e),
@@ -81,10 +81,10 @@
 //!         }
 //!     });
 //!
-//!     // Dial a peer using their PeerId (NAT traversal handled automatically)
+//!     // Dial a peer by address (NAT traversal handled automatically)
 //!     let peers = transport.peer_table();
-//!     if let Some((peer_id, caps)) = peers.first() {
-//!         match transport.dial(*peer_id, DHT_PROTOCOL).await {
+//!     if let Some((addr, _caps)) = peers.first() {
+//!         match transport.dial_addr(*addr, DHT_PROTOCOL).await {
 //!             Ok(conn) => {
 //!                 // Open a bidirectional stream for request/response
 //!                 let (mut send, mut recv) = conn.open_bi().await?;
@@ -93,9 +93,6 @@
 //!
 //!                 let response = recv.read_to_end(1024).await?;
 //!                 println!("Response: {:?}", response);
-//!             }
-//!             Err(LinkError::PeerNotFound(_)) => {
-//!                 println!("Peer not in table - need to bootstrap");
 //!             }
 //!             Err(e) => eprintln!("Dial failed: {}", e),
 //!         }
@@ -120,20 +117,17 @@
 //!
 //! ```rust,ignore
 //! use ant_quic::link_transport::{LinkError, LinkResult};
+//! use std::net::SocketAddr;
 //!
 //! async fn connect_with_retry<T: LinkTransport>(
 //!     transport: &T,
-//!     peer: PeerId,
+//!     addr: SocketAddr,
 //!     proto: ProtocolId,
 //! ) -> LinkResult<T::Conn> {
 //!     for attempt in 1..=3 {
-//!         match transport.dial(peer, proto).await {
+//!         match transport.dial_addr(addr, proto).await {
 //!             Ok(conn) => return Ok(conn),
-//!             Err(LinkError::PeerNotFound(_)) => {
-//!                 // Peer not in table - can't retry, need bootstrap
-//!                 return Err(LinkError::PeerNotFound(format!("{:?}", peer)));
-//!             }
-//!             Err(LinkError::ConnectionFailed(msg)) if attempt < 3 => {
+//!             Err(LinkError::ConnectionFailed(_msg)) if attempt < 3 => {
 //!                 // Transient failure - retry after delay
 //!                 tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
 //!                 continue;
@@ -162,7 +156,6 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::broadcast;
 
-use crate::nat_traversal_api::PeerId;
 use crate::transport::TransportAddr;
 
 // ============================================================================
@@ -775,16 +768,18 @@ pub enum DisconnectReason {
 pub enum LinkEvent {
     /// A new peer has connected.
     PeerConnected {
-        /// The connected peer's ID.
-        peer: PeerId,
+        /// The remote peer's network address.
+        addr: SocketAddr,
+        /// The authenticated ML-DSA-65 SPKI public key bytes (None for constrained transports).
+        public_key: Option<Vec<u8>>,
         /// Initial capabilities (may be updated later).
         caps: Capabilities,
     },
 
     /// A peer has disconnected.
     PeerDisconnected {
-        /// The disconnected peer's ID.
-        peer: PeerId,
+        /// The disconnected peer's network address.
+        addr: SocketAddr,
         /// Reason for disconnection.
         reason: DisconnectReason,
     },
@@ -798,27 +793,27 @@ pub enum LinkEvent {
     /// A peer's capabilities have been updated.
     CapabilityUpdated {
         /// The peer whose capabilities changed.
-        peer: PeerId,
+        addr: SocketAddr,
         /// Updated capabilities.
         caps: Capabilities,
     },
 
     /// A relay request has been received.
     RelayRequest {
-        /// Peer requesting the relay.
-        from: PeerId,
-        /// Target peer for the relay.
-        to: PeerId,
+        /// Address of the peer requesting the relay.
+        from_addr: SocketAddr,
+        /// Target address for the relay.
+        to_addr: SocketAddr,
         /// Bytes remaining in relay budget.
         budget_bytes: u64,
     },
 
     /// A NAT traversal coordination request has been received.
     CoordinationRequest {
-        /// First peer in the coordination.
-        peer_a: PeerId,
-        /// Second peer in the coordination.
-        peer_b: PeerId,
+        /// First peer's address in the coordination.
+        addr_a: SocketAddr,
+        /// Second peer's address in the coordination.
+        addr_b: SocketAddr,
         /// Coordination round number.
         round: u64,
     },
@@ -843,9 +838,10 @@ pub enum LinkEvent {
 /// # Example
 ///
 /// ```rust,ignore
-/// use ant_quic::link_transport::{ProtocolHandler, StreamType, LinkResult, PeerId};
+/// use ant_quic::link_transport::{ProtocolHandler, StreamType, LinkResult};
 /// use async_trait::async_trait;
 /// use bytes::Bytes;
+/// use std::net::SocketAddr;
 ///
 /// struct GossipHandler;
 ///
@@ -857,7 +853,8 @@ pub enum LinkEvent {
 ///
 ///     async fn handle_stream(
 ///         &self,
-///         peer: PeerId,
+///         remote_addr: SocketAddr,
+///         public_key: Option<&[u8]>,
 ///         stream_type: StreamType,
 ///         data: Bytes,
 ///     ) -> LinkResult<Option<Bytes>> {
@@ -875,7 +872,8 @@ pub trait ProtocolHandler: Send + Sync {
     ///
     /// # Arguments
     ///
-    /// * `peer` - The peer that sent the stream
+    /// * `remote_addr` - The network address of the peer that sent the stream
+    /// * `public_key` - The authenticated ML-DSA-65 SPKI public key (None for constrained)
     /// * `stream_type` - The type of stream received
     /// * `data` - The stream payload data
     ///
@@ -886,7 +884,8 @@ pub trait ProtocolHandler: Send + Sync {
     /// * `Err(e)` - Handler error (stream closed with error)
     async fn handle_stream(
         &self,
-        peer: PeerId,
+        remote_addr: SocketAddr,
+        public_key: Option<&[u8]>,
         stream_type: StreamType,
         data: Bytes,
     ) -> LinkResult<Option<Bytes>>;
@@ -896,7 +895,8 @@ pub trait ProtocolHandler: Send + Sync {
     /// Default implementation does nothing. Override for unreliable messaging.
     async fn handle_datagram(
         &self,
-        _peer: PeerId,
+        _remote_addr: SocketAddr,
+        _public_key: Option<&[u8]>,
         _stream_type: StreamType,
         _data: Bytes,
     ) -> LinkResult<()> {
@@ -1043,16 +1043,16 @@ pub type BoxStream<'a, T> = Pin<Box<dyn futures_util::Stream<Item = T> + Send + 
 /// 2. Open streams as needed
 /// 3. Close gracefully with `close()` or let it drop
 pub trait LinkConn: Send + Sync {
-    /// Get the remote peer's cryptographic identity.
-    ///
-    /// This is stable across reconnections and network changes.
-    fn peer(&self) -> PeerId;
-
     /// Get the remote peer's current network address.
     ///
     /// Note: This may change during the connection lifetime due to
     /// NAT rebinding or connection migration.
     fn remote_addr(&self) -> SocketAddr;
+
+    /// Get the remote peer's authenticated ML-DSA-65 SPKI public key bytes.
+    ///
+    /// Returns `None` for constrained transports (BLE/LoRa) that lack TLS.
+    fn peer_public_key(&self) -> Option<Vec<u8>>;
 
     /// Open a unidirectional stream (send only).
     ///
@@ -1300,11 +1300,11 @@ pub trait LinkTransport: Send + Sync + 'static {
     /// The connection type returned by this transport.
     type Conn: LinkConn + 'static;
 
-    /// Get our local peer identity.
+    /// Get our local ML-DSA-65 public key bytes (SPKI-encoded).
     ///
-    /// This is our stable cryptographic identity, derived from our key pair.
-    /// It remains constant across restarts and network changes.
-    fn local_peer(&self) -> PeerId;
+    /// This is our stable cryptographic identity material. The overlay derives
+    /// its PeerId from this key.
+    fn local_public_key(&self) -> Vec<u8>;
 
     /// Get our externally observed address, if known.
     ///
@@ -1317,7 +1317,7 @@ pub trait LinkTransport: Send + Sync + 'static {
     /// if we're behind a symmetric NAT that changes our external port.
     fn external_address(&self) -> Option<SocketAddr>;
 
-    /// Get all known peers with their capabilities.
+    /// Get all known peers with their capabilities, keyed by address.
     ///
     /// Includes:
     /// - Currently connected peers (`caps.is_connected = true`)
@@ -1325,12 +1325,12 @@ pub trait LinkTransport: Send + Sync + 'static {
     /// - Peers learned from relay/coordination traffic
     ///
     /// Use `Capabilities::quality_score()` to rank peers for selection.
-    fn peer_table(&self) -> Vec<(PeerId, Capabilities)>;
+    fn peer_table(&self) -> Vec<(SocketAddr, Capabilities)>;
 
-    /// Get capabilities for a specific peer.
+    /// Get capabilities for a peer at a specific address.
     ///
-    /// Returns `None` if the peer is not known.
-    fn peer_capabilities(&self, peer: &PeerId) -> Option<Capabilities>;
+    /// Returns `None` if the address is not known.
+    fn peer_capabilities(&self, addr: &SocketAddr) -> Option<Capabilities>;
 
     /// Subscribe to transport-level events.
     ///
@@ -1357,25 +1357,11 @@ pub trait LinkTransport: Send + Sync + 'static {
     /// ```
     fn accept(&self, proto: ProtocolId) -> Incoming<Self::Conn>;
 
-    /// Dial a peer by their PeerId (preferred method).
+    /// Dial a peer by direct address.
     ///
-    /// Uses the peer table to find known addresses for this peer.
-    /// NAT traversal is handled automatically - if direct connection
-    /// fails, coordination and hole-punching are attempted.
-    ///
-    /// # Errors
-    /// - `PeerNotFound`: Peer not in table (need to bootstrap)
-    /// - `ConnectionFailed`: Network error (may be transient)
-    /// - `Timeout`: NAT traversal timed out (retry may succeed)
-    fn dial(&self, peer: PeerId, proto: ProtocolId) -> BoxFuture<'_, LinkResult<Self::Conn>>;
-
-    /// Dial a peer by direct address (for bootstrapping).
-    ///
-    /// Use when you don't know the peer's ID yet, such as when
-    /// connecting to a known seed address to join the network.
-    ///
-    /// After connection, the peer's ID will be available via
-    /// `conn.peer()`.
+    /// Connects directly to the given address. NAT traversal is handled
+    /// automatically if needed. After connection, the peer's public key
+    /// will be available via `conn.peer_public_key()`.
     fn dial_addr(
         &self,
         addr: SocketAddr,
@@ -1397,8 +1383,8 @@ pub trait LinkTransport: Send + Sync + 'static {
     /// connections are not affected.
     fn unregister_protocol(&self, proto: ProtocolId);
 
-    /// Check if we have an active connection to a peer.
-    fn is_connected(&self, peer: &PeerId) -> bool;
+    /// Check if we have an active connection to the given address.
+    fn is_connected(&self, addr: &SocketAddr) -> bool;
 
     /// Get the count of active connections.
     fn active_connections(&self) -> usize;
@@ -1637,6 +1623,9 @@ mod tests {
             }
         }
 
+        const TEST_ADDR: SocketAddr =
+            SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 9999);
+
         #[async_trait]
         impl ProtocolHandler for TestHandler {
             fn stream_types(&self) -> &[StreamType] {
@@ -1645,7 +1634,8 @@ mod tests {
 
             async fn handle_stream(
                 &self,
-                _peer: PeerId,
+                _remote_addr: SocketAddr,
+                _public_key: Option<&[u8]>,
                 _stream_type: StreamType,
                 data: Bytes,
             ) -> LinkResult<Option<Bytes>> {
@@ -1669,10 +1659,14 @@ mod tests {
         #[tokio::test]
         async fn test_handler_returns_response() {
             let handler = TestHandler::new(vec![StreamType::DhtQuery]);
-            let peer = PeerId::from([0u8; 32]);
 
             let result = handler
-                .handle_stream(peer, StreamType::DhtQuery, Bytes::from_static(b"test"))
+                .handle_stream(
+                    TEST_ADDR,
+                    None,
+                    StreamType::DhtQuery,
+                    Bytes::from_static(b"test"),
+                )
                 .await;
 
             assert!(result.is_ok());
@@ -1691,7 +1685,8 @@ mod tests {
 
                 async fn handle_stream(
                     &self,
-                    _peer: PeerId,
+                    _remote_addr: SocketAddr,
+                    _public_key: Option<&[u8]>,
                     _stream_type: StreamType,
                     _data: Bytes,
                 ) -> LinkResult<Option<Bytes>> {
@@ -1700,10 +1695,14 @@ mod tests {
             }
 
             let handler = SinkHandler;
-            let peer = PeerId::from([0u8; 32]);
 
             let result = handler
-                .handle_stream(peer, StreamType::GossipBulk, Bytes::from_static(b"data"))
+                .handle_stream(
+                    TEST_ADDR,
+                    None,
+                    StreamType::GossipBulk,
+                    Bytes::from_static(b"data"),
+                )
                 .await;
 
             assert!(result.is_ok());
@@ -1714,18 +1713,17 @@ mod tests {
         async fn test_handler_tracks_calls() {
             let count = Arc::new(AtomicUsize::new(0));
             let handler = TestHandler::with_counter(vec![StreamType::Membership], count.clone());
-            let peer = PeerId::from([0u8; 32]);
 
             assert_eq!(handler.name(), "TestHandler");
             assert_eq!(count.load(Ordering::SeqCst), 0);
 
             let _ = handler
-                .handle_stream(peer, StreamType::Membership, Bytes::new())
+                .handle_stream(TEST_ADDR, None, StreamType::Membership, Bytes::new())
                 .await;
             assert_eq!(count.load(Ordering::SeqCst), 1);
 
             let _ = handler
-                .handle_stream(peer, StreamType::Membership, Bytes::new())
+                .handle_stream(TEST_ADDR, None, StreamType::Membership, Bytes::new())
                 .await;
             assert_eq!(count.load(Ordering::SeqCst), 2);
         }
@@ -1740,11 +1738,15 @@ mod tests {
         #[tokio::test]
         async fn test_default_datagram_handler() {
             let handler = TestHandler::new(vec![StreamType::Membership]);
-            let peer = PeerId::from([0u8; 32]);
 
             // Default implementation should succeed silently
             let result = handler
-                .handle_datagram(peer, StreamType::Membership, Bytes::from_static(b"dgram"))
+                .handle_datagram(
+                    TEST_ADDR,
+                    None,
+                    StreamType::Membership,
+                    Bytes::from_static(b"dgram"),
+                )
                 .await;
             assert!(result.is_ok());
         }

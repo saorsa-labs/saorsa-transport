@@ -11,7 +11,7 @@
 //! statistics, NAT traversal performance, and network health metrics.
 
 use crate::{
-    nat_traversal_api::{NatTraversalEvent, NatTraversalStatistics, PeerId},
+    nat_traversal_api::{NatTraversalEvent, NatTraversalStatistics},
     terminal_ui,
 };
 
@@ -100,8 +100,6 @@ impl Default for DashboardConfig {
 /// Connection information
 #[derive(Debug, Clone)]
 pub struct ConnectionInfo {
-    /// Peer identifier
-    pub peer_id: PeerId,
     /// Remote socket address
     pub remote_address: SocketAddr,
     /// Timestamp when the connection was established
@@ -141,7 +139,7 @@ pub struct StatsDashboard {
     /// NAT traversal statistics
     nat_stats: Arc<RwLock<NatTraversalStatistics>>,
     /// Active connections
-    connections: Arc<RwLock<HashMap<PeerId, ConnectionInfo>>>,
+    connections: Arc<RwLock<HashMap<SocketAddr, ConnectionInfo>>>,
     /// Historical data
     #[allow(dead_code)]
     history: Arc<RwLock<VecDeque<DataPoint>>>,
@@ -185,15 +183,14 @@ impl StatsDashboard {
     pub async fn handle_nat_event(&self, event: &NatTraversalEvent) {
         match event {
             NatTraversalEvent::ConnectionEstablished {
-                peer_id,
                 remote_address,
-                side: _, // Direction not tracked in dashboard stats yet
+                side: _,
+                ..
             } => {
                 let mut connections = self.connections.write().await;
                 connections.insert(
-                    *peer_id,
+                    *remote_address,
                     ConnectionInfo {
-                        peer_id: *peer_id,
                         remote_address: *remote_address,
                         connected_at: Instant::now(),
                         bytes_sent: 0,
@@ -205,9 +202,9 @@ impl StatsDashboard {
                     },
                 );
             }
-            NatTraversalEvent::TraversalFailed { peer_id, .. } => {
+            NatTraversalEvent::TraversalFailed { remote_address, .. } => {
                 let mut connections = self.connections.write().await;
-                connections.remove(peer_id);
+                connections.remove(remote_address);
             }
             _ => {}
         }
@@ -216,13 +213,13 @@ impl StatsDashboard {
     /// Update connection metrics
     pub async fn update_connection_metrics(
         &self,
-        peer_id: PeerId,
+        addr: SocketAddr,
         bytes_sent: u64,
         bytes_received: u64,
         rtt: Option<Duration>,
     ) {
         let mut connections = self.connections.write().await;
-        if let Some(conn) = connections.get_mut(&peer_id) {
+        if let Some(conn) = connections.get_mut(&addr) {
             conn.bytes_sent = bytes_sent;
             conn.bytes_received = bytes_received;
             conn.rtt = rtt;
@@ -399,24 +396,19 @@ impl StatsDashboard {
             ));
         } else {
             let mut content = String::new();
-            for (i, (peer_id, conn)) in connections.iter().enumerate() {
+            for (i, (addr, conn)) in connections.iter().enumerate() {
                 if i > 0 {
                     content.push_str("\n─────────────────────────────────────────────\n");
                 }
 
                 content.push_str(&format!(
-                    "Peer: {}\n\
-                     Address: {}\n\
+                    "Address: {}{}{}\n\
                      Duration: {}\n\
                      Sent: {} | Received: {}\n\
                      RTT: {} | Loss: {:.1}%",
-                    format!(
-                        "{}{}{}",
-                        terminal_ui::colors::DIM,
-                        hex::encode(&peer_id.0[..8]),
-                        terminal_ui::colors::RESET
-                    ),
-                    conn.remote_address,
+                    terminal_ui::colors::DIM,
+                    addr,
+                    terminal_ui::colors::RESET,
                     format_duration(conn.connected_at.elapsed()),
                     format_bytes(conn.bytes_sent),
                     format_bytes(conn.bytes_received),

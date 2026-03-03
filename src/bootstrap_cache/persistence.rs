@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use tracing::{debug, info, warn};
@@ -45,9 +46,8 @@ pub struct CacheData {
     /// Timestamp of last write (Unix epoch seconds)
     pub timestamp: u64,
 
-    /// Peer entries keyed by peer ID bytes
-    #[serde(with = "peer_map_serde")]
-    pub peers: HashMap<[u8; 32], CachedPeer>,
+    /// Peer entries keyed by primary socket address
+    pub peers: HashMap<SocketAddr, CachedPeer>,
 
     /// Checksum for integrity verification
     pub checksum: u64,
@@ -80,11 +80,11 @@ impl CacheData {
         self.version.hash(&mut hasher);
         self.peers.len().hash(&mut hasher);
 
-        // Hash peer IDs in sorted order for determinism
-        let mut ids: Vec<_> = self.peers.keys().collect();
-        ids.sort();
-        for id in ids {
-            id.hash(&mut hasher);
+        // Hash peer addresses in sorted order for determinism
+        let mut addrs: Vec<_> = self.peers.keys().map(|a| a.to_string()).collect();
+        addrs.sort();
+        for addr in &addrs {
+            addr.hash(&mut hasher);
         }
 
         hasher.finish()
@@ -556,68 +556,17 @@ fn generate_instance_id() -> String {
     )
 }
 
-/// Serde helper for HashMap with [u8; 32] keys
-mod peer_map_serde {
-    use super::*;
-    use serde::ser::SerializeMap;
-
-    pub fn serialize<S>(
-        map: &HashMap<[u8; 32], CachedPeer>,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        let mut map_ser = serializer.serialize_map(Some(map.len()))?;
-        for (k, v) in map {
-            map_ser.serialize_entry(&hex::encode(k), v)?;
-        }
-        map_ser.end()
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<HashMap<[u8; 32], CachedPeer>, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        use serde::de::MapAccess;
-
-        struct MapVisitor;
-
-        impl<'de> serde::de::Visitor<'de> for MapVisitor {
-            type Value = HashMap<[u8; 32], CachedPeer>;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter.write_str("a map with hex-encoded 32-byte keys")
-            }
-
-            fn visit_map<M>(self, mut access: M) -> Result<Self::Value, M::Error>
-            where
-                M: MapAccess<'de>,
-            {
-                let mut map = HashMap::new();
-                while let Some((key, value)) = access.next_entry::<String, CachedPeer>()? {
-                    let bytes = hex::decode(&key).map_err(serde::de::Error::custom)?;
-                    if bytes.len() != 32 {
-                        return Err(serde::de::Error::custom("key must be 32 bytes"));
-                    }
-                    let mut arr = [0u8; 32];
-                    arr.copy_from_slice(&bytes);
-                    map.insert(arr, value);
-                }
-                Ok(map)
-            }
-        }
-
-        deserializer.deserialize_map(MapVisitor)
-    }
-}
+// SocketAddr natively supports Serialize/Deserialize, so no custom serde helper needed.
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::PeerId;
     use crate::bootstrap_cache::entry::PeerSource;
     use tempfile::TempDir;
+
+    fn test_addr() -> SocketAddr {
+        "127.0.0.1:9000".parse().unwrap()
+    }
 
     #[test]
     fn test_cache_data_new() {
@@ -636,12 +585,9 @@ mod tests {
         assert!(data.verify());
 
         // Add a peer
-        let peer = CachedPeer::new(
-            PeerId([1u8; 32]),
-            vec!["127.0.0.1:9000".parse().unwrap()],
-            PeerSource::Seed,
-        );
-        data.peers.insert(peer.peer_id.0, peer);
+        let addr = test_addr();
+        let peer = CachedPeer::new(addr, vec![addr], PeerSource::Seed);
+        data.peers.insert(peer.primary_address, peer);
         data.finalize();
 
         let checksum2 = data.checksum;
@@ -656,18 +602,15 @@ mod tests {
 
         // Save some data
         let mut data = CacheData::new("test".to_string());
-        let peer = CachedPeer::new(
-            PeerId([42u8; 32]),
-            vec!["127.0.0.1:9000".parse().unwrap()],
-            PeerSource::Seed,
-        );
-        data.peers.insert(peer.peer_id.0, peer);
+        let addr = test_addr();
+        let peer = CachedPeer::new(addr, vec![addr], PeerSource::Seed);
+        data.peers.insert(peer.primary_address, peer);
         persistence.save(&mut data).unwrap();
 
         // Load and verify
         let loaded = persistence.load().unwrap();
         assert_eq!(loaded.peers.len(), 1);
-        assert!(loaded.peers.contains_key(&[42u8; 32]));
+        assert!(loaded.peers.contains_key(&addr));
     }
 
     #[test]
@@ -687,23 +630,17 @@ mod tests {
 
         // Create and save first cache
         let mut data1 = CacheData::new("first".to_string());
-        let peer1 = CachedPeer::new(
-            PeerId([1u8; 32]),
-            vec!["127.0.0.1:9001".parse().unwrap()],
-            PeerSource::Seed,
-        );
-        data1.peers.insert(peer1.peer_id.0, peer1);
+        let addr1: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+        let peer1 = CachedPeer::new(addr1, vec![addr1], PeerSource::Seed);
+        data1.peers.insert(peer1.primary_address, peer1);
         persistence.save(&mut data1).unwrap();
 
         // Create second cache file
         let other_path = temp_dir.path().join("other_cache.json");
         let mut data2 = CacheData::new("second".to_string());
-        let peer2 = CachedPeer::new(
-            PeerId([2u8; 32]),
-            vec!["127.0.0.1:9002".parse().unwrap()],
-            PeerSource::Seed,
-        );
-        data2.peers.insert(peer2.peer_id.0, peer2);
+        let addr2: SocketAddr = "127.0.0.1:9002".parse().unwrap();
+        let peer2 = CachedPeer::new(addr2, vec![addr2], PeerSource::Seed);
+        data2.peers.insert(peer2.primary_address, peer2);
         data2.finalize();
         let json = serde_json::to_string(&data2).unwrap();
         fs::write(&other_path, json).unwrap();
@@ -726,18 +663,15 @@ mod tests {
 
         // Save some data
         let mut data = CacheData::new("test".to_string());
-        let peer = CachedPeer::new(
-            PeerId([42u8; 32]),
-            vec!["127.0.0.1:9000".parse().unwrap()],
-            PeerSource::Seed,
-        );
-        data.peers.insert(peer.peer_id.0, peer);
+        let addr = test_addr();
+        let peer = CachedPeer::new(addr, vec![addr], PeerSource::Seed);
+        data.peers.insert(peer.primary_address, peer);
         persistence.save(&mut data).unwrap();
 
         // Load and verify
         let loaded = persistence.load().unwrap();
         assert_eq!(loaded.peers.len(), 1);
-        assert!(loaded.peers.contains_key(&[42u8; 32]));
+        assert!(loaded.peers.contains_key(&addr));
     }
 
     #[test]
@@ -749,12 +683,9 @@ mod tests {
         // Save with key1
         let persistence1 = EncryptedCachePersistence::new(temp_dir.path(), false, key1).unwrap();
         let mut data = CacheData::new("test".to_string());
-        let peer = CachedPeer::new(
-            PeerId([1u8; 32]),
-            vec!["127.0.0.1:9000".parse().unwrap()],
-            PeerSource::Seed,
-        );
-        data.peers.insert(peer.peer_id.0, peer);
+        let addr = test_addr();
+        let peer = CachedPeer::new(addr, vec![addr], PeerSource::Seed);
+        data.peers.insert(peer.primary_address, peer);
         persistence1.save(&mut data).unwrap();
 
         // Try to load with key2 - should fail

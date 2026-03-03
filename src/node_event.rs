@@ -36,7 +36,6 @@
 
 use std::net::SocketAddr;
 
-use crate::nat_traversal_api::PeerId;
 use crate::node_status::NatType;
 use crate::transport::TransportAddr;
 
@@ -82,18 +81,18 @@ pub enum NodeEvent {
     // --- Peer Events ---
     /// A peer connected successfully
     PeerConnected {
-        /// The connected peer's ID
-        peer_id: PeerId,
         /// The peer's address (supports all transport types)
         addr: TransportAddr,
+        /// The peer's public key bytes (ML-DSA-65 SPKI), if available from TLS handshake
+        public_key: Option<Vec<u8>>,
         /// Whether this is a direct connection (vs relayed)
         direct: bool,
     },
 
     /// A peer disconnected
     PeerDisconnected {
-        /// The disconnected peer's ID
-        peer_id: PeerId,
+        /// The peer's address
+        addr: SocketAddr,
         /// Reason for disconnection
         reason: DisconnectReason,
     },
@@ -123,8 +122,8 @@ pub enum NodeEvent {
 
     /// NAT traversal completed
     NatTraversalComplete {
-        /// The peer we traversed to
-        peer_id: PeerId,
+        /// The address of the peer we traversed to
+        addr: SocketAddr,
         /// Whether traversal was successful
         success: bool,
         /// Connection method used
@@ -134,14 +133,14 @@ pub enum NodeEvent {
     // --- Relay Events ---
     /// Started relaying for a peer
     RelaySessionStarted {
-        /// The peer we're relaying for
-        peer_id: PeerId,
+        /// The address of the peer we're relaying for
+        addr: SocketAddr,
     },
 
     /// Stopped relaying for a peer
     RelaySessionEnded {
-        /// The peer we were relaying for
-        peer_id: PeerId,
+        /// The address of the peer we were relaying for
+        addr: SocketAddr,
         /// Total bytes forwarded during session
         bytes_forwarded: u64,
     },
@@ -149,18 +148,18 @@ pub enum NodeEvent {
     // --- Coordination Events ---
     /// Started coordinating NAT traversal for peers
     CoordinationStarted {
-        /// Peer A in the coordination
-        peer_a: PeerId,
-        /// Peer B in the coordination
-        peer_b: PeerId,
+        /// Address of peer A in the coordination
+        addr_a: SocketAddr,
+        /// Address of peer B in the coordination
+        addr_b: SocketAddr,
     },
 
     /// NAT traversal coordination completed
     CoordinationComplete {
-        /// Peer A in the coordination
-        peer_a: PeerId,
-        /// Peer B in the coordination
-        peer_b: PeerId,
+        /// Address of peer A in the coordination
+        addr_a: SocketAddr,
+        /// Address of peer B in the coordination
+        addr_b: SocketAddr,
         /// Whether coordination was successful
         success: bool,
     },
@@ -168,8 +167,8 @@ pub enum NodeEvent {
     // --- Data Events ---
     /// Data received from a peer
     DataReceived {
-        /// The peer that sent data
-        peer_id: PeerId,
+        /// The address of the peer that sent data
+        addr: SocketAddr,
         /// Stream ID (for multiplexed connections)
         stream_id: u64,
         /// Number of bytes received
@@ -178,8 +177,8 @@ pub enum NodeEvent {
 
     /// Data sent to a peer
     DataSent {
-        /// The peer we sent data to
-        peer_id: PeerId,
+        /// The address of the peer we sent data to
+        addr: SocketAddr,
         /// Stream ID
         stream_id: u64,
         /// Number of bytes sent
@@ -253,16 +252,19 @@ impl NodeEvent {
         matches!(self, Self::DataReceived { .. } | Self::DataSent { .. })
     }
 
-    /// Get the peer ID associated with this event (if any)
-    pub fn peer_id(&self) -> Option<&PeerId> {
+    /// Get the socket address associated with this event (if any).
+    ///
+    /// For `PeerConnected`, this converts the `TransportAddr` to a `SocketAddr`
+    /// using `to_synthetic_socket_addr()`.
+    pub fn addr(&self) -> Option<SocketAddr> {
         match self {
-            Self::PeerConnected { peer_id, .. } => Some(peer_id),
-            Self::PeerDisconnected { peer_id, .. } => Some(peer_id),
-            Self::NatTraversalComplete { peer_id, .. } => Some(peer_id),
-            Self::RelaySessionStarted { peer_id } => Some(peer_id),
-            Self::RelaySessionEnded { peer_id, .. } => Some(peer_id),
-            Self::DataReceived { peer_id, .. } => Some(peer_id),
-            Self::DataSent { peer_id, .. } => Some(peer_id),
+            Self::PeerConnected { addr, .. } => Some(addr.to_synthetic_socket_addr()),
+            Self::PeerDisconnected { addr, .. } => Some(*addr),
+            Self::NatTraversalComplete { addr, .. } => Some(*addr),
+            Self::RelaySessionStarted { addr } => Some(*addr),
+            Self::RelaySessionEnded { addr, .. } => Some(*addr),
+            Self::DataReceived { addr, .. } => Some(*addr),
+            Self::DataSent { addr, .. } => Some(*addr),
             _ => None,
         }
     }
@@ -294,10 +296,6 @@ impl From<P2pDisconnectReason> for DisconnectReason {
 mod tests {
     use super::*;
 
-    fn test_peer_id() -> PeerId {
-        PeerId([1u8; 32])
-    }
-
     fn test_addr() -> SocketAddr {
         "127.0.0.1:9000".parse().unwrap()
     }
@@ -305,25 +303,25 @@ mod tests {
     #[test]
     fn test_peer_connected_event() {
         let event = NodeEvent::PeerConnected {
-            peer_id: test_peer_id(),
             addr: TransportAddr::Udp(test_addr()),
+            public_key: None,
             direct: true,
         };
 
         assert!(event.is_connection_event());
         assert!(!event.is_nat_event());
-        assert_eq!(event.peer_id(), Some(&test_peer_id()));
+        assert_eq!(event.addr(), Some(test_addr()));
     }
 
     #[test]
     fn test_peer_disconnected_event() {
         let event = NodeEvent::PeerDisconnected {
-            peer_id: test_peer_id(),
+            addr: test_addr(),
             reason: DisconnectReason::Graceful,
         };
 
         assert!(event.is_connection_event());
-        assert_eq!(event.peer_id(), Some(&test_peer_id()));
+        assert_eq!(event.addr(), Some(test_addr()));
     }
 
     #[test]
@@ -334,17 +332,15 @@ mod tests {
 
         assert!(event.is_nat_event());
         assert!(!event.is_connection_event());
-        assert!(event.peer_id().is_none());
+        assert!(event.addr().is_none());
     }
 
     #[test]
     fn test_relay_session_events() {
-        let start = NodeEvent::RelaySessionStarted {
-            peer_id: test_peer_id(),
-        };
+        let start = NodeEvent::RelaySessionStarted { addr: test_addr() };
 
         let end = NodeEvent::RelaySessionEnded {
-            peer_id: test_peer_id(),
+            addr: test_addr(),
             bytes_forwarded: 1024,
         };
 
@@ -355,14 +351,14 @@ mod tests {
 
     #[test]
     fn test_coordination_events() {
-        let peer_a = PeerId([1u8; 32]);
-        let peer_b = PeerId([2u8; 32]);
+        let addr_a: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+        let addr_b: SocketAddr = "127.0.0.1:9002".parse().unwrap();
 
-        let start = NodeEvent::CoordinationStarted { peer_a, peer_b };
+        let start = NodeEvent::CoordinationStarted { addr_a, addr_b };
 
         let complete = NodeEvent::CoordinationComplete {
-            peer_a,
-            peer_b,
+            addr_a,
+            addr_b,
             success: true,
         };
 
@@ -373,13 +369,13 @@ mod tests {
     #[test]
     fn test_data_events() {
         let recv = NodeEvent::DataReceived {
-            peer_id: test_peer_id(),
+            addr: test_addr(),
             stream_id: 1,
             bytes: 1024,
         };
 
         let send = NodeEvent::DataSent {
-            peer_id: test_peer_id(),
+            addr: test_addr(),
             stream_id: 1,
             bytes: 512,
         };
@@ -419,8 +415,8 @@ mod tests {
     #[test]
     fn test_events_are_clone() {
         let event = NodeEvent::PeerConnected {
-            peer_id: test_peer_id(),
             addr: TransportAddr::Udp(test_addr()),
+            public_key: None,
             direct: true,
         };
 
@@ -447,7 +443,7 @@ mod tests {
         };
 
         assert!(event.is_connection_event());
-        assert!(event.peer_id().is_none());
+        assert!(event.addr().is_none());
     }
 
     #[test]
@@ -457,6 +453,6 @@ mod tests {
         };
 
         assert!(event.is_nat_event());
-        assert!(event.peer_id().is_none());
+        assert!(event.addr().is_none());
     }
 }

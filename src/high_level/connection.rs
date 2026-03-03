@@ -311,7 +311,9 @@ impl Future for ConnectionDriver {
                                     .state
                                     .lock("set peer")
                                     .inner
-                                    .set_token_binding_peer_id(peer);
+                                    .set_token_binding_peer_id(crate::nat_traversal_api::PeerId(
+                                        peer,
+                                    ));
                                 hl_conn_server
                                     .0
                                     .state

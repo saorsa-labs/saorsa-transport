@@ -25,8 +25,8 @@ use bytes::{Buf, BufMut};
 use rand::RngCore;
 use thiserror::Error;
 
+use crate::shared::ConnectionId;
 use crate::{Duration, SystemTime, UNIX_EPOCH};
-use crate::{nat_traversal_api::PeerId, shared::ConnectionId};
 
 use aws_lc_rs::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
 
@@ -40,8 +40,8 @@ pub struct TokenKey(pub [u8; 32]);
 /// The decoded contents of a binding token after successful decryption.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BindingTokenDecoded {
-    /// The peer ID that the token was issued for.
-    pub peer_id: PeerId,
+    /// The SPKI fingerprint (BLAKE3 hash) of the peer's public key.
+    pub spki_fingerprint: [u8; 32],
     /// The connection ID associated with this token.
     pub cid: ConnectionId,
     /// A unique nonce to prevent replay attacks.
@@ -121,16 +121,16 @@ pub fn test_key_from_rng(rng: &mut dyn RngCore) -> TokenKey {
     TokenKey(k)
 }
 
-/// Encode a binding token containing peer ID and connection ID.
+/// Encode a binding token containing SPKI fingerprint and connection ID.
 pub fn encode_binding_token_with_rng<R: RngCore>(
     key: &TokenKey,
-    peer_id: &PeerId,
+    fingerprint: &[u8; 32],
     cid: &ConnectionId,
     rng: &mut R,
 ) -> Result<Vec<u8>, TokenError> {
     let mut pt = Vec::with_capacity(1 + 32 + 1 + cid.len());
     pt.push(TokenType::Binding as u8);
-    pt.extend_from_slice(&peer_id.0);
+    pt.extend_from_slice(fingerprint);
     pt.push(cid.len() as u8);
     pt.extend_from_slice(&cid[..]);
     seal_with_rng(&key.0, &pt, rng)
@@ -139,10 +139,10 @@ pub fn encode_binding_token_with_rng<R: RngCore>(
 /// Encode a binding token using the thread RNG.
 pub fn encode_binding_token(
     key: &TokenKey,
-    peer_id: &PeerId,
+    fingerprint: &[u8; 32],
     cid: &ConnectionId,
 ) -> Result<Vec<u8>, TokenError> {
-    encode_binding_token_with_rng(key, peer_id, cid, &mut rand::thread_rng())
+    encode_binding_token_with_rng(key, fingerprint, cid, &mut rand::thread_rng())
 }
 
 /// Encode a retry token containing the client address, original destination CID, and issue time.
@@ -208,8 +208,8 @@ pub fn decode_token(key: &TokenKey, token: &[u8]) -> Option<DecodedToken> {
             if reader.remaining() < 32 + 1 {
                 return None;
             }
-            let mut pid = [0u8; 32];
-            reader.copy_to_slice(&mut pid);
+            let mut fpr = [0u8; 32];
+            reader.copy_to_slice(&mut fpr);
             let cid_len = reader.get_u8() as usize;
             if cid_len > crate::MAX_CID_SIZE || reader.remaining() < cid_len {
                 return None;
@@ -217,7 +217,7 @@ pub fn decode_token(key: &TokenKey, token: &[u8]) -> Option<DecodedToken> {
             let cid = ConnectionId::new(&reader.chunk()[..cid_len]);
             reader.advance(cid_len);
             DecodedToken::Binding(BindingTokenDecoded {
-                peer_id: PeerId(pid),
+                spki_fingerprint: fpr,
                 cid,
                 nonce,
             })
@@ -271,15 +271,15 @@ pub fn decode_validation_token(key: &TokenKey, token: &[u8]) -> Option<Validatio
     }
 }
 
-/// Validate a binding token against the expected peer and connection ID.
+/// Validate a binding token against the expected fingerprint and connection ID.
 pub fn validate_binding_token(
     key: &TokenKey,
     token: &[u8],
-    expected_peer: &PeerId,
+    expected_fingerprint: &[u8; 32],
     expected_cid: &ConnectionId,
 ) -> bool {
     match decode_binding_token(key, token) {
-        Some(dec) => dec.peer_id == *expected_peer && dec.cid == *expected_cid,
+        Some(dec) => dec.spki_fingerprint == *expected_fingerprint && dec.cid == *expected_cid,
         None => false,
     }
 }

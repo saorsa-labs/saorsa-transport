@@ -64,7 +64,6 @@ pub use crate::nat_traversal_api::{
     NatTraversalError,
     NatTraversalEvent,
     NatTraversalStatistics,
-    PeerId,
     // Multi-transport support
     TransportCandidate,
 };
