@@ -269,7 +269,7 @@ jobs:
           ls -t .benchmarks/results-*.json | tail -n +51 | xargs rm -f || true
 
       - name: Commit benchmark history
-        uses: stefanzweifel/git-auto-commit-action@v5
+        uses: stefanzweifel/git-auto-commit-action@v7
         with:
           commit_message: "Update benchmark history [skip ci]"
           file_pattern: ".benchmarks/*.json"
