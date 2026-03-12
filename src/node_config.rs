@@ -532,8 +532,8 @@ mod tests {
         assert_eq!(config.known_peers.len(), 2);
 
         // Check that TransportAddr types are maintained
-        assert!(matches!(config.known_peers[0], TransportAddr::Udp(_)));
-        assert!(matches!(config.known_peers[1], TransportAddr::Udp(_)));
+        assert!(matches!(config.known_peers[0], TransportAddr::Quic(_)));
+        assert!(matches!(config.known_peers[1], TransportAddr::Quic(_)));
 
         // Verify actual addresses match
         assert_eq!(config.known_peers[0], udp_peer);
