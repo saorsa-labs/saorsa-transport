@@ -2813,10 +2813,10 @@ mod tests {
     #[test]
     fn test_peer_connected_event_with_ble() {
         // BLE MAC address (6 bytes)
-        let device_id = [0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc];
+        let mac_addr = [0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc];
         let event = P2pEvent::PeerConnected {
             addr: TransportAddr::Ble {
-                mac: device_id,
+                mac: mac_addr,
                 psm: 128,
             },
             public_key: None,
@@ -2838,7 +2838,7 @@ mod tests {
 
             // Verify we can match on BLE variant
             if let TransportAddr::Ble { mac, psm } = addr {
-                assert_eq!(mac, device_id);
+                assert_eq!(mac, mac_addr);
                 assert_eq!(psm, 128);
             } else {
                 panic!("Expected BLE address");
@@ -2910,11 +2910,11 @@ mod tests {
         );
 
         // Test with BLE
-        let device_id = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+        let mac_addr = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
         let ble_conn = PeerConnection {
             public_key: None,
             remote_addr: TransportAddr::Ble {
-                mac: device_id,
+                mac: mac_addr,
                 psm: 128,
             },
             authenticated: true,

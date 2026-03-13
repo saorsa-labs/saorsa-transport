@@ -3691,8 +3691,8 @@ impl NatTraversalEndpoint {
     /// // Advertise a BLE address
     /// endpoint.advertise_transport_address(
     ///     TransportAddr::Ble {
-    ///         device_id: [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC],
-    ///         service_uuid: None,
+    ///         mac: [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC],
+    ///         psm: 0x0080,
     ///     },
     ///     50,
     ///     Some(CapabilityFlags::ble()),

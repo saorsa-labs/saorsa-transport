@@ -3996,7 +3996,7 @@ mod tests {
     async fn test_ble_transport_send_requires_connection() {
         if let Ok(transport) = BleTransport::new().await {
             let device_id = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
-            let dest = TransportAddr::ble(device_id, None);
+            let dest = TransportAddr::ble(device_id, DEFAULT_BLE_L2CAP_PSM);
             let data = b"Hello BLE";
 
             // Send without connection should fail
@@ -4028,7 +4028,7 @@ mod tests {
     async fn test_ble_transport_send_size_check() {
         if let Ok(transport) = BleTransport::new().await {
             let device_id = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
-            let dest = TransportAddr::ble(device_id, None);
+            let dest = TransportAddr::ble(device_id, DEFAULT_BLE_L2CAP_PSM);
 
             // Add device and connect
             let device = DiscoveredDevice::new(device_id);
@@ -4084,7 +4084,7 @@ mod tests {
     async fn test_ble_transport_send_offline() {
         if let Ok(transport) = BleTransport::new().await {
             let device_id = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
-            let dest = TransportAddr::ble(device_id, None);
+            let dest = TransportAddr::ble(device_id, DEFAULT_BLE_L2CAP_PSM);
 
             // Shutdown transport
             transport.shutdown().await.unwrap();

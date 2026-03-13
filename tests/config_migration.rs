@@ -19,6 +19,10 @@ use saorsa_transport::transport::{TransportAddr, TransportType};
 use saorsa_transport::{NodeConfig, P2pConfig};
 use std::net::SocketAddr;
 
+/// Default BLE L2CAP PSM value (matches `saorsa_transport::transport::DEFAULT_BLE_L2CAP_PSM`
+/// which is gated behind the `ble` feature).
+const DEFAULT_BLE_L2CAP_PSM: u16 = 0x0080;
+
 // ============================================================================
 // P2pConfig Migration Tests
 // ============================================================================
@@ -66,7 +70,7 @@ fn test_p2p_config_new_transport_addr_approach() {
 
     let bind_addr = TransportAddr::Udp("0.0.0.0:9000".parse().expect("valid addr"));
     let udp_peer = TransportAddr::Udp("192.168.1.1:9000".parse().expect("valid addr"));
-    let ble_peer = TransportAddr::ble([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF], None);
+    let ble_peer = TransportAddr::ble([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF], DEFAULT_BLE_L2CAP_PSM);
 
     let config = P2pConfig::builder()
         .bind_addr(bind_addr.clone())
@@ -187,7 +191,7 @@ fn test_node_config_new_transport_addr_approach() {
 
     let bind_addr = TransportAddr::Udp("0.0.0.0:0".parse().expect("valid addr"));
     let udp_peer = TransportAddr::Udp("192.168.1.100:9000".parse().expect("valid addr"));
-    let ble_peer = TransportAddr::ble([0x11, 0x22, 0x33, 0x44, 0x55, 0x66], None);
+    let ble_peer = TransportAddr::ble([0x11, 0x22, 0x33, 0x44, 0x55, 0x66], DEFAULT_BLE_L2CAP_PSM);
 
     let config = NodeConfig::builder()
         .bind_addr(bind_addr.clone())
@@ -213,7 +217,8 @@ fn test_node_config_mixed_transport_types() {
 
     let udp_ipv4 = TransportAddr::Udp("192.168.1.1:9000".parse().expect("valid addr"));
     let udp_ipv6 = TransportAddr::Udp("[::1]:9001".parse().expect("valid addr"));
-    let ble_device = TransportAddr::ble([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF], None);
+    let ble_device =
+        TransportAddr::ble([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF], DEFAULT_BLE_L2CAP_PSM);
     let serial_port = TransportAddr::serial("/dev/ttyUSB0");
 
     let config = NodeConfig::builder()
@@ -306,7 +311,7 @@ fn test_mixed_config_to_nat_config_filtering() {
     // since NatTraversalConfig only works with SocketAddr
 
     let udp_peer: SocketAddr = "192.168.1.1:9000".parse().expect("valid addr");
-    let ble_peer = TransportAddr::ble([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF], None);
+    let ble_peer = TransportAddr::ble([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF], DEFAULT_BLE_L2CAP_PSM);
 
     let p2p_config = P2pConfig::builder()
         .known_peer(udp_peer)
@@ -523,13 +528,13 @@ fn test_new_code_multi_transport() {
         ))
         .known_peer(TransportAddr::ble(
             [0x11, 0x22, 0x33, 0x44, 0x55, 0x66],
-            None,
+            DEFAULT_BLE_L2CAP_PSM,
         ))
         .known_peer(TransportAddr::serial("/dev/ttyUSB0"))
         .build();
 
     // Pattern 3: LoRa and other constrained transports
     let _config3 = NodeConfig::builder()
-        .known_peer(TransportAddr::lora([0x01, 0x02, 0x03, 0x04]))
+        .known_peer(TransportAddr::lora([0x01, 0x02, 0x03, 0x04], 868_000_000))
         .build();
 }
