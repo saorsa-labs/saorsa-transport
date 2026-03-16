@@ -39,10 +39,9 @@ const SHORT_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Create a test node configuration
-fn test_node_config(known_peers: Vec<SocketAddr>) -> P2pConfig {
+fn test_node_config() -> P2pConfig {
     P2pConfig::builder()
         .bind_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
-        .known_peers(known_peers)
         .nat(NatConfig {
             enable_relay_fallback: false,
             ..Default::default()
@@ -67,7 +66,7 @@ mod connection_lifecycle {
     /// Test that a node can be created and starts in idle state
     #[tokio::test]
     async fn test_node_creation() {
-        let config = test_node_config(vec![]);
+        let config = test_node_config();
         let node = P2pEndpoint::new(config)
             .await
             .expect("Failed to create node");
@@ -87,7 +86,7 @@ mod connection_lifecycle {
     #[tokio::test]
     async fn test_connection_establishment() {
         // Create listener node
-        let listener_config = test_node_config(vec![]);
+        let listener_config = test_node_config();
         let listener = P2pEndpoint::new(listener_config)
             .await
             .expect("Failed to create listener");
@@ -100,7 +99,7 @@ mod connection_lifecycle {
         drop(listener); // Just test creation, not full accept
 
         // Create connector node
-        let connector_config = test_node_config(vec![listener_addr]);
+        let connector_config = test_node_config();
         let connector = P2pEndpoint::new(connector_config)
             .await
             .expect("Failed to create connector");
@@ -134,16 +133,16 @@ mod connection_lifecycle {
     #[tokio::test]
     async fn test_multiple_connections() {
         // Create listener
-        let listener_config = test_node_config(vec![]);
+        let listener_config = test_node_config();
         let listener = P2pEndpoint::new(listener_config)
             .await
             .expect("Failed to create listener");
-        let listener_addr = listener.local_addr().expect("Listener should have address");
+        let _listener_addr = listener.local_addr().expect("Listener should have address");
 
         // Create multiple connectors
         let mut connectors = Vec::new();
         for i in 0..3 {
-            let config = test_node_config(vec![listener_addr]);
+            let config = test_node_config();
             match P2pEndpoint::new(config).await {
                 Ok(node) => {
                     println!("Connector {} created", i);
@@ -166,13 +165,13 @@ mod connection_lifecycle {
     #[tokio::test]
     async fn test_connection_state_transitions() {
         // Create two nodes
-        let node1_config = test_node_config(vec![]);
+        let node1_config = test_node_config();
         let node1 = P2pEndpoint::new(node1_config)
             .await
             .expect("Failed to create node1");
         let node1_addr = node1.local_addr().expect("Node1 should have address");
 
-        let node2_config = test_node_config(vec![node1_addr]);
+        let node2_config = test_node_config();
         let node2 = P2pEndpoint::new(node2_config)
             .await
             .expect("Failed to create node2");
@@ -205,7 +204,7 @@ mod connection_lifecycle {
     /// Test graceful shutdown
     #[tokio::test]
     async fn test_graceful_shutdown() {
-        let config = test_node_config(vec![]);
+        let config = test_node_config();
         let node = P2pEndpoint::new(config)
             .await
             .expect("Failed to create node");
@@ -223,7 +222,7 @@ mod connection_lifecycle {
     /// Test public key persistence
     #[tokio::test]
     async fn test_public_key_persistence() {
-        let config = test_node_config(vec![]);
+        let config = test_node_config();
         let node = P2pEndpoint::new(config)
             .await
             .expect("Failed to create node");
@@ -242,14 +241,14 @@ mod connection_lifecycle {
     #[tokio::test]
     async fn test_external_address_discovery() {
         // Create two nodes that connect
-        let node1_config = test_node_config(vec![]);
+        let node1_config = test_node_config();
         let node1 = P2pEndpoint::new(node1_config)
             .await
             .expect("Failed to create node1");
         let node1_addr = node1.local_addr().expect("Node1 should have address");
 
         // Connect node2 to node1
-        let node2_config = test_node_config(vec![node1_addr]);
+        let node2_config = test_node_config();
         let node2 = P2pEndpoint::new(node2_config)
             .await
             .expect("Failed to create node2");
@@ -269,7 +268,7 @@ mod connection_lifecycle {
     /// Test connection statistics
     #[tokio::test]
     async fn test_connection_statistics() {
-        let config = test_node_config(vec![]);
+        let config = test_node_config();
         let node = P2pEndpoint::new(config)
             .await
             .expect("Failed to create node");
@@ -284,7 +283,7 @@ mod connection_lifecycle {
     /// Test NAT statistics
     #[tokio::test]
     async fn test_nat_statistics() {
-        let config = test_node_config(vec![]);
+        let config = test_node_config();
         let node = P2pEndpoint::new(config)
             .await
             .expect("Failed to create node");
@@ -307,7 +306,7 @@ mod error_conditions {
     /// Test connecting to invalid address
     #[tokio::test]
     async fn test_connect_to_invalid_address() {
-        let config = test_node_config(vec![]);
+        let config = test_node_config();
         let node = P2pEndpoint::new(config)
             .await
             .expect("Failed to create node");
@@ -337,7 +336,7 @@ mod error_conditions {
     /// Test connecting to non-existent peer
     #[tokio::test]
     async fn test_connect_to_nonexistent_peer() {
-        let config = test_node_config(vec![]);
+        let config = test_node_config();
         let _node = P2pEndpoint::new(config)
             .await
             .expect("Failed to create node");

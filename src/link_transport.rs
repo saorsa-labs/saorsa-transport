@@ -26,7 +26,7 @@
 //!                              ▼
 //! ┌─────────────────────────────────────────────────────────────────┐
 //! │                    LinkTransport trait                          │
-//! │  local_peer() │ peer_table() │ dial() │ accept() │ subscribe()  │
+//! │  local_peer() │ dial() │ accept() │ subscribe()                  │
 //! └─────────────────────────────────────────────────────────────────┘
 //!                              │
 //!                              ▼
@@ -82,9 +82,9 @@
 //!     });
 //!
 //!     // Dial a peer by address (NAT traversal handled automatically)
-//!     let peers = transport.peer_table();
-//!     if let Some((addr, _caps)) = peers.first() {
-//!         match transport.dial_addr(*addr, DHT_PROTOCOL).await {
+//!     let peer_addr: SocketAddr = "192.168.1.1:9000".parse()?;
+//!     {
+//!         match transport.dial_addr(peer_addr, DHT_PROTOCOL).await {
 //!             Ok(conn) => {
 //!                 // Open a bidirectional stream for request/response
 //!                 let (mut send, mut recv) = conn.open_bi().await?;
@@ -817,12 +817,6 @@ pub enum LinkEvent {
         /// Coordination round number.
         round: u64,
     },
-
-    /// The bootstrap cache has been updated.
-    BootstrapCacheUpdated {
-        /// Number of peers in the cache.
-        peer_count: usize,
-    },
 }
 
 // ============================================================================
@@ -1316,21 +1310,6 @@ pub trait LinkTransport: Send + Sync + 'static {
     /// Returns `None` if we haven't connected to any peers yet or
     /// if we're behind a symmetric NAT that changes our external port.
     fn external_address(&self) -> Option<SocketAddr>;
-
-    /// Get all known peers with their capabilities, keyed by address.
-    ///
-    /// Includes:
-    /// - Currently connected peers (`caps.is_connected = true`)
-    /// - Previously connected peers still in bootstrap cache
-    /// - Peers learned from relay/coordination traffic
-    ///
-    /// Use `Capabilities::quality_score()` to rank peers for selection.
-    fn peer_table(&self) -> Vec<(SocketAddr, Capabilities)>;
-
-    /// Get capabilities for a peer at a specific address.
-    ///
-    /// Returns `None` if the address is not known.
-    fn peer_capabilities(&self, addr: &SocketAddr) -> Option<Capabilities>;
 
     /// Subscribe to transport-level events.
     ///

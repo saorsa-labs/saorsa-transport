@@ -28,7 +28,6 @@
 //!     // All nodes are symmetric - they can both connect and accept connections
 //!     let config = P2pConfig::builder()
 //!         .bind_addr("0.0.0.0:9000".parse()?)
-//!         .known_peer("quic.saorsalabs.com:9000".parse()?)
 //!         .build()?;
 //!
 //!     let endpoint = P2pEndpoint::new(config).await?;
@@ -41,9 +40,6 @@
 //!             println!("Event: {:?}", event);
 //!         }
 //!     });
-//!
-//!     // Connect to known peers
-//!     endpoint.connect_known_peers().await?;
 //!
 //!     Ok(())
 //! }
@@ -60,7 +56,6 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::Side;
-use crate::bootstrap_cache::{BootstrapCache, BootstrapTokenStore};
 use crate::bounded_pending_buffer::BoundedPendingBuffer;
 use crate::connection_router::{ConnectionRouter, RouterConfig};
 use crate::connection_strategy::{
@@ -145,9 +140,6 @@ pub struct P2pEndpoint {
 
     /// Bounded pending data buffer for message ordering
     pending_data: Arc<RwLock<BoundedPendingBuffer>>,
-
-    /// Bootstrap cache for peer persistence
-    pub bootstrap_cache: Arc<BootstrapCache>,
 
     /// Transport registry for multi-transport support
     ///
@@ -275,12 +267,6 @@ pub struct EndpointStats {
     /// Relayed connections
     pub relayed_connections: u64,
 
-    /// Total bootstrap nodes configured
-    pub total_bootstrap_nodes: usize,
-
-    /// Connected bootstrap nodes
-    pub connected_bootstrap_nodes: usize,
-
     /// Endpoint start time
     pub start_time: Instant,
 
@@ -301,8 +287,6 @@ impl Default for EndpointStats {
             nat_traversal_successes: 0,
             direct_connections: 0,
             relayed_connections: 0,
-            total_bootstrap_nodes: 0,
-            connected_bootstrap_nodes: 0,
             start_time: Instant::now(),
             average_coordination_time: Duration::ZERO,
             phantom_connections_evicted: 0,
@@ -404,14 +388,6 @@ pub enum P2pEvent {
     ExternalAddressDiscovered {
         /// Discovered external transport address (typically TransportAddr::Quic for NAT traversal)
         addr: TransportAddr,
-    },
-
-    /// Bootstrap connection status
-    BootstrapStatus {
-        /// Number of connected bootstrap nodes
-        connected: usize,
-        /// Total number of bootstrap nodes
-        total: usize,
     },
 
     /// Peer authenticated
@@ -577,7 +553,6 @@ impl P2pEndpoint {
 
         // Create stats
         let stats = Arc::new(RwLock::new(EndpointStats {
-            total_bootstrap_nodes: config.known_peers.len(),
             start_time: Instant::now(),
             ..Default::default()
         }));
@@ -643,16 +618,6 @@ impl P2pEndpoint {
         // Create NAT traversal endpoint with the same identity key used for auth
         // This ensures P2pEndpoint and NatTraversalEndpoint use the same keypair
         let mut nat_config = config.to_nat_config_with_key(public_key.clone(), secret_key);
-        let bootstrap_cache = Arc::new(
-            BootstrapCache::open(config.bootstrap_cache.clone())
-                .await
-                .map_err(|e| {
-                    EndpointError::Config(format!("Failed to open bootstrap cache: {}", e))
-                })?,
-        );
-
-        // Create token store
-        let token_store = Arc::new(BootstrapTokenStore::new(bootstrap_cache.clone()).await);
 
         // Phase 5.3 Deliverable 3: Socket sharing in default constructor
         // Bind a single UDP socket and share it between transport registry and Quinn
@@ -687,7 +652,7 @@ impl P2pEndpoint {
         let inner = NatTraversalEndpoint::new_with_socket(
             nat_config,
             Some(event_callback),
-            Some(token_store.clone()),
+            None,
             Some(quinn_socket),
         )
         .await
@@ -729,7 +694,6 @@ impl P2pEndpoint {
             public_key: public_key_bytes,
             shutdown: CancellationToken::new(),
             pending_data: Arc::new(RwLock::new(BoundedPendingBuffer::default())),
-            bootstrap_cache,
             transport_registry,
             router: Arc::new(RwLock::new(router)),
             constrained_connections: Arc::new(RwLock::new(HashMap::new())),
@@ -1318,44 +1282,11 @@ impl P2pEndpoint {
             return Err(EndpointError::ShuttingDown);
         }
 
-        // Build strategy config with coordinator and relay from our config
+        // Build strategy config with relay from our config
         let mut config = strategy_config.unwrap_or_default();
-        if config.coordinator.is_none() {
-            config.coordinator = self
-                .config
-                .known_peers
-                .first()
-                .and_then(|addr| addr.as_socket_addr());
-        }
         if config.relay_addrs.is_empty() {
-            // Optimization: Try to find a high-quality relay from our cache first
-            let target_addr = target_ipv4.or(target_ipv6);
-            if let Some(addr) = target_addr {
-                // Select best relay for this target (preferring dual-stack)
-                let relays = self
-                    .bootstrap_cache
-                    .select_relays_for_target(1, &addr, true)
-                    .await;
-
-                if let Some(best_relay) = relays.first() {
-                    // Use the first address of the best relay
-                    // In a perfect world we'd check reachability of this address too,
-                    // but for now we assume cached addresses are valid candidates.
-                    if let Some(relay_addr) = best_relay.addresses.first().copied() {
-                        config.relay_addrs.push(relay_addr);
-                        debug!(
-                            "Selected optimized relay from cache: {:?} for target {}",
-                            relay_addr, addr
-                        );
-                    }
-                }
-            }
-
-            // Fallback to static config if cache gave nothing
-            if config.relay_addrs.is_empty() {
-                if let Some(relay_addr) = self.config.nat.relay_nodes.first().copied() {
-                    config.relay_addrs.push(relay_addr);
-                }
+            if let Some(relay_addr) = self.config.nat.relay_nodes.first().copied() {
+                config.relay_addrs.push(relay_addr);
             }
         }
 
@@ -2123,49 +2054,6 @@ impl P2pEndpoint {
             .map_err(|e| EndpointError::Connection(e.to_string()))
     }
 
-    // === Known Peers ===
-
-    /// Connect to configured known peers
-    ///
-    /// This method now uses the connection router to automatically select
-    /// the appropriate protocol engine for each peer address.
-    pub async fn connect_known_peers(&self) -> Result<usize, EndpointError> {
-        let mut connected = 0;
-        let known_peers = self.config.known_peers.clone();
-
-        for addr in &known_peers {
-            // Use connect_transport for all address types
-            match self.connect_transport(addr).await {
-                Ok(_) => {
-                    connected += 1;
-                    info!("Connected to known peer {}", addr);
-                }
-                Err(e) => {
-                    warn!("Failed to connect to known peer {}: {}", addr, e);
-                }
-            }
-        }
-
-        {
-            let mut stats = self.stats.write().await;
-            stats.connected_bootstrap_nodes = connected;
-        }
-
-        let _ = self.event_tx.send(P2pEvent::BootstrapStatus {
-            connected,
-            total: known_peers.len(),
-        });
-
-        Ok(connected)
-    }
-
-    /// Add a bootstrap node dynamically
-    pub async fn add_bootstrap(&self, addr: SocketAddr) {
-        let _ = self.inner.add_bootstrap_node(addr);
-        let mut stats = self.stats.write().await;
-        stats.total_bootstrap_nodes += 1;
-    }
-
     /// Get list of connected peers
     pub async fn connected_peers(&self) -> Vec<PeerConnection> {
         self.connected_peers
@@ -2636,7 +2524,6 @@ impl Clone for P2pEndpoint {
             public_key: self.public_key.clone(),
             shutdown: self.shutdown.clone(),
             pending_data: Arc::clone(&self.pending_data),
-            bootstrap_cache: Arc::clone(&self.bootstrap_cache),
             transport_registry: Arc::clone(&self.transport_registry),
             router: Arc::clone(&self.router),
             constrained_connections: Arc::clone(&self.constrained_connections),

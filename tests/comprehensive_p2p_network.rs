@@ -40,10 +40,9 @@ async fn shutdown_with_timeout(node: P2pEndpoint) {
 }
 
 /// Create a test node configuration
-fn test_node_config(known_peers: Vec<SocketAddr>) -> P2pConfig {
+fn test_node_config() -> P2pConfig {
     P2pConfig::builder()
         .bind_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
-        .known_peers(known_peers)
         // v0.2: Authentication handled by TLS via ML-DSA-65 - no separate config needed
         .nat(NatConfig {
             enable_relay_fallback: false,
@@ -54,9 +53,9 @@ fn test_node_config(known_peers: Vec<SocketAddr>) -> P2pConfig {
         .expect("Failed to build test config")
 }
 
-/// Create a test node with optional known peers
-async fn create_test_node(known_peers: Vec<SocketAddr>) -> P2pEndpoint {
-    let config = test_node_config(known_peers);
+/// Create a test node
+async fn create_test_node() -> P2pEndpoint {
+    let config = test_node_config();
     P2pEndpoint::new(config)
         .await
         .expect("Failed to create test node")
@@ -90,7 +89,7 @@ mod first_node_tests {
 
     #[tokio::test]
     async fn test_first_node_creation() {
-        let node = create_test_node(vec![]).await;
+        let node = create_test_node().await;
 
         // First node should have a valid local address
         let local_addr = node.local_addr();
@@ -121,7 +120,7 @@ mod first_node_tests {
 
     #[tokio::test]
     async fn test_first_node_can_accept_connections() {
-        let listener = create_test_node(vec![]).await;
+        let listener = create_test_node().await;
         let listener_addr = listener.local_addr().expect("Listener should have address");
 
         println!("Listener ready at: {}", listener_addr);
@@ -135,7 +134,7 @@ mod first_node_tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Create a connecting node
-        let connector = create_test_node(vec![listener_addr]).await;
+        let connector = create_test_node().await;
         println!("Connector created, attempting connection...");
 
         // Connect to listener
@@ -163,9 +162,9 @@ mod first_node_tests {
 
     #[tokio::test]
     async fn test_multiple_listeners_different_ports() {
-        let node1 = create_test_node(vec![]).await;
-        let node2 = create_test_node(vec![]).await;
-        let node3 = create_test_node(vec![]).await;
+        let node1 = create_test_node().await;
+        let node2 = create_test_node().await;
+        let node3 = create_test_node().await;
 
         let addr1 = node1.local_addr().expect("Node 1 should have address");
         let addr2 = node2.local_addr().expect("Node 2 should have address");
@@ -197,14 +196,14 @@ mod bootstrap_tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_connect_to_known_peer() {
-        // Create first node (no known peers)
-        let node1 = create_test_node(vec![]).await;
+    async fn test_connect_to_peer() {
+        // Create first node
+        let node1 = create_test_node().await;
         let node1_addr = node1.local_addr().expect("Node 1 should have address");
         println!("Node 1 listening at: {}", node1_addr);
 
-        // Create second node with node1 as known peer
-        let node2 = create_test_node(vec![node1_addr]).await;
+        // Create second node
+        let node2 = create_test_node().await;
         let node2_addr = node2.local_addr().expect("Node 2 should have address");
         println!("Node 2 listening at: {}", node2_addr);
 
@@ -213,13 +212,13 @@ mod bootstrap_tests {
         let accept_task =
             tokio::spawn(async move { timeout(SHORT_TIMEOUT, node1_clone.accept()).await });
 
-        // Node2 connects to known peers
+        // Node2 connects directly to node1
         tokio::time::sleep(Duration::from_millis(100)).await;
-        let connect_result = timeout(SHORT_TIMEOUT, node2.connect_known_peers()).await;
+        let connect_result = timeout(SHORT_TIMEOUT, node2.connect(node1_addr)).await;
 
         match connect_result {
-            Ok(Ok(count)) => {
-                println!("Node 2 connected to {} known peers", count);
+            Ok(Ok(conn)) => {
+                println!("Node 2 connected to Node 1 at {:?}", conn.remote_addr);
             }
             Ok(Err(e)) => {
                 println!("Connect error (may be expected): {}", e);
@@ -237,17 +236,17 @@ mod bootstrap_tests {
     #[tokio::test]
     async fn test_three_node_bootstrap_chain() {
         // Create first node (the "seed" node)
-        let seed = create_test_node(vec![]).await;
+        let seed = create_test_node().await;
         let seed_addr = seed.local_addr().expect("Seed should have address");
         println!("Seed node at: {}", seed_addr);
 
         // Create second node, knows seed
-        let node2 = create_test_node(vec![seed_addr]).await;
+        let node2 = create_test_node().await;
         let node2_addr = node2.local_addr().expect("Node 2 should have address");
         println!("Node 2 at: {}", node2_addr);
 
         // Create third node, knows both seed and node2
-        let node3 = create_test_node(vec![seed_addr, node2_addr]).await;
+        let node3 = create_test_node().await;
         println!("Node 3 at: {:?}", node3.local_addr());
 
         // All nodes should have unique public keys
@@ -292,7 +291,7 @@ mod address_discovery_tests {
     async fn test_external_address_not_discovered_on_localhost() {
         // On localhost, external address might not be discovered
         // This tests the API works correctly regardless
-        let node = create_test_node(vec![]).await;
+        let node = create_test_node().await;
 
         // External address may or may not be set on localhost
         let external = node.external_addr();
@@ -308,14 +307,14 @@ mod address_discovery_tests {
 
     #[tokio::test]
     async fn test_address_discovery_event() {
-        let observer = create_test_node(vec![]).await;
+        let observer = create_test_node().await;
         let observer_addr = observer.local_addr().expect("Observer needs address");
 
         // Subscribe to events
         let events = observer.subscribe();
 
         // Create client that connects to observer
-        let client = create_test_node(vec![observer_addr]).await;
+        let client = create_test_node().await;
 
         // Spawn connection task
         let client_clone = client.clone();
@@ -364,14 +363,14 @@ mod data_transfer_tests {
 
     #[tokio::test]
     async fn test_send_receive_data() {
-        let server = create_test_node(vec![]).await;
+        let server = create_test_node().await;
         let server_addr = server.local_addr().expect("Server needs address");
 
         // Subscribe to events on both sides
         let _server_events = server.subscribe();
 
         // Create client
-        let client = create_test_node(vec![server_addr]).await;
+        let client = create_test_node().await;
 
         // Spawn server accept task
         let server_clone = server.clone();
@@ -420,10 +419,10 @@ mod data_transfer_tests {
 
     #[tokio::test]
     async fn test_bidirectional_data_transfer() {
-        let node1 = create_test_node(vec![]).await;
+        let node1 = create_test_node().await;
         let node1_addr = node1.local_addr().expect("Node 1 needs address");
 
-        let node2 = create_test_node(vec![node1_addr]).await;
+        let node2 = create_test_node().await;
 
         // Setup connection
         let node1_clone = node1.clone();
@@ -542,7 +541,7 @@ mod raw_public_key_tests {
 
     #[tokio::test]
     async fn test_node_public_key_access() {
-        let node = create_test_node(vec![]).await;
+        let node = create_test_node().await;
 
         // Get public key from node - v0.2.0+: ML-DSA-65 is 1952 bytes
         let public_key_bytes = node.public_key_bytes();
@@ -689,9 +688,9 @@ mod nat_traversal_tests {
     #[tokio::test]
     async fn test_three_node_nat_simulation() {
         // Create three nodes simulating NAT scenario
-        let node1 = create_test_node(vec![]).await;
-        let node2 = create_test_node(vec![]).await;
-        let node3 = create_test_node(vec![]).await;
+        let node1 = create_test_node().await;
+        let node2 = create_test_node().await;
+        let node3 = create_test_node().await;
 
         let addr1 = node1.local_addr().unwrap();
         let addr2 = node2.local_addr().unwrap();
@@ -719,10 +718,10 @@ mod nat_traversal_tests {
     #[tokio::test]
     async fn test_nat_traversal_state_machine() {
         // Test that NAT traversal events are properly generated
-        let coordinator = create_test_node(vec![]).await;
+        let coordinator = create_test_node().await;
         let coordinator_addr = coordinator.local_addr().unwrap();
 
-        let client = create_test_node(vec![coordinator_addr]).await;
+        let client = create_test_node().await;
         let client_events = client.subscribe();
 
         // Spawn coordinator accept
@@ -768,15 +767,15 @@ mod three_node_network_tests {
         println!("=== Three Node Ring Topology Test ===");
 
         // Create three nodes
-        let node1 = create_test_node(vec![]).await;
+        let node1 = create_test_node().await;
         let addr1 = node1.local_addr().unwrap();
         println!("Node 1 at {}", addr1);
 
-        let node2 = create_test_node(vec![addr1]).await;
+        let node2 = create_test_node().await;
         let addr2 = node2.local_addr().unwrap();
         println!("Node 2 at {}", addr2);
 
-        let node3 = create_test_node(vec![addr1, addr2]).await;
+        let node3 = create_test_node().await;
         let addr3 = node3.local_addr().unwrap();
         println!("Node 3 at {}", addr3);
 
@@ -803,13 +802,13 @@ mod three_node_network_tests {
         println!("=== Three Node Star Topology Test ===");
 
         // Create central node
-        let hub = create_test_node(vec![]).await;
+        let hub = create_test_node().await;
         let hub_addr = hub.local_addr().unwrap();
         println!("Hub at {}", hub_addr);
 
         // Create spoke nodes that only know the hub
-        let spoke1 = create_test_node(vec![hub_addr]).await;
-        let spoke2 = create_test_node(vec![hub_addr]).await;
+        let spoke1 = create_test_node().await;
+        let spoke2 = create_test_node().await;
 
         println!("Spoke 1 addr: {:?}", spoke1.local_addr());
         println!("Spoke 2 addr: {:?}", spoke2.local_addr());
@@ -832,14 +831,14 @@ mod three_node_network_tests {
         println!("=== Three Node Full Mesh Topology Test ===");
 
         // Create nodes incrementally, each knowing all previous nodes
-        let node1 = create_test_node(vec![]).await;
+        let node1 = create_test_node().await;
         let addr1 = node1.local_addr().unwrap();
 
-        let node2 = create_test_node(vec![addr1]).await;
+        let node2 = create_test_node().await;
         let addr2 = node2.local_addr().unwrap();
 
         // Node3 knows both node1 and node2
-        let node3 = create_test_node(vec![addr1, addr2]).await;
+        let node3 = create_test_node().await;
         let addr3 = node3.local_addr().unwrap();
 
         println!("Full mesh:");
@@ -941,7 +940,7 @@ async fn test_comprehensive_integration_summary() {
 
     // 1. First node creation
     println!("1. Testing first node creation...");
-    let first_node = create_test_node(vec![]).await;
+    let first_node = create_test_node().await;
     let first_addr = first_node.local_addr().expect("First node needs address");
     println!("   First node at: {}", first_addr);
     println!(
@@ -951,12 +950,12 @@ async fn test_comprehensive_integration_summary() {
 
     // 2. Second node with bootstrap
     println!("\n2. Testing bootstrap connection...");
-    let second_node = create_test_node(vec![first_addr]).await;
+    let second_node = create_test_node().await;
     println!("   Second node at: {:?}", second_node.local_addr());
 
     // 3. Third node (mesh)
     println!("\n3. Testing three-node mesh...");
-    let third_node = create_test_node(vec![first_addr]).await;
+    let third_node = create_test_node().await;
     println!("   Third node at: {:?}", third_node.local_addr());
 
     // 4. Verify uniqueness
@@ -1003,7 +1002,7 @@ mod channel_recv_and_shutdown_tests {
     /// architecture is operational.
     #[tokio::test]
     async fn test_recv_delivers_data_via_channel() {
-        let server = create_test_node(vec![]).await;
+        let server = create_test_node().await;
         let server_addr = server.local_addr().expect("Server needs address");
 
         // Spawn server accept so handshake completes and reader task is spawned
@@ -1014,7 +1013,7 @@ mod channel_recv_and_shutdown_tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Client connects
-        let client = create_test_node(vec![server_addr]).await;
+        let client = create_test_node().await;
         let connect_result = timeout(SHORT_TIMEOUT, client.connect(server_addr)).await;
 
         let peer_conn = match connect_result {
@@ -1078,7 +1077,7 @@ mod channel_recv_and_shutdown_tests {
     /// underlying QUIC idle timeout.
     #[tokio::test]
     async fn test_accept_returns_promptly_on_shutdown() {
-        let node = create_test_node(vec![]).await;
+        let node = create_test_node().await;
         let node_clone = node.clone();
 
         // Spawn a task that blocks on accept() — no one will connect
@@ -1116,7 +1115,7 @@ mod channel_recv_and_shutdown_tests {
     /// and could stall forever.
     #[tokio::test]
     async fn test_shutdown_completes_within_bounded_time() {
-        let server = create_test_node(vec![]).await;
+        let server = create_test_node().await;
         let server_addr = server.local_addr().expect("Server needs address");
 
         // Spawn accept so handshake can complete
@@ -1126,7 +1125,7 @@ mod channel_recv_and_shutdown_tests {
 
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        let client = create_test_node(vec![server_addr]).await;
+        let client = create_test_node().await;
 
         // Establish a connection (so shutdown has something to drain)
         let _ = timeout(SHORT_TIMEOUT, client.connect(server_addr)).await;

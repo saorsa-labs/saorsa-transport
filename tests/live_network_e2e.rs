@@ -65,7 +65,6 @@ async fn test_external_address_discovery_live() -> anyhow::Result<()> {
 
     let config = P2pConfig::builder()
         .bind_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
-        .known_peers(known_peers.clone())
         .pqc(saorsa_transport::PqcConfig::default())
         .build()?;
 
@@ -76,7 +75,16 @@ async fn test_external_address_discovery_live() -> anyhow::Result<()> {
     println!("Connecting to {} known peers...", known_peers.len());
     let connect_task = {
         let node = node.clone();
-        tokio::spawn(async move { node.connect_known_peers().await })
+        let peers = known_peers.clone();
+        tokio::spawn(async move {
+            let mut connected = 0usize;
+            for peer_addr in peers {
+                if node.connect(peer_addr).await.is_ok() {
+                    connected += 1;
+                }
+            }
+            Ok::<usize, anyhow::Error>(connected)
+        })
     };
 
     // Wait for connection and external address discovery
@@ -167,7 +175,6 @@ async fn test_dual_stack_connectivity() -> anyhow::Result<()> {
 
         let config = P2pConfig::builder()
             .bind_addr(bind_addr)
-            .known_peers(vec![peer_addr])
             .pqc(saorsa_transport::PqcConfig::default())
             .build()?;
 
@@ -177,12 +184,12 @@ async fn test_dual_stack_connectivity() -> anyhow::Result<()> {
 
                 // Try to connect
                 let result = tokio::time::timeout(Duration::from_secs(10), async {
-                    node.connect_known_peers().await
+                    node.connect(peer_addr).await
                 })
                 .await;
 
                 match result {
-                    Ok(Ok(n)) => println!("{} connection successful! {} peers connected", mode, n),
+                    Ok(Ok(_)) => println!("{} connection successful!", mode),
                     Ok(Err(e)) => println!("{} connection failed: {:?}", mode, e),
                     Err(_) => println!("{} connection timed out", mode),
                 }
@@ -210,7 +217,6 @@ async fn connect_to_node(addr: &str) -> anyhow::Result<()> {
 
     let config = P2pConfig::builder()
         .bind_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
-        .known_peers(vec![peer_addr])
         .pqc(saorsa_transport::PqcConfig::default())
         .build()?;
 
@@ -219,13 +225,13 @@ async fn connect_to_node(addr: &str) -> anyhow::Result<()> {
 
     // Connect with timeout
     let connect_result = tokio::time::timeout(Duration::from_secs(15), async {
-        node.connect_known_peers().await
+        node.connect(peer_addr).await
     })
     .await;
 
     match connect_result {
-        Ok(Ok(n)) => {
-            println!("Successfully connected to {} ({} peers)", addr, n);
+        Ok(Ok(_)) => {
+            println!("Successfully connected to {}", addr);
 
             // Verify connection by checking for observed address
             tokio::time::sleep(Duration::from_secs(2)).await;

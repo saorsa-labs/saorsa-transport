@@ -14,10 +14,7 @@ async fn main() -> anyhow::Result<()> {
     let pqc_config = PqcConfig::builder().ml_kem(true).ml_dsa(true).build()?;
 
     // v0.13.0+: No role needed - all nodes are symmetric P2P nodes
-    let config = P2pConfig::builder()
-        .known_peer("127.0.0.1:9000".parse::<std::net::SocketAddr>()?)
-        .pqc(pqc_config)
-        .build()?;
+    let config = P2pConfig::builder().pqc(pqc_config).build()?;
 
     println!("Attempting to create P2pEndpoint with PQC...");
 

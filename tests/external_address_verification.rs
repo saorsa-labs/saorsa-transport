@@ -46,7 +46,6 @@ async fn test_external_address_discovery() -> anyhow::Result<()> {
     println!("Initializing client node...");
     let client_config = P2pConfig::builder()
         .bind_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
-        .known_peers(vec![observer_addr])
         // v0.2: Authentication handled by TLS via ML-DSA-65 - no separate config needed
         // v0.13.0+: PQC is always on
         .pqc(saorsa_transport::PqcConfig::default())
@@ -55,11 +54,11 @@ async fn test_external_address_discovery() -> anyhow::Result<()> {
     let client_node = P2pEndpoint::new(client_config).await?;
     println!("Client node started at {:?}", client_node.local_addr());
 
-    // 3. Connect to known peers
-    println!("Client connecting to known peers...");
+    // 3. Connect to the observer node directly
+    println!("Client connecting to observer...");
     let connect_task = {
         let client_node = client_node.clone();
-        tokio::spawn(async move { client_node.connect_known_peers().await })
+        tokio::spawn(async move { client_node.connect(observer_addr).await })
     };
 
     let mut discovered_addr: Option<saorsa_transport::transport::TransportAddr> = None;

@@ -286,14 +286,6 @@ pub use link_transport_impl::{
     P2pLinkConn, P2pLinkTransport, P2pRecvStream, P2pSendStream, SharedTransport,
 };
 
-// Bootstrap cache for peer persistence and quality-based selection
-pub mod bootstrap_cache;
-pub use bootstrap_cache::{
-    BootstrapCache, BootstrapCacheConfig, BootstrapCacheConfigBuilder, CacheEvent, CacheStats,
-    CachedPeer, ConnectionOutcome, ConnectionStats as CacheConnectionStats,
-    NatType as CacheNatType, PeerCapabilities, PeerSource, QualityWeights, SelectionStrategy,
-};
-
 // Host identity for local-only HostKey management (ADR-007)
 pub mod host_identity;
 pub use host_identity::{EndpointKeyPolicy, HostIdentity, HostKeyStorage, StorageError};

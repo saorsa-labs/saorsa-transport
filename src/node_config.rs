@@ -26,7 +26,7 @@
 //!
 //! // Only configure what you need
 //! let config = NodeConfig::builder()
-//!     .known_peer("quic.saorsalabs.com:9000".parse()?)
+//!     .bind_addr("0.0.0.0:9000".parse()?)
 //!     .build();
 //!
 //! let node = Node::with_config(config).await?;
@@ -44,7 +44,6 @@ use crate::unified_config::load_or_generate_endpoint_keypair;
 ///
 /// All fields are optional - the node will auto-configure everything.
 /// - `bind_addr`: Defaults to `0.0.0.0:0` (random port)
-/// - `known_peers`: Defaults to empty (node can still accept connections)
 /// - `keypair`: Defaults to fresh generated keypair
 /// - `transport_providers`: Defaults to UDP transport only
 ///
@@ -53,11 +52,6 @@ use crate::unified_config::load_or_generate_endpoint_keypair;
 /// ```rust,ignore
 /// // Zero configuration
 /// let config = NodeConfig::default();
-///
-/// // Or with known peers
-/// let config = NodeConfig::builder()
-///     .known_peer("peer1.example.com:9000".parse()?)
-///     .build();
 ///
 /// // Or with additional transport providers
 /// #[cfg(feature = "ble")]
@@ -69,10 +63,6 @@ use crate::unified_config::load_or_generate_endpoint_keypair;
 pub struct NodeConfig {
     /// Bind address. Default: 0.0.0.0:0 (random port)
     pub bind_addr: Option<TransportAddr>,
-
-    /// Known peers for initial discovery. Default: empty
-    /// When empty, node can still accept incoming connections.
-    pub known_peers: Vec<TransportAddr>,
 
     /// Identity keypair (ML-DSA-65). Default: fresh generated
     /// Provide for persistent identity across restarts.
@@ -92,7 +82,6 @@ impl std::fmt::Debug for NodeConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NodeConfig")
             .field("bind_addr", &self.bind_addr)
-            .field("known_peers", &self.known_peers)
             .field("keypair", &self.keypair.as_ref().map(|_| "[REDACTED]"))
             .field("transport_providers", &self.transport_providers.len())
             .finish()
@@ -118,14 +107,6 @@ impl NodeConfig {
         }
     }
 
-    /// Create config with known peers
-    pub fn with_known_peers(peers: impl IntoIterator<Item = impl Into<TransportAddr>>) -> Self {
-        Self {
-            known_peers: peers.into_iter().map(|p| p.into()).collect(),
-            ..Default::default()
-        }
-    }
-
     /// Create config with a specific ML-DSA-65 keypair
     pub fn with_keypair(public_key: MlDsaPublicKey, secret_key: MlDsaSecretKey) -> Self {
         Self {
@@ -139,7 +120,6 @@ impl NodeConfig {
 #[derive(Default)]
 pub struct NodeConfigBuilder {
     bind_addr: Option<TransportAddr>,
-    known_peers: Vec<TransportAddr>,
     keypair: Option<(MlDsaPublicKey, MlDsaSecretKey)>,
     transport_providers: Vec<Arc<dyn TransportProvider>>,
 }
@@ -172,78 +152,6 @@ impl NodeConfigBuilder {
     /// ```
     pub fn bind_addr(mut self, addr: impl Into<TransportAddr>) -> Self {
         self.bind_addr = Some(addr.into());
-        self
-    }
-
-    /// Add a known peer for initial network connectivity
-    ///
-    /// Known peers are used for initial discovery and connection establishment.
-    /// The node will learn about additional peers through the network.
-    ///
-    /// Accepts any type implementing `Into<TransportAddr>`:
-    /// - `SocketAddr` - Auto-converts to `TransportAddr::Udp`
-    /// - `TransportAddr` - Supports multiple transport types
-    ///
-    /// # Examples
-    ///
-    /// ```rust,ignore
-    /// use saorsa_transport::NodeConfig;
-    /// use std::net::SocketAddr;
-    ///
-    /// // Backward compatible: SocketAddr
-    /// let config = NodeConfig::builder()
-    ///     .known_peer("peer.example.com:9000".parse::<SocketAddr>().unwrap())
-    ///     .build();
-    ///
-    /// // Multi-transport: Mix different transport types
-    /// use saorsa_transport::transport::TransportAddr;
-    /// let config = NodeConfig::builder()
-    ///     .known_peer(TransportAddr::Udp("192.168.1.1:9000".parse().unwrap()))
-    ///     .known_peer(TransportAddr::ble([0x11, 0x22, 0x33, 0x44, 0x55, 0x66], 0x0080))
-    ///     .build();
-    /// ```
-    pub fn known_peer(mut self, addr: impl Into<TransportAddr>) -> Self {
-        self.known_peers.push(addr.into());
-        self
-    }
-
-    /// Add multiple known peers at once
-    ///
-    /// Convenient method to add a collection of peers. Each item is automatically
-    /// converted via `Into<TransportAddr>`, supporting both `SocketAddr` and
-    /// `TransportAddr` for backward compatibility and multi-transport scenarios.
-    ///
-    /// # Examples
-    ///
-    /// ```rust,ignore
-    /// use saorsa_transport::NodeConfig;
-    /// use std::net::SocketAddr;
-    ///
-    /// // Backward compatible: Vec<SocketAddr>
-    /// let peers: Vec<SocketAddr> = vec![
-    ///     "peer1.example.com:9000".parse().unwrap(),
-    ///     "peer2.example.com:9000".parse().unwrap(),
-    /// ];
-    /// let config = NodeConfig::builder()
-    ///     .known_peers(peers)
-    ///     .build();
-    ///
-    /// // Multi-transport: Heterogeneous transport list
-    /// use saorsa_transport::transport::TransportAddr;
-    /// let mixed = vec![
-    ///     TransportAddr::Udp("192.168.1.1:9000".parse().unwrap()),
-    ///     TransportAddr::ble([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF], 0x0080),
-    ///     TransportAddr::serial("/dev/ttyUSB0"),
-    /// ];
-    /// let config = NodeConfig::builder()
-    ///     .known_peers(mixed)
-    ///     .build();
-    /// ```
-    pub fn known_peers(
-        mut self,
-        addrs: impl IntoIterator<Item = impl Into<TransportAddr>>,
-    ) -> Self {
-        self.known_peers.extend(addrs.into_iter().map(|a| a.into()));
         self
     }
 
@@ -311,7 +219,6 @@ impl NodeConfigBuilder {
     pub fn build(self) -> NodeConfig {
         NodeConfig {
             bind_addr: self.bind_addr,
-            known_peers: self.known_peers,
             keypair: self.keypair,
             transport_providers: self.transport_providers,
         }
@@ -350,7 +257,6 @@ mod tests {
     fn test_default_config() {
         let config = NodeConfig::default();
         assert!(config.bind_addr.is_none());
-        assert!(config.known_peers.is_empty());
         assert!(config.keypair.is_none());
         assert!(config.transport_providers.is_empty());
     }
@@ -363,64 +269,10 @@ mod tests {
     }
 
     #[test]
-    fn test_builder_with_known_peers() {
-        let peer1: SocketAddr = "127.0.0.1:9000".parse().unwrap();
-        let peer2: SocketAddr = "127.0.0.1:9001".parse().unwrap();
-
-        let config = NodeConfig::builder()
-            .known_peer(peer1)
-            .known_peer(peer2)
-            .build();
-
-        assert_eq!(config.known_peers.len(), 2);
-        assert!(config.known_peers.contains(&TransportAddr::from(peer1)));
-        assert!(config.known_peers.contains(&TransportAddr::from(peer2)));
-    }
-
-    #[test]
-    fn test_builder_with_multiple_peers() {
-        let peers: Vec<SocketAddr> = vec![
-            "127.0.0.1:9000".parse().unwrap(),
-            "127.0.0.1:9001".parse().unwrap(),
-        ];
-
-        let config = NodeConfig::builder().known_peers(peers.clone()).build();
-
-        assert_eq!(config.known_peers.len(), 2);
-        assert_eq!(
-            config.known_peers,
-            peers
-                .into_iter()
-                .map(TransportAddr::from)
-                .collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
     fn test_with_bind_addr() {
         let addr: SocketAddr = "0.0.0.0:9000".parse().unwrap();
         let config = NodeConfig::with_bind_addr(addr);
         assert_eq!(config.bind_addr, Some(TransportAddr::from(addr)));
-        assert!(config.known_peers.is_empty());
-        assert!(config.keypair.is_none());
-    }
-
-    #[test]
-    fn test_with_known_peers() {
-        let peers: Vec<SocketAddr> = vec![
-            "127.0.0.1:9000".parse().unwrap(),
-            "127.0.0.1:9001".parse().unwrap(),
-        ];
-
-        let config = NodeConfig::with_known_peers(peers.clone());
-        assert!(config.bind_addr.is_none());
-        assert_eq!(
-            config.known_peers,
-            peers
-                .into_iter()
-                .map(TransportAddr::from)
-                .collect::<Vec<_>>()
-        );
         assert!(config.keypair.is_none());
     }
 
@@ -437,15 +289,10 @@ mod tests {
     #[test]
     fn test_config_is_clone() {
         let addr: SocketAddr = "0.0.0.0:9000".parse().unwrap();
-        let peer: SocketAddr = "127.0.0.1:9001".parse().unwrap();
-        let config = NodeConfig::builder()
-            .bind_addr(addr)
-            .known_peer(peer)
-            .build();
+        let config = NodeConfig::builder().bind_addr(addr).build();
 
         let cloned = config.clone();
         assert_eq!(config.bind_addr, cloned.bind_addr);
-        assert_eq!(config.known_peers, cloned.known_peers);
     }
 
     #[test]
@@ -470,73 +317,25 @@ mod tests {
 
     #[test]
     fn test_node_config_with_transport_addr() {
-        // Create NodeConfig with TransportAddr bind and peers
         let bind_addr = TransportAddr::from("0.0.0.0:9000".parse::<SocketAddr>().unwrap());
-        let peer1 = TransportAddr::from("127.0.0.1:9001".parse::<SocketAddr>().unwrap());
-        let peer2 = TransportAddr::from("127.0.0.1:9002".parse::<SocketAddr>().unwrap());
 
-        let config = NodeConfig::builder()
-            .bind_addr(bind_addr.clone())
-            .known_peer(peer1.clone())
-            .known_peer(peer2.clone())
-            .build();
+        let config = NodeConfig::builder().bind_addr(bind_addr.clone()).build();
 
-        // Verify fields set correctly
         assert_eq!(config.bind_addr, Some(bind_addr));
-        assert_eq!(config.known_peers.len(), 2);
-        assert!(config.known_peers.contains(&peer1));
-        assert!(config.known_peers.contains(&peer2));
     }
 
     #[test]
     fn test_node_config_builder_backward_compat() {
-        // Use builder with SocketAddr (should auto-convert via Into trait)
         let bind_socket: SocketAddr = "0.0.0.0:9000".parse().unwrap();
-        let peer_socket: SocketAddr = "127.0.0.1:9001".parse().unwrap();
 
-        let config = NodeConfig::builder()
-            .bind_addr(bind_socket)
-            .known_peer(peer_socket)
-            .build();
+        let config = NodeConfig::builder().bind_addr(bind_socket).build();
 
-        // Verify Into trait conversion works
         assert_eq!(config.bind_addr, Some(TransportAddr::from(bind_socket)));
-        assert_eq!(config.known_peers.len(), 1);
-        assert_eq!(config.known_peers[0], TransportAddr::from(peer_socket));
 
-        // Verify it's the same as explicit TransportAddr usage
         let explicit_config = NodeConfig::builder()
             .bind_addr(TransportAddr::from(bind_socket))
-            .known_peer(TransportAddr::from(peer_socket))
             .build();
 
         assert_eq!(config.bind_addr, explicit_config.bind_addr);
-        assert_eq!(config.known_peers, explicit_config.known_peers);
-    }
-
-    #[test]
-    fn test_node_config_transport_addr_preservation() {
-        // Create NodeConfig with various TransportAddr types
-        let udp_bind = TransportAddr::from("0.0.0.0:0".parse::<SocketAddr>().unwrap());
-        let udp_peer = TransportAddr::from("127.0.0.1:9000".parse::<SocketAddr>().unwrap());
-        let ipv6_peer = TransportAddr::from("[::1]:9001".parse::<SocketAddr>().unwrap());
-
-        let config = NodeConfig::builder()
-            .bind_addr(udp_bind.clone())
-            .known_peer(udp_peer.clone())
-            .known_peer(ipv6_peer.clone())
-            .build();
-
-        // Verify address types preserved
-        assert_eq!(config.bind_addr, Some(udp_bind));
-        assert_eq!(config.known_peers.len(), 2);
-
-        // Check that TransportAddr types are maintained
-        assert!(matches!(config.known_peers[0], TransportAddr::Quic(_)));
-        assert!(matches!(config.known_peers[1], TransportAddr::Quic(_)));
-
-        // Verify actual addresses match
-        assert_eq!(config.known_peers[0], udp_peer);
-        assert_eq!(config.known_peers[1], ipv6_peer);
     }
 }

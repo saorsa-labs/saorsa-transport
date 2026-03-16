@@ -54,9 +54,9 @@ struct Args {
     #[arg(short, long, default_value = "[::]:0")]
     listen: SocketAddr,
 
-    /// Known peer addresses to connect to (comma-separated)
-    #[arg(short = 'k', long, value_delimiter = ',')]
-    known_peers: Vec<SocketAddr>,
+    /// Peer address to connect to directly
+    #[arg(short, long)]
+    connect: Option<SocketAddr>,
 
     /// Dashboard/metrics server URL for pushing metrics
     #[arg(long)]
@@ -266,10 +266,6 @@ async fn main() -> anyhow::Result<()> {
 
     // Build configuration
     let mut builder = P2pConfig::builder().bind_addr(args.listen);
-
-    for addr in &args.known_peers {
-        builder = builder.known_peer(*addr);
-    }
 
     if args.pqc_mtu {
         builder = builder.mtu(MtuConfig::pqc_optimized());
@@ -499,32 +495,29 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // Connect to known peers
-    if !args.known_peers.is_empty() {
-        info!("Connecting to {} known peer(s)...", args.known_peers.len());
-        for peer_addr in &args.known_peers {
-            info!("Connecting to peer at {}...", peer_addr);
-            match endpoint.connect(*peer_addr).await {
-                Ok(peer) => {
-                    info!("Connected to peer at {}", peer_addr);
-                    stats.connections_initiated.fetch_add(1, Ordering::SeqCst);
+    // Connect to specific peer if specified
+    if let Some(peer_addr) = args.connect {
+        info!("Connecting to peer at {}...", peer_addr);
+        match endpoint.connect(peer_addr).await {
+            Ok(peer) => {
+                info!("Connected to peer at {}", peer_addr);
+                stats.connections_initiated.fetch_add(1, Ordering::SeqCst);
 
-                    // Track peer
-                    let mut peers_guard = peers.write().await;
-                    peers_guard.insert(
-                        *peer_addr,
-                        PeerState {
-                            remote_addr: peer.remote_addr,
-                            connected_at: Instant::now(),
-                            bytes_sent: 0,
-                            bytes_received: 0,
-                            connection_type: "direct".to_string(),
-                        },
-                    );
-                }
-                Err(e) => {
-                    error!("Failed to connect to {}: {}", peer_addr, e);
-                }
+                // Track peer
+                let mut peers_guard = peers.write().await;
+                peers_guard.insert(
+                    peer_addr,
+                    PeerState {
+                        remote_addr: peer.remote_addr,
+                        connected_at: Instant::now(),
+                        bytes_sent: 0,
+                        bytes_received: 0,
+                        connection_type: "direct".to_string(),
+                    },
+                );
+            }
+            Err(e) => {
+                error!("Failed to connect to {}: {}", peer_addr, e);
             }
         }
     }

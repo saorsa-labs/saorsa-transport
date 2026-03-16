@@ -44,18 +44,6 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-/// Default bootstrap nodes operated by Saorsa Labs
-///
-/// These nodes are available for initial network discovery. They run the same
-/// saorsa-transport software as any other node and provide:
-/// - Initial peer discovery
-/// - NAT traversal coordination
-/// - External address observation (OBSERVED_ADDRESS frames)
-const DEFAULT_BOOTSTRAP_NODES: &[&str] = &[
-    "saorsa-1.saorsalabs.com:9000",
-    "saorsa-2.saorsalabs.com:9000",
-];
-
 /// saorsa-transport P2P node
 ///
 /// A symmetric P2P node that can both connect to and accept connections from
@@ -72,14 +60,6 @@ struct Args {
     /// Address to listen on (dual-stack: binds IPv6 and IPv4)
     #[arg(short, long, default_value = "[::]:0")]
     listen: SocketAddr,
-
-    /// Known peer addresses to connect to (comma-separated)
-    #[arg(short = 'k', long, value_delimiter = ',')]
-    known_peers: Vec<SocketAddr>,
-
-    /// Bootstrap node addresses (alias for --known-peers)
-    #[arg(short, long, value_delimiter = ',')]
-    bootstrap: Vec<SocketAddr>,
 
     /// Peer address to connect to directly
     #[arg(short, long)]
@@ -181,12 +161,6 @@ enum Command {
         action: IdentityAction,
     },
 
-    /// Bootstrap cache management commands
-    Cache {
-        #[command(subcommand)]
-        action: CacheAction,
-    },
-
     /// Run diagnostic checks
     Doctor,
 }
@@ -218,28 +192,6 @@ enum IdentityAction {
 
     /// Export identity fingerprint for sharing
     Fingerprint,
-}
-
-/// Cache management actions
-#[derive(Subcommand, Debug)]
-enum CacheAction {
-    /// Show bootstrap cache statistics
-    Stats {
-        /// Data directory containing the cache
-        #[arg(long, default_value = "~/.saorsa-transport")]
-        data_dir: PathBuf,
-    },
-
-    /// Clear the bootstrap cache
-    Clear {
-        /// Skip confirmation prompt
-        #[arg(long)]
-        force: bool,
-
-        /// Data directory containing the cache
-        #[arg(long, default_value = "~/.saorsa-transport")]
-        data_dir: PathBuf,
-    },
 }
 
 // v0.13.0: Mode enum removed - all nodes are symmetric P2P nodes
@@ -330,39 +282,8 @@ async fn main() -> anyhow::Result<()> {
     info!("saorsa-transport v{}", env!("CARGO_PKG_VERSION"));
     info!("Symmetric P2P node starting...");
 
-    // Combine known_peers and bootstrap (bootstrap is an alias for backwards compat)
-    let mut all_peers: Vec<SocketAddr> = args
-        .known_peers
-        .iter()
-        .chain(args.bootstrap.iter())
-        .copied()
-        .collect();
-
-    // Use default bootstrap nodes if no peers were specified
-    if all_peers.is_empty() {
-        info!("No peers specified, using default Saorsa Labs bootstrap nodes");
-        for addr_str in DEFAULT_BOOTSTRAP_NODES {
-            match tokio::net::lookup_host(addr_str).await {
-                Ok(mut addrs) => {
-                    if let Some(addr) = addrs.next() {
-                        all_peers.push(addr);
-                        info!("  - {} -> {}", addr_str, addr);
-                    }
-                }
-                Err(e) => {
-                    warn!("Failed to resolve {}: {}", addr_str, e);
-                }
-            }
-        }
-    }
-
     // Build configuration
     let mut builder = P2pConfig::builder().bind_addr(args.listen);
-
-    // Add known peers
-    for addr in &all_peers {
-        builder = builder.known_peer(*addr);
-    }
 
     // Configure MTU
     if args.pqc_mtu {
@@ -643,23 +564,6 @@ async fn main() -> anyhow::Result<()> {
             }
         })
     };
-
-    // Connect to known peers (bootstrap nodes)
-    if !all_peers.is_empty() {
-        info!("Connecting to {} known peer(s)...", all_peers.len());
-        for peer_addr in &all_peers {
-            info!("Connecting to known peer at {}...", peer_addr);
-            match endpoint.connect(*peer_addr).await {
-                Ok(peer) => {
-                    info!("Connected to known peer at {}", peer.remote_addr);
-                    stats.connections_initiated.fetch_add(1, Ordering::SeqCst);
-                }
-                Err(e) => {
-                    error!("Failed to connect to known peer {}: {}", peer_addr, e);
-                }
-            }
-        }
-    }
 
     // Connect to specific peer if specified
     if let Some(peer_addr) = args.connect {
@@ -1198,7 +1102,6 @@ async fn build_metrics_report(
 async fn handle_command(command: Command) -> anyhow::Result<()> {
     match command {
         Command::Identity { action } => handle_identity_command(action).await,
-        Command::Cache { action } => handle_cache_command(action).await,
         Command::Doctor => handle_doctor_command().await,
     }
 }
@@ -1345,80 +1248,6 @@ async fn handle_identity_command(action: IdentityAction) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Handle cache subcommands
-async fn handle_cache_command(action: CacheAction) -> anyhow::Result<()> {
-    match action {
-        CacheAction::Stats { data_dir } => {
-            let data_dir = expand_tilde(&data_dir);
-            let cache_file = data_dir.join("bootstrap_cache.enc");
-
-            println!("═══════════════════════════════════════════════════════════════");
-            println!("                    BOOTSTRAP CACHE STATS");
-            println!("═══════════════════════════════════════════════════════════════");
-            println!("Cache file: {}", cache_file.display());
-
-            if cache_file.exists() {
-                let metadata = std::fs::metadata(&cache_file)?;
-                println!("File size: {} bytes", metadata.len());
-
-                if let Ok(modified) = metadata.modified()
-                    && let Ok(elapsed) = modified.elapsed()
-                {
-                    let secs = elapsed.as_secs();
-                    if secs < 60 {
-                        println!("Last modified: {}s ago", secs);
-                    } else if secs < 3600 {
-                        println!("Last modified: {}m ago", secs / 60);
-                    } else if secs < 86400 {
-                        println!("Last modified: {}h ago", secs / 3600);
-                    } else {
-                        println!("Last modified: {}d ago", secs / 86400);
-                    }
-                }
-
-                println!();
-                println!("Note: Cache is encrypted. Detailed stats require decryption");
-                println!("which needs a running node with host identity.");
-            } else {
-                println!("Cache file not found.");
-                println!();
-                println!("A new cache will be created when you run the node.");
-            }
-            println!("═══════════════════════════════════════════════════════════════");
-        }
-
-        CacheAction::Clear { force, data_dir } => {
-            let data_dir = expand_tilde(&data_dir);
-            let cache_file = data_dir.join("bootstrap_cache.enc");
-
-            if !cache_file.exists() {
-                println!("No cache file found at {}", cache_file.display());
-                return Ok(());
-            }
-
-            if !force {
-                println!("WARNING: This will delete your bootstrap cache.");
-                println!("You will need to rediscover peers on next run.");
-                println!();
-                print!("Type 'CLEAR' to confirm: ");
-                use std::io::Write;
-                std::io::stdout().flush()?;
-
-                let mut input = String::new();
-                std::io::stdin().read_line(&mut input)?;
-                if input.trim() != "CLEAR" {
-                    println!("Aborted.");
-                    return Ok(());
-                }
-            }
-
-            std::fs::remove_file(&cache_file)?;
-            println!("Bootstrap cache cleared.");
-        }
-    }
-    Ok(())
-}
-
 /// Handle doctor diagnostic command
 async fn handle_doctor_command() -> anyhow::Result<()> {
     println!("═══════════════════════════════════════════════════════════════");
@@ -1477,19 +1306,7 @@ async fn handle_doctor_command() -> anyhow::Result<()> {
         issues.push("Data directory not found. It will be created on first run.".to_string());
     }
 
-    // Check 4: Bootstrap cache
-    print!("Checking bootstrap cache... ");
-    let cache_file = data_dir.join("bootstrap_cache.enc");
-    if cache_file.exists() {
-        let size = std::fs::metadata(&cache_file).map(|m| m.len()).unwrap_or(0);
-        println!("OK ({} bytes)", size);
-        passed += 1;
-    } else {
-        println!("NOT FOUND");
-        issues.push("No bootstrap cache. Peers will be discovered on first run.".to_string());
-    }
-
-    // Check 5: Network connectivity (basic check)
+    // Check 4: Network connectivity (basic check)
     print!("Checking network... ");
     match tokio::net::UdpSocket::bind("[::]:0").await {
         Ok(socket) => {
@@ -1505,34 +1322,11 @@ async fn handle_doctor_command() -> anyhow::Result<()> {
         }
     }
 
-    // Check 6: DNS resolution for bootstrap nodes
-    print!("Checking DNS resolution... ");
-    let mut dns_ok = 0;
-    for node in DEFAULT_BOOTSTRAP_NODES {
-        if tokio::net::lookup_host(node).await.is_ok() {
-            dns_ok += 1;
-        }
-    }
-    if dns_ok == DEFAULT_BOOTSTRAP_NODES.len() {
-        println!("OK ({} nodes resolved)", dns_ok);
-        passed += 1;
-    } else if dns_ok > 0 {
-        println!(
-            "PARTIAL ({}/{} nodes resolved)",
-            dns_ok,
-            DEFAULT_BOOTSTRAP_NODES.len()
-        );
-        passed += 1;
-    } else {
-        println!("FAILED");
-        issues.push("Cannot resolve any bootstrap nodes. Check your DNS settings.".to_string());
-    }
-
     println!();
     println!("═══════════════════════════════════════════════════════════════");
     println!("                         SUMMARY");
     println!("═══════════════════════════════════════════════════════════════");
-    println!("Checks passed: {}/6", passed);
+    println!("Checks passed: {}/4", passed);
 
     if issues.is_empty() {
         println!();

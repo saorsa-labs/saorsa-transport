@@ -6,7 +6,7 @@
 //!
 //! This test suite validates:
 //! - Zero-configuration node creation
-//! - Various constructor methods (new, bind, with_peers, with_config)
+//! - Various constructor methods (new, bind, with_keypair, with_config)
 //! - Status observability (NodeStatus)
 //! - Event subscription (NodeEvent)
 //! - Basic connectivity
@@ -75,18 +75,17 @@ mod zero_config_tests {
     }
 
     #[tokio::test]
-    async fn test_node_with_peers() {
-        // First create a node bound to localhost (so address is connectable)
+    async fn test_node_two_independent_nodes() {
+        // Create two independent nodes bound to localhost
         let node1 = Node::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
             .await
             .expect("First node should succeed");
         let node1_addr = node1.local_addr().expect("Should have address");
         println!("First node at: {}", node1_addr);
 
-        // Create second node with known peer
-        let node2 = Node::with_peers(vec![node1_addr])
+        let node2 = Node::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
             .await
-            .expect("Node::with_peers() should succeed");
+            .expect("Second node should succeed");
 
         let node2_addr = node2.local_addr().expect("Should have address");
         println!("Second node at: {}", node2_addr);
@@ -373,25 +372,15 @@ mod connection_tests {
     }
 
     #[tokio::test]
-    async fn test_add_peer_dynamically() {
-        // Create two nodes on localhost
-        let node1 = Node::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
-            .await
-            .expect("Node 1 should create");
-        let node2 = Node::new().await.expect("Node 2 should create");
+    async fn test_connected_peers_initially_empty() {
+        let node = Node::new().await.expect("Node should create");
 
-        let node1_addr = node1.local_addr().expect("Should have address");
-
-        // Dynamically add node1 as peer of node2
-        let _ = node2.add_peer(node1_addr).await;
-        println!("Added {} as known peer", node1_addr);
-
-        // Get connected peers (should be empty until actual connection)
-        let peers = node2.connected_peers().await;
+        // Get connected peers (should be empty without connections)
+        let peers = node.connected_peers().await;
+        assert!(peers.is_empty(), "No peers connected initially");
         println!("Connected peers: {:?}", peers);
 
-        node1.shutdown().await;
-        node2.shutdown().await;
+        node.shutdown().await;
     }
 }
 
@@ -502,7 +491,6 @@ mod config_tests {
     fn test_config_default() {
         let config = NodeConfig::default();
         assert!(config.bind_addr.is_none());
-        assert!(config.known_peers.is_empty());
         assert!(config.keypair.is_none());
     }
 
@@ -515,34 +503,16 @@ mod config_tests {
     }
 
     #[test]
-    fn test_config_builder_known_peers() {
-        let peer1: SocketAddr = "127.0.0.1:9000".parse().unwrap();
-        let peer2: SocketAddr = "127.0.0.1:9001".parse().unwrap();
-
-        let config = NodeConfig::builder()
-            .known_peer(peer1)
-            .known_peer(peer2)
-            .build();
-
-        assert_eq!(config.known_peers.len(), 2);
-        assert!(config.known_peers.contains(&TransportAddr::from(peer1)));
-        assert!(config.known_peers.contains(&TransportAddr::from(peer2)));
-    }
-
-    #[test]
     fn test_config_builder_full() {
         let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
-        let peer: SocketAddr = "1.2.3.4:9000".parse().unwrap();
         let (public_key, secret_key) = generate_ml_dsa_keypair().expect("keygen");
 
         let config = NodeConfig::builder()
             .bind_addr(addr)
-            .known_peer(peer)
             .keypair(public_key, secret_key)
             .build();
 
         assert_eq!(config.bind_addr, Some(TransportAddr::from(addr)));
-        assert_eq!(config.known_peers.len(), 1);
         assert!(config.keypair.is_some());
     }
 
@@ -551,19 +521,6 @@ mod config_tests {
         let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
         let config1 = NodeConfig::with_bind_addr(addr);
         assert_eq!(config1.bind_addr, Some(TransportAddr::from(addr)));
-
-        let peers: Vec<SocketAddr> = vec![
-            "127.0.0.1:9000".parse().unwrap(),
-            "127.0.0.1:9001".parse().unwrap(),
-        ];
-        let config2 = NodeConfig::with_known_peers(peers.clone());
-        assert_eq!(
-            config2.known_peers,
-            peers
-                .into_iter()
-                .map(TransportAddr::from)
-                .collect::<Vec<_>>()
-        );
     }
 }
 
@@ -634,16 +591,16 @@ async fn test_simple_api_integration_summary() {
 
     // 4. Config builder
     println!("\n4. Config builder...");
-    let peer_addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
-    let config = NodeConfig::builder().known_peer(peer_addr).build();
-    println!(
-        "   Built config with {} known peers",
-        config.known_peers.len()
-    );
+    let config = NodeConfig::builder()
+        .bind_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+        .build();
+    println!("   Built config with bind_addr: {:?}", config.bind_addr);
 
     // 5. Second node with config
-    println!("\n5. Node with known peer...");
-    let config2 = NodeConfig::builder().known_peer(local_addr).build();
+    println!("\n5. Node with config...");
+    let config2 = NodeConfig::builder()
+        .bind_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+        .build();
     let node2 = Node::with_config(config2)
         .await
         .expect("Node::with_config() failed");

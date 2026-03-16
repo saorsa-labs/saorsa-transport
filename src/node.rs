@@ -110,9 +110,6 @@ pub enum NodeError {
 /// // Zero configuration
 /// let node = Node::new().await?;
 ///
-/// // Or with known peers
-/// let node = Node::with_peers(vec!["quic.saorsalabs.com:9000".parse()?]).await?;
-///
 /// // Or with persistent identity
 /// let keypair = load_keypair()?;
 /// let node = Node::with_keypair(keypair).await?;
@@ -167,23 +164,6 @@ impl Node {
     /// ```
     pub async fn bind(addr: SocketAddr) -> Result<Self, NodeError> {
         Self::with_config(NodeConfig::with_bind_addr(addr)).await
-    }
-
-    /// Create a node with known peers
-    ///
-    /// Use this when you have a list of known peers to connect to initially.
-    /// These can be any nodes in the network - they'll help with NAT traversal.
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// let node = Node::with_peers(vec![
-    ///     "quic.saorsalabs.com:9000".parse()?,
-    ///     "peer2.example.com:9000".parse()?,
-    /// ]).await?;
-    /// ```
-    pub async fn with_peers(peers: Vec<SocketAddr>) -> Result<Self, NodeError> {
-        Self::with_config(NodeConfig::with_known_peers(peers)).await
     }
 
     /// Create a node with an existing keypair
@@ -268,7 +248,6 @@ impl Node {
             p2p_config.bind_addr = Some(bind_addr.into());
         }
 
-        p2p_config.known_peers = config.known_peers.into_iter().map(Into::into).collect();
         p2p_config.keypair = config.keypair;
 
         // Create event channel
@@ -355,9 +334,7 @@ impl Node {
                 bytes: data.len(),
             }),
             // Events without direct NodeEvent equivalents are ignored
-            P2pEvent::NatTraversalProgress { .. }
-            | P2pEvent::BootstrapStatus { .. }
-            | P2pEvent::PeerAuthenticated { .. } => None,
+            P2pEvent::NatTraversalProgress { .. } | P2pEvent::PeerAuthenticated { .. } => None,
         }
     }
 
@@ -428,24 +405,6 @@ impl Node {
     /// ```
     pub async fn accept(&self) -> Option<PeerConnection> {
         self.inner.accept().await
-    }
-
-    /// Add a known peer dynamically
-    ///
-    /// Known peers help with NAT traversal and peer discovery.
-    /// You can add more peers at runtime.
-    pub async fn add_peer(&self, addr: SocketAddr) {
-        self.inner.add_bootstrap(addr).await;
-    }
-
-    /// Connect to all known peers
-    ///
-    /// Returns the number of successful connections.
-    pub async fn connect_known_peers(&self) -> Result<usize, NodeError> {
-        self.inner
-            .connect_known_peers()
-            .await
-            .map_err(NodeError::Endpoint)
     }
 
     /// Disconnect from a peer by address
@@ -749,15 +708,6 @@ mod tests {
         assert!(node.local_addr().is_some());
 
         node.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn test_node_with_peers() {
-        let peers = vec!["127.0.0.1:9000".parse().unwrap()];
-        let node = Node::with_peers(peers).await;
-        assert!(node.is_ok(), "Node::with_peers() should succeed");
-
-        node.unwrap().shutdown().await;
     }
 
     #[tokio::test]

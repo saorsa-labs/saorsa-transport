@@ -584,26 +584,6 @@ impl LinkTransport for P2pLinkTransport {
         self.endpoint.external_addr()
     }
 
-    fn peer_table(&self) -> Vec<(SocketAddr, Capabilities)> {
-        self.state
-            .read()
-            .map(|state| {
-                state
-                    .capabilities
-                    .iter()
-                    .map(|(k, v)| (*k, v.clone()))
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    fn peer_capabilities(&self, addr: &SocketAddr) -> Option<Capabilities> {
-        self.state
-            .read()
-            .ok()
-            .and_then(|state| state.capabilities.get(addr).cloned())
-    }
-
     fn subscribe(&self) -> broadcast::Receiver<LinkEvent> {
         self.state
             .read()
@@ -1488,12 +1468,6 @@ mod tests {
                 self.local_key.clone()
             }
             fn external_address(&self) -> Option<SocketAddr> {
-                None
-            }
-            fn peer_table(&self) -> Vec<(SocketAddr, Capabilities)> {
-                vec![]
-            }
-            fn peer_capabilities(&self, _: &SocketAddr) -> Option<Capabilities> {
                 None
             }
             fn subscribe(&self) -> broadcast::Receiver<LinkEvent> {
