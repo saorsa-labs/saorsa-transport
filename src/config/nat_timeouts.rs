@@ -132,10 +132,15 @@ impl Default for RelayTimeouts {
 }
 
 /// Default time to wait for the peer to acknowledge stream data after a send.
-const DEFAULT_SEND_ACK_TIMEOUT: Duration = Duration::from_secs(1);
+///
+/// The actual timeout used on the send path is *adaptive*: it is computed as
+/// `max(DEFAULT_SEND_ACK_TIMEOUT, data_len / 100_000)` seconds so that large
+/// payloads on slow or newly-opened NAT-traversed connections are not
+/// prematurely timed out.
+const DEFAULT_SEND_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Fast-network send ACK timeout.
-const FAST_SEND_ACK_TIMEOUT: Duration = Duration::from_millis(500);
+/// Fast-network send ACK timeout (for local/LAN networks).
+const FAST_SEND_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Master timeout configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
