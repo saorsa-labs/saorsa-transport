@@ -499,6 +499,11 @@ pub enum EndpointError {
 /// Used by both `P2pEndpoint::cleanup_connection()` and the background reaper
 /// to ensure consistent cleanup behaviour (single source of truth).
 ///
+/// Lock ordering: always acquires locks in the canonical order
+/// `connected_peers` → `reader_handles` → `stats` to prevent ABBA deadlocks.
+/// Each lock is acquired and released independently (no nesting) to minimise
+/// hold time and avoid blocking concurrent `send()` / `connect()` calls.
+///
 /// Returns `true` if the peer was actually present in `connected_peers`.
 async fn do_cleanup_connection(
     connected_peers: &RwLock<HashMap<SocketAddr, PeerConnection>>,
@@ -509,14 +514,19 @@ async fn do_cleanup_connection(
     addr: &SocketAddr,
     reason: DisconnectReason,
 ) -> bool {
+    // Step 1: Remove from connected_peers (canonical lock #1)
     let removed = connected_peers.write().await.remove(addr);
+
+    // Step 2: Remove from NAT traversal layer (lock-free DashMap)
     let _ = inner.remove_connection(addr);
 
-    // Abort the background reader task for this address
-    if let Some(handle) = reader_handles.write().await.remove(addr) {
+    // Step 3: Remove and abort reader task (canonical lock #2)
+    let abort_handle = reader_handles.write().await.remove(addr);
+    if let Some(handle) = abort_handle {
         handle.abort();
     }
 
+    // Step 4: Update stats and emit event (canonical lock #3)
     if let Some(peer_conn) = removed {
         {
             let mut s = stats.write().await;
@@ -1316,6 +1326,10 @@ impl P2pEndpoint {
         target_ipv6: Option<SocketAddr>,
         strategy_config: Option<StrategyConfig>,
     ) -> Result<(PeerConnection, ConnectionMethod), EndpointError> {
+        info!(
+            "connect_with_fallback: IPv4={:?}, IPv6={:?}",
+            target_ipv4, target_ipv6
+        );
         if self.shutdown.is_cancelled() {
             return Err(EndpointError::ShuttingDown);
         }
@@ -1831,30 +1845,73 @@ impl P2pEndpoint {
         target: SocketAddr,
         coordinator: SocketAddr,
     ) -> Result<PeerConnection, EndpointError> {
+        info!(
+            "try_hole_punch: ENTER target={} coordinator={}",
+            target, coordinator
+        );
+
         // First ensure we're connected to the coordinator
         if !self.is_connected_to_addr(coordinator).await {
-            debug!("Connecting to coordinator {} first", coordinator);
+            info!(
+                "try_hole_punch: connecting to coordinator {} first",
+                coordinator
+            );
             self.connect(coordinator).await?;
+            info!("try_hole_punch: coordinator {} connected", coordinator);
+        } else {
+            info!(
+                "try_hole_punch: coordinator {} already connected",
+                coordinator
+            );
         }
 
         // Initiate NAT traversal — sends PUNCH_ME_NOW to coordinator
+        info!(
+            "try_hole_punch: calling initiate_nat_traversal({}, {})",
+            target, coordinator
+        );
         self.inner
             .initiate_nat_traversal(target, coordinator)
             .map_err(EndpointError::NatTraversal)?;
+        info!("try_hole_punch: initiate_nat_traversal returned OK");
+
+        // NOTE: We intentionally do NOT send a QUIC probe here.
+        // A previous attempt sent a fire-and-forget probe that created
+        // a second QUIC connection to the target address. When the probe
+        // succeeded (target is a cloud VM, directly reachable), the probe
+        // connection was accepted by the target, stored in the DashMap
+        // under the same key as the REAL incoming connection, then
+        // immediately closed with "hole-punch-probe". The close triggered
+        // cleanup that removed the DashMap entry — destroying the real
+        // connection's entry and making all send() calls fail.
+        //
+        // The correct approach: rely on the coordinator relay (PUNCH_ME_NOW)
+        // to create the NAT binding on the target side. The target then
+        // connects back to us, and we use THAT connection for bidirectional
+        // communication.
 
         // Poll for the connection to appear. The target node will receive
         // the relayed PUNCH_ME_NOW and initiate a QUIC connection to us,
         // which gets accepted by saorsa-core's transport handler.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        let mut poll_count = 0u32;
 
         loop {
+            poll_count += 1;
+            if poll_count % 10 == 1 {
+                info!(
+                    "try_hole_punch: poll loop iteration {} for target {}",
+                    poll_count, target
+                );
+            }
+
             if self.shutdown.is_cancelled() {
                 return Err(EndpointError::ShuttingDown);
             }
 
             // Check NatTraversalEndpoint's connections
             if self.inner.is_connected(&target) {
-                info!("try_hole_punch: connection to {} established", target);
+                info!("try_hole_punch: connection to {} established!", target);
                 let peer_conn = PeerConnection {
                     public_key: None,
                     remote_addr: TransportAddr::Quic(target),
@@ -1878,16 +1935,19 @@ impl P2pEndpoint {
                 }
             }
 
-            // The background session driver (spawn_session_driver) calls
-            // poll() every 500ms to advance sessions. We just wait here.
-
             // Wait briefly then re-check, or timeout
             tokio::select! {
-                _ = self.inner.connection_notify().notified() => {}
+                _ = self.inner.connection_notify().notified() => {
+                    debug!("try_hole_punch: connection_notify fired for {}", target);
+                }
                 _ = self.shutdown.cancelled() => {
                     return Err(EndpointError::ShuttingDown);
                 }
                 _ = tokio::time::sleep_until(deadline) => {
+                    info!(
+                        "try_hole_punch: TIMEOUT after 15s for {} (polled {} times)",
+                        target, poll_count
+                    );
                     return Err(EndpointError::Timeout);
                 }
                 // Wake periodically to drive session and re-check connections
@@ -2097,6 +2157,22 @@ impl P2pEndpoint {
             return Err(EndpointError::ShuttingDown);
         }
 
+        // Diagnostic: log send attempt with connection state
+        let peers_has = self.connected_peers.read().await.contains_key(addr);
+        let alt = crate::shared::dual_stack_alternate(addr);
+        let peers_has_alt = alt.as_ref().map_or(false, |a| {
+            // Can't read while holding read — check was done above
+            false
+        });
+        let inner_has = self.inner.is_connected(addr);
+        let inner_has_alt = alt.as_ref().map_or(false, |a| self.inner.is_connected(a));
+        if !peers_has && !inner_has && !inner_has_alt {
+            info!(
+                "send({}): NOT in connected_peers (peers={}, inner={}, inner_alt={})",
+                addr, peers_has, inner_has, inner_has_alt
+            );
+        }
+
         // Get peer's transport address and optionally capture the connection
         // for hole-punched peers that bypassed normal registration.
         //
@@ -2159,6 +2235,14 @@ impl P2pEndpoint {
                         .map_err(EndpointError::NatTraversal)?
                         .ok_or(EndpointError::PeerNotFound(*addr))?
                 };
+
+                // Log connection state before attempting to open stream
+                if let Some(reason) = connection.close_reason() {
+                    warn!(
+                        "send({}): connection has close_reason BEFORE open_uni: {}",
+                        addr, reason
+                    );
+                }
 
                 let mut send_stream = connection.open_uni().await.map_err(|e| {
                     warn!("send({}): open_uni failed: {}", addr, e);
@@ -2389,6 +2473,35 @@ impl P2pEndpoint {
         self.connected_peers.read().await.contains_key(addr)
     }
 
+    /// Check if a live QUIC connection exists at the NatTraversalEndpoint level.
+    ///
+    /// This is the authoritative check — it queries the DashMap that stores
+    /// actual QUIC connections, bypassing the connected_peers HashMap which
+    /// may have a registration delay for hole-punch connections.
+    ///
+    /// Tries both the plain and IPv4-mapped address forms because the DashMap
+    /// key format depends on whether the connection was established on a
+    /// dual-stack socket (IPv6-mapped) or IPv4-only (plain).
+    pub fn inner_is_connected(&self, addr: &SocketAddr) -> bool {
+        if self.inner.is_connected(addr) {
+            info!("inner_is_connected: {} found (exact match)", addr);
+            return true;
+        }
+        // Try the alternate form (plain ↔ mapped)
+        if let Some(alt) = crate::shared::dual_stack_alternate(addr) {
+            if self.inner.is_connected(&alt) {
+                info!("inner_is_connected: {} found via alternate {}", addr, alt);
+                return true;
+            }
+        }
+        info!(
+            "inner_is_connected: {} NOT found (connections: {})",
+            addr,
+            self.inner.connection_count()
+        );
+        false
+    }
+
     /// Check if an address is authenticated
     pub async fn is_authenticated(&self, addr: &SocketAddr) -> bool {
         self.connected_peers
@@ -2445,9 +2558,21 @@ impl P2pEndpoint {
         let event_tx = self.event_tx.clone();
         let max_read_bytes = self.config.max_message_size;
         let exit_tx = self.reader_exit_tx.clone();
+        let inner = Arc::clone(&self.inner);
 
         let abort_handle = self.reader_tasks.lock().await.spawn(async move {
             info!("Reader task STARTED for {}", addr);
+
+            // Ensure the connection is in the NatTraversalEndpoint's DashMap
+            // so the send path can find it. This is critical for NAT-traversed
+            // connections where the accept-time DashMap entry may be missing
+            // or removed by competing accept paths.
+            info!("Reader task: calling add_connection for {}", addr);
+            match inner.add_connection(addr, connection.clone()) {
+                Ok(()) => info!("Reader task: add_connection OK for {}", addr),
+                Err(e) => warn!("Reader task: add_connection FAILED for {}: {:?}", addr, e),
+            }
+
             loop {
                 // Accept the next unidirectional stream
                 let mut recv_stream = match connection.accept_uni().await {
@@ -2719,7 +2844,8 @@ impl P2pEndpoint {
                     }
                 };
 
-                debug!("Reader task exited for {}, running immediate cleanup", addr);
+                info!("Reader task exited for {}, running immediate cleanup", addr);
+                let cleanup_start = Instant::now();
                 do_cleanup_connection(
                     &connected_peers,
                     &inner,
@@ -2730,6 +2856,13 @@ impl P2pEndpoint {
                     DisconnectReason::Timeout,
                 )
                 .await;
+                let cleanup_elapsed = cleanup_start.elapsed();
+                if cleanup_elapsed > Duration::from_secs(1) {
+                    warn!(
+                        "do_cleanup_connection for {} took {:?} — potential lock contention",
+                        addr, cleanup_elapsed
+                    );
+                }
             }
         });
     }
@@ -2819,8 +2952,20 @@ impl P2pEndpoint {
 
                 // Drive the session state machine. Errors are non-fatal —
                 // the session will retry on the next tick.
+                //
+                // poll() is synchronous — it acquires parking_lot locks and
+                // iterates DashMaps. Measure duration to detect if it's
+                // blocking the worker thread for too long.
+                let poll_start = Instant::now();
                 if let Err(e) = inner.poll(Instant::now()) {
                     debug!("NAT traversal poll error (will retry): {:?}", e);
+                }
+                let poll_elapsed = poll_start.elapsed();
+                if poll_elapsed > Duration::from_millis(100) {
+                    warn!(
+                        "NAT traversal poll() took {:?} — may be starving other tasks",
+                        poll_elapsed
+                    );
                 }
 
                 // Process any hole-punch addresses forwarded from the Quinn driver.

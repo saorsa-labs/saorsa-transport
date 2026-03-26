@@ -3651,8 +3651,12 @@ impl NatTraversalEndpoint {
     /// cleanup of phantom connections during deduplication checks.
     pub fn is_connected(&self, addr: &SocketAddr) -> bool {
         if let Some(entry) = self.connections.get(addr) {
-            if entry.value().close_reason().is_some() {
+            if let Some(reason) = entry.value().close_reason() {
                 // Connection is dead — remove it and report not connected.
+                info!(
+                    "is_connected: {} has close_reason={}, removing from DashMap",
+                    addr, reason
+                );
                 drop(entry); // release the DashMap ref before removing
                 self.connections.remove(addr);
                 return false;
@@ -3661,6 +3665,11 @@ impl NatTraversalEndpoint {
         } else {
             false
         }
+    }
+
+    /// Number of tracked connections (for diagnostics).
+    pub fn connection_count(&self) -> usize {
+        self.connections.len()
     }
 
     /// Get an active connection by remote address
@@ -3698,8 +3707,27 @@ impl NatTraversalEndpoint {
     ) -> Result<(), NatTraversalError> {
         let observed = connection.observed_address();
         info!("add_connection: {} observed_address={:?}", addr, observed);
-        // DashMap provides lock-free .insert()
-        self.connections.insert(addr, connection);
+        // Only insert if no existing LIVE connection. This prevents
+        // an outgoing hole-punch connection (which may die quickly)
+        // from overwriting an incoming connection that the reader task
+        // is actively using. The reader task has a clone of the
+        // connection object and continues to receive data even if the
+        // DashMap entry is replaced — but the send path looks up the
+        // DashMap, so we must keep the live connection there.
+        if let Some(existing) = self.connections.get(&addr) {
+            if existing.value().close_reason().is_none() {
+                info!(
+                    "add_connection: {} already has a live connection, skipping overwrite",
+                    addr
+                );
+                drop(existing);
+            } else {
+                drop(existing);
+                self.connections.insert(addr, connection);
+            }
+        } else {
+            self.connections.insert(addr, connection);
+        }
         info!(
             "add_connection: now have {} connections",
             self.connections.len()
@@ -3782,7 +3810,21 @@ impl NatTraversalEndpoint {
         // DashSet provides lock-free .remove()
         self.emitted_established_events.remove(addr);
 
-        // DashMap provides lock-free .remove() that returns Option<(K, V)>
+        // Only remove if the connection is actually dead. Multiple reader
+        // tasks can share the same address (incoming + outgoing hole-punch).
+        // If one reader exits but the connection is still live (the other
+        // reader is using it), don't remove it from the DashMap — the send
+        // path needs it.
+        if let Some(entry) = self.connections.get(addr) {
+            if entry.value().close_reason().is_none() {
+                info!(
+                    "remove_connection: {} still has a live connection, keeping in DashMap",
+                    addr
+                );
+                drop(entry);
+                return Ok(None);
+            }
+        }
         Ok(self.connections.remove(addr).map(|(_, v)| v))
     }
 
@@ -4773,6 +4815,7 @@ impl NatTraversalEndpoint {
                         let event_tx = event_tx.clone();
                         let connections = self.connections.clone();
                         let incoming_notify = self.incoming_notify.clone();
+                        let accepted_addrs_tx = self.accepted_addrs_tx.clone();
                         let address = candidate.address;
 
                         tokio::spawn(async move {
@@ -4795,9 +4838,30 @@ impl NatTraversalEndpoint {
                                     let public_key =
                                         Self::extract_public_key_from_connection(&connection);
 
-                                    // Store the connection
-                                    // DashMap provides lock-free .insert()
-                                    connections.insert(remote, connection.clone());
+                                    // Store the connection, but don't overwrite an existing
+                                    // live connection. The reader task may have already
+                                    // registered the incoming connection from the same peer.
+                                    if let Some(existing) = connections.get(&remote) {
+                                        if existing.value().close_reason().is_none() {
+                                            info!(
+                                                "attempt_hole_punch: {} already has live connection, skipping insert",
+                                                remote
+                                            );
+                                            drop(existing);
+                                        } else {
+                                            drop(existing);
+                                            connections.insert(remote, connection.clone());
+                                        }
+                                    } else {
+                                        connections.insert(remote, connection.clone());
+                                    }
+
+                                    // Notify the P2pEndpoint forwarder so the connection is
+                                    // registered in connected_peers and the send path can
+                                    // find it. Without this, hole-punch connections are only
+                                    // in the NatTraversalEndpoint's DashMap and send() fails
+                                    // with "Connection closed unexpectedly".
+                                    let _ = accepted_addrs_tx.send(remote);
 
                                     // Send connection established event (we initiated hole punch = Client side)
                                     let _ =
@@ -4931,81 +4995,61 @@ impl NatTraversalEndpoint {
         let mut hole_punch_requests: Vec<(SocketAddr, Vec<CandidateAddress>)> = Vec::new();
         let mut validation_requests: Vec<(SocketAddr, SocketAddr)> = Vec::new();
 
-        // Phase 1: Collect work and update session states (brief DashMap access)
-        for mut entry in self.active_sessions.iter_mut() {
-            let target_addr = *entry.key();
-            let session = entry.value_mut();
-            let elapsed = now.duration_since(session.started_at);
+        // Phase 1: Collect work and update session states.
+        //
+        // CRITICAL: We must NOT use active_sessions.iter_mut() here.
+        // DashMap iter_mut() holds WRITE guards on ALL shards for the
+        // entire iteration, blocking any concurrent access to
+        // active_sessions (e.g., initiate_nat_traversal's contains_key).
+        // Instead, we snapshot the keys and process each session
+        // individually via get_mut(), which locks only ONE shard at a time.
+        let mut discovery_needed: Vec<(SocketAddr, DiscoverySessionId)> = Vec::new();
 
-            // Get timeout for current phase
-            let timeout = self.get_phase_timeout(session.phase);
+        let session_keys: Vec<SocketAddr> = self
+            .active_sessions
+            .iter()
+            .map(|entry| *entry.key())
+            .collect();
+
+        for target_addr in session_keys {
+            // Read phase and timing info, then RELEASE the shard immediately.
+            // This prevents holding any DashMap shard while other code paths
+            // (initiate_nat_traversal, check_punch_results, select_coordinator)
+            // access the DashMap concurrently.
+            let session_snapshot = {
+                let Some(entry) = self.active_sessions.get(&target_addr) else {
+                    continue; // Session was removed concurrently
+                };
+                let session = entry.value();
+                (
+                    session.phase,
+                    now.duration_since(session.started_at),
+                    session.attempt,
+                    session.candidates.clone(),
+                )
+            }; // shard lock released here
+
+            let (phase, elapsed, attempt, candidates) = session_snapshot;
+            let timeout = self.get_phase_timeout(phase);
 
             // Check if we've exceeded the timeout
             if elapsed > timeout {
-                match session.phase {
+                match phase {
                     TraversalPhase::Discovery => {
+                        // DEFER: discovery_manager access to Phase 1b
                         let discovery_session_id = DiscoverySessionId::Remote(target_addr);
-                        // Get candidates from discovery manager (safe - different lock)
-                        let discovered_candidates = self
-                            .discovery_manager
-                            .lock()
-                            .get_candidates(discovery_session_id);
-
-                        // Update session candidates
-                        session.candidates = discovered_candidates.clone();
-
-                        // Check if we have discovered any candidates
-                        if !session.candidates.is_empty() {
-                            // Advance to coordination phase
-                            session.phase = TraversalPhase::Coordination;
-                            self.emit_event(
-                                &mut events,
-                                NatTraversalEvent::PhaseTransition {
-                                    remote_address: target_addr,
-                                    from_phase: TraversalPhase::Discovery,
-                                    to_phase: TraversalPhase::Coordination,
-                                },
-                            );
-                            info!(
-                                "{} advanced from Discovery to Coordination with {} candidates",
-                                target_addr,
-                                session.candidates.len()
-                            );
-                        } else if session.attempt < self.config.max_concurrent_attempts as u32 {
-                            // Retry discovery with exponential backoff
-                            session.attempt += 1;
-                            session.started_at = now;
-                            let backoff_duration = self.calculate_backoff(session.attempt);
-                            warn!(
-                                "Discovery timeout for {}, retrying (attempt {}), backoff: {:?}",
-                                target_addr, session.attempt, backoff_duration
-                            );
-                        } else {
-                            // Max attempts reached, fail
-                            session.phase = TraversalPhase::Failed;
-                            self.emit_event(
-                                &mut events,
-                                NatTraversalEvent::TraversalFailed {
-                                    remote_address: target_addr,
-                                    error: NatTraversalError::NoCandidatesFound,
-                                    fallback_available: true,
-                                },
-                            );
-                            error!(
-                                "NAT traversal failed for {}: no candidates found after {} attempts",
-                                target_addr, session.attempt
-                            );
-                        }
+                        discovery_needed.push((target_addr, discovery_session_id));
                     }
                     TraversalPhase::Coordination => {
-                        // DEFER: coordination request (accesses connections DashMap)
+                        // All checks done WITHOUT holding DashMap shard.
                         if let Some(coordinator) = self.select_coordinator() {
-                            // Update phase now, execute request later
-                            session.phase = TraversalPhase::Synchronization;
+                            if let Some(mut session) = self.active_sessions.get_mut(&target_addr) {
+                                session.phase = TraversalPhase::Synchronization;
+                            }
                             coordination_requests.push((target_addr, coordinator));
-                        } else {
+                        } else if let Some(mut session) = self.active_sessions.get_mut(&target_addr) {
                             self.handle_phase_failure(
-                                session,
+                                &mut session,
                                 now,
                                 &mut events,
                                 NatTraversalError::NoBootstrapNodes,
@@ -5013,21 +5057,21 @@ impl NatTraversalEndpoint {
                         }
                     }
                     TraversalPhase::Synchronization => {
-                        // Check if target is synchronized
                         if self.is_addr_synchronized(&target_addr) {
-                            session.phase = TraversalPhase::Punching;
-                            self.emit_event(
-                                &mut events,
-                                NatTraversalEvent::HolePunchingStarted {
-                                    remote_address: target_addr,
-                                    targets: session.candidates.iter().map(|c| c.address).collect(),
-                                },
-                            );
-                            // DEFER: hole punching (may access connections)
-                            hole_punch_requests.push((target_addr, session.candidates.clone()));
-                        } else {
+                            if let Some(mut session) = self.active_sessions.get_mut(&target_addr) {
+                                session.phase = TraversalPhase::Punching;
+                                self.emit_event(
+                                    &mut events,
+                                    NatTraversalEvent::HolePunchingStarted {
+                                        remote_address: target_addr,
+                                        targets: session.candidates.iter().map(|c| c.address).collect(),
+                                    },
+                                );
+                                hole_punch_requests.push((target_addr, session.candidates.clone()));
+                            }
+                        } else if let Some(mut session) = self.active_sessions.get_mut(&target_addr) {
                             self.handle_phase_failure(
-                                session,
+                                &mut session,
                                 now,
                                 &mut events,
                                 NatTraversalError::ProtocolError(
@@ -5037,21 +5081,22 @@ impl NatTraversalEndpoint {
                         }
                     }
                     TraversalPhase::Punching => {
-                        // Check if any punch succeeded
-                        if let Some(successful_path) = self.check_punch_results(&target_addr) {
-                            session.phase = TraversalPhase::Validation;
+                        let successful_path = self.check_punch_results(&target_addr);
+                        if let Some(successful_path) = successful_path {
+                            if let Some(mut session) = self.active_sessions.get_mut(&target_addr) {
+                                session.phase = TraversalPhase::Validation;
+                            }
                             self.emit_event(
                                 &mut events,
                                 NatTraversalEvent::PathValidated {
                                     remote_address: target_addr,
-                                    rtt: Duration::from_millis(50), // TODO: Get actual RTT
+                                    rtt: Duration::from_millis(50),
                                 },
                             );
-                            // DEFER: path validation (may access connections)
                             validation_requests.push((target_addr, successful_path));
-                        } else {
+                        } else if let Some(mut session) = self.active_sessions.get_mut(&target_addr) {
                             self.handle_phase_failure(
-                                session,
+                                &mut session,
                                 now,
                                 &mut events,
                                 NatTraversalError::PunchingFailed(
@@ -5061,28 +5106,30 @@ impl NatTraversalEndpoint {
                         }
                     }
                     TraversalPhase::Validation => {
-                        // Check if path is validated
-                        if self.is_path_validated(&target_addr) {
-                            session.phase = TraversalPhase::Connected;
-                            self.emit_event(
-                                &mut events,
-                                NatTraversalEvent::TraversalSucceeded {
-                                    remote_address: target_addr,
-                                    final_address: session
-                                        .candidates
-                                        .first()
-                                        .map(|c| c.address)
-                                        .unwrap_or_else(create_random_port_bind_addr),
-                                    total_time: elapsed,
-                                },
-                            );
-                            info!(
-                                "NAT traversal succeeded for {} in {:?}",
-                                target_addr, elapsed
-                            );
-                        } else {
+                        let validated = self.is_path_validated(&target_addr);
+                        if validated {
+                            if let Some(mut session) = self.active_sessions.get_mut(&target_addr) {
+                                session.phase = TraversalPhase::Connected;
+                                let final_addr = candidates
+                                    .first()
+                                    .map(|c| c.address)
+                                    .unwrap_or_else(create_random_port_bind_addr);
+                                self.emit_event(
+                                    &mut events,
+                                    NatTraversalEvent::TraversalSucceeded {
+                                        remote_address: target_addr,
+                                        final_address: final_addr,
+                                        total_time: elapsed,
+                                    },
+                                );
+                                info!(
+                                    "NAT traversal succeeded for {} in {:?}",
+                                    target_addr, elapsed
+                                );
+                            }
+                        } else if let Some(mut session) = self.active_sessions.get_mut(&target_addr) {
                             self.handle_phase_failure(
-                                session,
+                                &mut session,
                                 now,
                                 &mut events,
                                 NatTraversalError::ValidationFailed(
@@ -5105,6 +5152,56 @@ impl NatTraversalEndpoint {
             }
         }
         // Phase 1 complete - all DashMap entries are now released
+
+        // Phase 1b: Fetch discovery candidates and update sessions.
+        // This is done AFTER releasing active_sessions shards to avoid
+        // holding DashMap write guards while acquiring discovery_manager.
+        for (target_addr, discovery_session_id) in discovery_needed {
+            let discovered_candidates = self.discovery_manager.lock().get_candidates(discovery_session_id);
+
+            if let Some(mut session) = self.active_sessions.get_mut(&target_addr) {
+                session.candidates = discovered_candidates.clone();
+
+                if !session.candidates.is_empty() {
+                    session.phase = TraversalPhase::Coordination;
+                    self.emit_event(
+                        &mut events,
+                        NatTraversalEvent::PhaseTransition {
+                            remote_address: target_addr,
+                            from_phase: TraversalPhase::Discovery,
+                            to_phase: TraversalPhase::Coordination,
+                        },
+                    );
+                    info!(
+                        "{} advanced from Discovery to Coordination with {} candidates",
+                        target_addr,
+                        session.candidates.len()
+                    );
+                } else if session.attempt < self.config.max_concurrent_attempts as u32 {
+                    session.attempt += 1;
+                    session.started_at = now;
+                    let backoff_duration = self.calculate_backoff(session.attempt);
+                    warn!(
+                        "Discovery timeout for {}, retrying (attempt {}), backoff: {:?}",
+                        target_addr, session.attempt, backoff_duration
+                    );
+                } else {
+                    session.phase = TraversalPhase::Failed;
+                    self.emit_event(
+                        &mut events,
+                        NatTraversalEvent::TraversalFailed {
+                            remote_address: target_addr,
+                            error: NatTraversalError::NoCandidatesFound,
+                            fallback_available: true,
+                        },
+                    );
+                    error!(
+                        "NAT traversal failed for {}: no candidates found after {} attempts",
+                        target_addr, session.attempt
+                    );
+                }
+            }
+        }
 
         // Phase 2: Execute deferred work (no DashMap entries held)
 
