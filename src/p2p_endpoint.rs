@@ -2157,22 +2157,6 @@ impl P2pEndpoint {
             return Err(EndpointError::ShuttingDown);
         }
 
-        // Diagnostic: log send attempt with connection state
-        let peers_has = self.connected_peers.read().await.contains_key(addr);
-        let alt = crate::shared::dual_stack_alternate(addr);
-        let peers_has_alt = alt.as_ref().map_or(false, |a| {
-            // Can't read while holding read — check was done above
-            false
-        });
-        let inner_has = self.inner.is_connected(addr);
-        let inner_has_alt = alt.as_ref().map_or(false, |a| self.inner.is_connected(a));
-        if !peers_has && !inner_has && !inner_has_alt {
-            info!(
-                "send({}): NOT in connected_peers (peers={}, inner={}, inner_alt={})",
-                addr, peers_has, inner_has, inner_has_alt
-            );
-        }
-
         // Get peer's transport address and optionally capture the connection
         // for hole-punched peers that bypassed normal registration.
         //
@@ -2487,13 +2471,13 @@ impl P2pEndpoint {
     /// dual-stack socket (IPv6-mapped) or IPv4-only (plain).
     pub fn inner_is_connected(&self, addr: &SocketAddr) -> bool {
         if self.inner.is_connected(addr) {
-            info!("inner_is_connected: {} found (exact match)", addr);
+            debug!("inner_is_connected: {} found (exact match)", addr);
             return true;
         }
         // Try the alternate form (plain ↔ mapped)
         if let Some(alt) = crate::shared::dual_stack_alternate(addr) {
             if self.inner.is_connected(&alt) {
-                info!("inner_is_connected: {} found via alternate {}", addr, alt);
+                debug!("inner_is_connected: {} found via alternate {}", addr, alt);
                 return true;
             }
         }
@@ -2570,9 +2554,9 @@ impl P2pEndpoint {
             // so the send path can find it. This is critical for NAT-traversed
             // connections where the accept-time DashMap entry may be missing
             // or removed by competing accept paths.
-            info!("Reader task: calling add_connection for {}", addr);
+            debug!("Reader task: calling add_connection for {}", addr);
             match inner.add_connection(addr, connection.clone()) {
-                Ok(()) => info!("Reader task: add_connection OK for {}", addr),
+                Ok(()) => debug!("Reader task: add_connection OK for {}", addr),
                 Err(e) => warn!("Reader task: add_connection FAILED for {}: {:?}", addr, e),
             }
 
@@ -2596,7 +2580,7 @@ impl P2pEndpoint {
                 };
 
                 let data_len = data.len();
-                info!("Reader task: {} bytes from {}", data_len, addr);
+                debug!("Reader task: {} bytes from {}", data_len, addr);
 
                 // Note: last_activity update moved out of the hot path to avoid
                 // RwLock write contention. With N reader tasks all acquiring

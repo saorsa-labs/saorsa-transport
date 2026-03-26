@@ -3610,26 +3610,37 @@ impl NatTraversalEndpoint {
                     info!("Accepted connection from {} (unified path)", remote_address);
 
                     connections2.insert(remote_address, connection.clone());
-                    emitted2.insert(remote_address);
 
-                    if let Some(ref server) = relay_server2 {
-                        let conn_clone = connection.clone();
-                        let server_clone = Arc::clone(server);
-                        tokio::spawn(async move {
-                            Self::handle_relay_requests(conn_clone, server_clone).await;
-                        });
+                    // Only forward to handshake_tx if this is the first time
+                    // we've seen this address. Without this guard, a
+                    // simultaneous-open (both sides connect at the same time)
+                    // sends two entries to handshake_tx, causing duplicate
+                    // reader tasks for the same connection address.
+                    if emitted2.insert(remote_address) {
+                        if let Some(ref server) = relay_server2 {
+                            let conn_clone = connection.clone();
+                            let server_clone = Arc::clone(server);
+                            tokio::spawn(async move {
+                                Self::handle_relay_requests(conn_clone, server_clone).await;
+                            });
+                        }
+
+                        if let Some(ref etx) = event_tx2 {
+                            let etx = etx.clone();
+                            let addr = remote_address;
+                            let conn = connection.clone();
+                            tokio::spawn(async move {
+                                Self::handle_connection(addr, conn, etx).await;
+                            });
+                        }
+
+                        let _ = tx2.send(Ok((remote_address, connection))).await;
+                    } else {
+                        debug!(
+                            "Duplicate connection from {} already emitted, skipping",
+                            remote_address
+                        );
                     }
-
-                    if let Some(ref etx) = event_tx2 {
-                        let etx = etx.clone();
-                        let addr = remote_address;
-                        let conn = connection.clone();
-                        tokio::spawn(async move {
-                            Self::handle_connection(addr, conn, etx).await;
-                        });
-                    }
-
-                    let _ = tx2.send(Ok((remote_address, connection))).await;
                 });
             }
         });
@@ -5029,7 +5040,7 @@ impl NatTraversalEndpoint {
                 )
             }; // shard lock released here
 
-            let (phase, elapsed, attempt, candidates) = session_snapshot;
+            let (phase, elapsed, _attempt, candidates) = session_snapshot;
             let timeout = self.get_phase_timeout(phase);
 
             // Check if we've exceeded the timeout
