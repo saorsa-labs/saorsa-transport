@@ -2099,16 +2099,25 @@ impl P2pEndpoint {
 
         // Get peer's transport address and optionally capture the connection
         // for hole-punched peers that bypassed normal registration.
+        //
+        // On dual-stack sockets (bindv6only=0), incoming connections use
+        // IPv4-mapped IPv6 addresses ([::ffff:x.x.x.x]) but callers may pass
+        // plain IPv4. Try both forms when looking up the peer.
         let (transport_addr, cached_connection) = {
             let peer_info = self.connected_peers.read().await;
-            if let Some(peer_conn) = peer_info.get(addr) {
+            let alt = crate::shared::dual_stack_alternate(addr);
+            let found = peer_info.get(addr).or_else(|| alt.as_ref().and_then(|a| peer_info.get(a)));
+            if let Some(peer_conn) = found {
                 (peer_conn.remote_addr.clone(), None)
             } else {
                 // Check if the NatTraversalEndpoint has a connection to this
                 // address (e.g. from a hole-punch that bypassed the normal path).
                 // Capture the connection now before it can be cleaned up.
                 drop(peer_info);
-                if let Ok(Some(conn)) = self.inner.get_connection(addr) {
+                let conn = self.inner.get_connection(addr)
+                    .ok().flatten()
+                    .or_else(|| alt.as_ref().and_then(|a| self.inner.get_connection(a).ok().flatten()));
+                if let Some(conn) = conn {
                     info!(
                         "send: found hole-punched connection to {}, registering",
                         addr

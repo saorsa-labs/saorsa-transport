@@ -987,6 +987,12 @@ impl SecurityValidationState {
         claimed_addr: SocketAddr,
         observed_addr: SocketAddr,
     ) -> bool {
+        // Normalise IPv4-mapped IPv6 addresses to plain IPv4 before comparing.
+        // On dual-stack sockets (bindv6only=0), the observed_addr may be in
+        // mapped form ([::ffff:x.x.x.x]) while the claimed address is plain IPv4.
+        let claimed_addr = crate::shared::normalize_socket_addr(claimed_addr);
+        let observed_addr = crate::shared::normalize_socket_addr(observed_addr);
+
         // For P2P NAT traversal, the port will typically be different due to NAT,
         // but the IP should be consistent unless there's multi-homing or proxying
         // Check if IPs are in the same family

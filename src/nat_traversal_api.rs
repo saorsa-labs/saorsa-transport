@@ -5892,8 +5892,12 @@ impl NatTraversalEndpoint {
                 );
 
                 // DashMap provides lock-free access
-                // First try direct SocketAddr lookup
-                let connection_found = if let Some(entry) = self.connections.get(&target_address) {
+                // First try direct SocketAddr lookup (try both plain and mapped forms
+                // for dual-stack compatibility where bindv6only=0)
+                let alt_target = crate::shared::dual_stack_alternate(&target_address);
+                let connection_found = if let Some(entry) = self.connections.get(&target_address)
+                    .or_else(|| alt_target.as_ref().and_then(|a| self.connections.get(a)))
+                {
                     Some(entry.value().clone())
                 } else {
                     // RFC approach: find connection by address match

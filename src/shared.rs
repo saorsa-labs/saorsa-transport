@@ -241,6 +241,30 @@ pub fn normalize_socket_addr(addr: SocketAddr) -> SocketAddr {
     }
 }
 
+/// Return the alternate IPv4 / IPv4-mapped-IPv6 form of a socket address,
+/// or `None` if the address is a pure IPv6 address (no alternate form).
+///
+/// On dual-stack sockets (`bindv6only=0`), the kernel represents IPv4 peers
+/// as `[::ffff:x.x.x.x]` but callers may hold either representation.
+/// This function produces the "other" form so both can be tried during lookups.
+pub fn dual_stack_alternate(addr: &SocketAddr) -> Option<SocketAddr> {
+    match addr {
+        SocketAddr::V4(v4) => {
+            let mapped = v4.ip().to_ipv6_mapped();
+            Some(SocketAddr::V6(std::net::SocketAddrV6::new(
+                mapped,
+                v4.port(),
+                0,
+                0,
+            )))
+        }
+        SocketAddr::V6(v6) => v6
+            .ip()
+            .to_ipv4_mapped()
+            .map(|ipv4| SocketAddr::new(IpAddr::V4(ipv4), v6.port())),
+    }
+}
+
 /// Deterministic 32-byte wire identifier from a `SocketAddr`.
 ///
 /// Used to correlate PUNCH_ME_NOW relay targets across connections.
@@ -259,6 +283,10 @@ pub fn normalize_socket_addr(addr: SocketAddr) -> SocketAddr {
 ///   bytes 17-18 = port (big-endian)
 ///   bytes 19-31 = zero padding
 pub fn wire_id_from_addr(addr: SocketAddr) -> [u8; 32] {
+    // Normalise IPv4-mapped IPv6 to plain IPv4 so that the same peer
+    // always produces the same wire ID regardless of whether the address
+    // came from a dual-stack socket ([::ffff:x.x.x.x]) or a plain IPv4 socket.
+    let addr = normalize_socket_addr(addr);
     let mut bytes = [0u8; 32];
     match addr {
         SocketAddr::V4(v4) => {
