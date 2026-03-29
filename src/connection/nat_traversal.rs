@@ -2687,20 +2687,12 @@ impl NatTraversalState {
         }
         // If there's an existing coordination that's stale (not in an active
         // negotiation phase), reset it so a new PUNCH_ME_NOW can be processed.
-        let should_reset = if let Some(coord) = &self.coordination {
-            let stale = !matches!(
+        let should_reset = self.coordination.as_ref().is_some_and(|coord| {
+            !matches!(
                 coord.state,
                 CoordinationPhase::Coordinating | CoordinationPhase::Requesting
-            ) || coord.round != peer_round;
-            // Active coordination for the same round — don't reset
-            if !stale && coord.round == peer_round {
-                false
-            } else {
-                stale
-            }
-        } else {
-            false
-        };
+            ) || coord.round != peer_round
+        });
         if should_reset {
             info!(
                 "Resetting stale coordination for new PUNCH_ME_NOW round {}",
