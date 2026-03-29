@@ -185,7 +185,7 @@ libc = "0.2"
 saorsa-transport-workspace-hack = { path = "saorsa-transport-workspace-hack" }
 assert_matches = "1.1"
 hex-literal = "0.4"
-rand_pcg = "0.3"
+rand_pcg = "0.10"
 rcgen = "0.14"
 tracing-subscriber = { version = "0.3.0", default-features = false, features = ["env-filter", "fmt", "ansi", "time", "local-time", "json"] }
 tempfile = "3"
