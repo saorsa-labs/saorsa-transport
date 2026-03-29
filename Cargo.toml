@@ -131,7 +131,7 @@ qlog = { version = "0.13", optional = true }
 
 # Essential dependencies
 uuid = { version = "1.0", features = ["v4", "serde"] }
-unicode-width = "=0.2.0"  # Pinned to match ratatui's requirement
+unicode-width = "=0.2.2"  # Pinned to match ratatui's requirement
 hex = "0.4"
 blake3 = "1"
 once_cell = "1.21"
