@@ -2973,6 +2973,12 @@ impl P2pEndpoint {
         let event_tx = self.event_tx.clone();
         let shutdown = self.shutdown.clone();
         let accepted_rx = self.inner.accepted_addrs_rx();
+        let inner = Arc::clone(&self.inner);
+        let data_tx = self.data_tx.clone();
+        let reader_exit_tx = self.reader_exit_tx.clone();
+        let reader_tasks = Arc::clone(&self.reader_tasks);
+        let reader_handles = Arc::clone(&self.reader_handles);
+        let max_read_bytes = self.config.max_message_size;
 
         tokio::spawn(async move {
             debug!("FORWARDER_DEBUG: started, acquiring rx lock...");
@@ -3003,6 +3009,67 @@ impl P2pEndpoint {
                     connected_at: Instant::now(),
                     last_activity: Instant::now(),
                 };
+
+                // Spawn a reader task so we can receive data on this connection.
+                // Without this, the target node of a hole-punch cannot receive
+                // unidirectional streams opened by the initiator.
+                if let Ok(Some(conn)) = inner.get_connection(&addr) {
+                    let data_tx = data_tx.clone();
+                    let event_tx = event_tx.clone();
+                    let exit_tx = reader_exit_tx.clone();
+                    let inner2 = Arc::clone(&inner);
+
+                    let abort_handle = reader_tasks.lock().await.spawn(async move {
+                        info!("Reader task STARTED for {} (via forwarder)", addr);
+                        match inner2.add_connection(addr, conn.clone()) {
+                            Ok(()) => debug!("Reader task (forwarder): add_connection OK for {}", addr),
+                            Err(e) => warn!("Reader task (forwarder): add_connection FAILED for {}: {:?}", addr, e),
+                        }
+
+                        loop {
+                            let mut recv_stream = match conn.accept_uni().await {
+                                Ok(stream) => stream,
+                                Err(e) => {
+                                    info!("Reader task for {} (forwarder) ending: accept_uni error: {}", addr, e);
+                                    break;
+                                }
+                            };
+
+                            let data = match recv_stream.read_to_end(max_read_bytes).await {
+                                Ok(data) if data.is_empty() => continue,
+                                Ok(data) => data,
+                                Err(e) => {
+                                    info!("Reader task for {} (forwarder): read_to_end error: {}", addr, e);
+                                    break;
+                                }
+                            };
+
+                            let data_len = data.len();
+                            debug!("Reader task (forwarder): {} bytes from {}", data_len, addr);
+
+                            let _ = event_tx.send(P2pEvent::DataReceived {
+                                addr,
+                                bytes: data_len,
+                            });
+
+                            if data_tx.send((addr, data)).await.is_err() {
+                                debug!("Reader task for {} (forwarder): channel closed, exiting", addr);
+                                break;
+                            }
+                        }
+
+                        let _ = exit_tx.send(addr);
+                        addr
+                    });
+
+                    reader_handles.write().await.insert(addr, abort_handle);
+                } else {
+                    warn!(
+                        "Incoming connection forwarder: no connection found for {} in DashMap",
+                        addr
+                    );
+                }
+
                 connected_peers.write().await.insert(addr, peer_conn);
                 let _ = event_tx.send(P2pEvent::PeerConnected {
                     addr: TransportAddr::Quic(addr),

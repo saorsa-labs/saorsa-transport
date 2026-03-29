@@ -3541,7 +3541,13 @@ impl NatTraversalEndpoint {
                 // connection was inserted into the DashMap. We forward any
                 // newly-emitted connections to the handshake channel.
                 let connecting = tokio::select! {
-                    Some(c) = endpoint.accept() => c,
+                    result = endpoint.accept() => match result {
+                        Some(c) => c,
+                        None => {
+                            debug!("Quinn endpoint closed, accept loop exiting");
+                            return;
+                        }
+                    },
                     _ = incoming_notify.notified() => {
                         // Hole-punch completed — check DashMap for new
                         // outgoing connections and forward them.
@@ -4935,7 +4941,12 @@ impl NatTraversalEndpoint {
 
         for (addr, reason) in closed_connections {
             // Record the time we first observed this connection as closed.
-            let first_seen_closed = *self.closed_at.entry(addr).or_insert(now);
+            // `or_insert` returns the existing value if present, so `is_first_seen`
+            // is only true on the very first poll cycle that detects the closure.
+            let entry = self.closed_at.entry(addr).or_insert(now);
+            let is_first_seen = *entry == now;
+            let first_seen_closed = *entry;
+            drop(entry); // Release shard lock before further DashMap operations
 
             if now.duration_since(first_seen_closed) >= grace_period {
                 // Grace period elapsed — remove the dead connection.
@@ -4952,13 +4963,17 @@ impl NatTraversalEndpoint {
                 );
             }
 
-            self.emit_event(
-                events,
-                NatTraversalEvent::ConnectionLost {
-                    remote_address: addr,
-                    reason: reason.to_string(),
-                },
-            );
+            // Only emit ConnectionLost on first detection to avoid ~10 duplicate
+            // events during the 5-second grace period (poll runs every 500ms).
+            if is_first_seen {
+                self.emit_event(
+                    events,
+                    NatTraversalEvent::ConnectionLost {
+                        remote_address: addr,
+                        reason: reason.to_string(),
+                    },
+                );
+            }
         }
     }
 
