@@ -113,6 +113,9 @@ pub struct Endpoint {
     /// Pending hole-punch connection attempts to initiate
     /// These are generated when a target node receives a relayed PUNCH_ME_NOW
     pending_hole_punch_addrs: Vec<SocketAddr>,
+    /// Pending peer address updates from ADD_ADDRESS frames.
+    /// Each entry is (peer_connection_addr, new_advertised_addr).
+    pending_peer_address_updates: Vec<(SocketAddr, SocketAddr)>,
 }
 
 /// Deterministic 32-byte wire ID from a SocketAddr, used to correlate
@@ -158,6 +161,7 @@ impl Endpoint {
             address_change_callback: None,
             pending_relay_events: Vec::new(),
             pending_hole_punch_addrs: Vec::new(),
+            pending_peer_address_updates: Vec::new(),
         }
     }
 
@@ -230,6 +234,14 @@ impl Endpoint {
     /// Drain pending hole-punch addresses that need connection attempts.
     pub fn drain_hole_punch_addrs(&mut self) -> impl Iterator<Item = SocketAddr> + '_ {
         self.pending_hole_punch_addrs.drain(..)
+    }
+
+    /// Drain pending peer address updates from ADD_ADDRESS frames.
+    /// Returns (peer_connection_addr, advertised_addr) pairs.
+    pub fn drain_peer_address_updates(
+        &mut self,
+    ) -> impl Iterator<Item = (SocketAddr, SocketAddr)> + '_ {
+        self.pending_peer_address_updates.drain(..)
     }
 
     /// Set the peer ID for an existing connection
@@ -350,6 +362,17 @@ impl Endpoint {
                 // This event serves as notification to the endpoint for potential coordination
                 // with other components or logging/metrics collection
                 debug!("NAT candidate {} validated successfully", address);
+            }
+            PeerAddressAdvertised {
+                peer_addr,
+                advertised_addr,
+            } => {
+                tracing::info!(
+                    "Peer {} advertised new address {}",
+                    peer_addr, advertised_addr
+                );
+                self.pending_peer_address_updates
+                    .push((peer_addr, advertised_addr));
             }
             InitiateHolePunch { peer_address } => {
                 // Queue a hole-punch connection attempt as a relay event.

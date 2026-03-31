@@ -89,6 +89,14 @@ pub(crate) enum EndpointEventInner {
         /// The peer's external address to connect to
         peer_address: SocketAddr,
     },
+    /// A peer advertised a new reachable address via ADD_ADDRESS.
+    /// The endpoint should propagate this so the DHT routing table is updated.
+    PeerAddressAdvertised {
+        /// The peer's current connection address
+        peer_addr: SocketAddr,
+        /// The new address the peer is advertising
+        advertised_addr: SocketAddr,
+    },
     /// Request to attempt connection to a target address (NAT callback mechanism)
     TryConnectTo {
         request_id: crate::VarInt,

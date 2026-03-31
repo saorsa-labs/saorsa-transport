@@ -609,7 +609,18 @@ impl Connection {
             if nat_traversal.check_coordination_timeout(now) {
                 trace!("NAT traversal coordination timed out, may retry");
             }
+            // Clean up expired validations so slots are freed for new candidates
+            let expired = nat_traversal.check_validation_timeouts(now);
+            if !expired.is_empty() {
+                debug!(
+                    "Cleaned up {} expired NAT traversal validations",
+                    expired.len()
+                );
+            }
         }
+
+        // Send OBSERVED_ADDRESS frames to tell peers their external address
+        self.check_for_address_observations(now);
 
         // First priority: NAT traversal PATH_CHALLENGE packets (includes coordination)
         if let Some(challenge) = self.send_nat_traversal_challenge(now, buf) {
@@ -4770,6 +4781,13 @@ impl Connection {
                     "Added remote candidate: {} (seq={}, priority={})",
                     normalized_addr, add_address.sequence, add_address.priority
                 );
+
+                // Notify the endpoint so the DHT routing table can be updated
+                self.endpoint_events
+                    .push_back(crate::shared::EndpointEventInner::PeerAddressAdvertised {
+                        peer_addr: self.path.remote,
+                        advertised_addr: normalized_addr,
+                    });
 
                 // Trigger validation of this new candidate
                 self.trigger_candidate_validation(normalized_addr, now)?;

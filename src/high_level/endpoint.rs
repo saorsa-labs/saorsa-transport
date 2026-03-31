@@ -270,6 +270,16 @@ impl Endpoint {
         }
     }
 
+    /// Set channel for peer address update events (ADD_ADDRESS → DHT bridge).
+    pub fn set_peer_address_update_tx(
+        &self,
+        tx: mpsc::UnboundedSender<(SocketAddr, SocketAddr)>,
+    ) {
+        if let Ok(mut state) = self.inner.0.state.lock() {
+            state.peer_address_update_tx = Some(tx);
+        }
+    }
+
     /// Connect to a remote endpoint
     ///
     /// `server_name` must be covered by the certificate presented by the server. This prevents a
@@ -629,6 +639,7 @@ pub(crate) struct State {
     /// Channel for forwarding hole-punch addresses to the NatTraversalEndpoint
     /// for full connection tracking instead of fire-and-forget.
     hole_punch_tx: Option<mpsc::UnboundedSender<SocketAddr>>,
+    peer_address_update_tx: Option<mpsc::UnboundedSender<(SocketAddr, SocketAddr)>>,
 }
 
 #[derive(Debug)]
@@ -759,6 +770,17 @@ impl State {
                         );
                     }
                 }
+            }
+        }
+
+        // Forward peer address updates from ADD_ADDRESS frames to the
+        // NatTraversalEndpoint so it can update the DHT routing table.
+        let address_updates: Vec<(SocketAddr, SocketAddr)> =
+            self.inner.drain_peer_address_updates().collect();
+        for (peer_addr, advertised_addr) in address_updates {
+            did_work = true;
+            if let Some(ref tx) = self.peer_address_update_tx {
+                let _ = tx.send((peer_addr, advertised_addr));
             }
         }
 
@@ -921,6 +943,7 @@ impl EndpointRef {
                 stats: EndpointStats::default(),
                 default_client_config: None,
                 hole_punch_tx: None,
+                peer_address_update_tx: None,
             }),
         }))
     }

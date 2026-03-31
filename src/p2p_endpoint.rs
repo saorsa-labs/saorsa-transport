@@ -393,6 +393,23 @@ pub enum P2pEvent {
         addr: TransportAddr,
     },
 
+    /// A connected peer advertised a new reachable address (relay or migration).
+    PeerAddressUpdated {
+        /// The connected peer that sent the advertisement
+        peer_addr: SocketAddr,
+        /// The new address the peer is advertising as reachable
+        advertised_addr: SocketAddr,
+    },
+
+    /// This node established a MASQUE relay and is advertising a relay address.
+    ///
+    /// Emitted once when the relay becomes active. Upper layers should use this
+    /// to trigger a DHT self-lookup so that more peers learn the relay address.
+    RelayEstablished {
+        /// The relay's public address (relay_IP:PORT)
+        relay_addr: SocketAddr,
+    },
+
     /// Bootstrap connection status
     BootstrapStatus {
         /// Number of connected bootstrap nodes
@@ -1966,7 +1983,8 @@ impl P2pEndpoint {
             target, relay_addr
         );
 
-        let public_addr = self
+        // Step 1: Establish relay session (control plane handshake)
+        let (public_addr, relay_socket) = self
             .inner
             .establish_relay_session(relay_addr)
             .await
@@ -1977,14 +1995,102 @@ impl P2pEndpoint {
             relay_addr, public_addr
         );
 
-        let conn = self.connect(target).await?;
+        let relay_socket = relay_socket.ok_or_else(|| {
+            EndpointError::Connection("Relay did not provide socket".to_string())
+        })?;
+
+        // Step 4: Create a new Quinn endpoint with the relay socket
+        let existing_endpoint = self
+            .inner
+            .get_endpoint()
+            .ok_or_else(|| EndpointError::Config("QUIC endpoint not available".to_string()))?;
+
+        let client_config = existing_endpoint
+            .default_client_config
+            .clone()
+            .ok_or_else(|| EndpointError::Config("No client config available".to_string()))?;
+
+        let runtime = crate::high_level::default_runtime().ok_or_else(|| {
+            EndpointError::Config("No async runtime available".to_string())
+        })?;
+
+        let mut relay_endpoint = crate::high_level::Endpoint::new_with_abstract_socket(
+            crate::EndpointConfig::default(),
+            None,
+            relay_socket,
+            runtime,
+        )
+        .map_err(|e| {
+            EndpointError::Connection(format!("Failed to create relay endpoint: {}", e))
+        })?;
+
+        relay_endpoint.set_default_client_config(client_config);
+
+        // Step 5: Connect to target through the relay endpoint
+        let connecting = relay_endpoint.connect(target, "peer").map_err(|e| {
+            EndpointError::Connection(format!("Failed to initiate relay connection: {}", e))
+        })?;
+
+        let handshake_timeout = self
+            .config
+            .timeouts
+            .nat_traversal
+            .connection_establishment_timeout;
+
+        let connection = match timeout(handshake_timeout, connecting).await {
+            Ok(Ok(conn)) => conn,
+            Ok(Err(e)) => {
+                info!(
+                    "Relay connection handshake to {} via {} failed: {}",
+                    target, relay_addr, e
+                );
+                return Err(EndpointError::Connection(e.to_string()));
+            }
+            Err(_) => {
+                info!(
+                    "Relay connection handshake to {} via {} timed out",
+                    target, relay_addr
+                );
+                return Err(EndpointError::Timeout);
+            }
+        };
+
+        // Step 6: Finalize — extract public key, store connection, spawn handler
+        let remote_public_key = extract_public_key_bytes_from_connection(&connection);
+
+        self.inner
+            .add_connection(target, connection.clone())
+            .map_err(EndpointError::NatTraversal)?;
+
+        self.inner
+            .spawn_connection_handler(target, connection, Side::Client)
+            .map_err(EndpointError::NatTraversal)?;
+
+        let peer_conn = PeerConnection {
+            public_key: remote_public_key,
+            remote_addr: TransportAddr::Quic(target),
+            authenticated: true,
+            connected_at: Instant::now(),
+            last_activity: Instant::now(),
+        };
+
+        // Spawn background reader task
+        if let Ok(Some(conn)) = self.inner.get_connection(&target) {
+            self.spawn_reader_task(target, conn).await;
+        }
+
+        // Store peer connection
+        self.connected_peers
+            .write()
+            .await
+            .insert(target, peer_conn.clone());
 
         info!(
-            "MASQUE relay connection succeeded to {} via {} (our relay addr: {:?})",
-            target, relay_addr, public_addr
+            "MASQUE relay connection succeeded to {} via {}",
+            target, relay_addr
         );
 
-        Ok(conn)
+        Ok(peer_conn)
     }
 
     /// Check if we're connected to a specific address
@@ -2434,6 +2540,49 @@ impl P2pEndpoint {
             connected,
             total: known_peers.len(),
         });
+
+        // After bootstrap, check for symmetric NAT and set up relay if needed
+        if connected > 0 {
+            let inner = Arc::clone(&self.inner);
+            let bootstrap_addrs: Vec<SocketAddr> = known_peers
+                .iter()
+                .filter_map(|addr| match addr {
+                    TransportAddr::Quic(a) => Some(*a),
+                    _ => None,
+                })
+                .collect();
+
+            tokio::spawn(async move {
+                // Wait for OBSERVED_ADDRESS frames to arrive from peers
+                tokio::time::sleep(Duration::from_secs(5)).await;
+
+                if inner.is_symmetric_nat() {
+                    info!("Symmetric NAT detected — setting up proactive relay");
+
+                    for bootstrap in &bootstrap_addrs {
+                        match inner.setup_proactive_relay(*bootstrap).await {
+                            Ok(relay_addr) => {
+                                info!(
+                                    "Proactive relay active at {} via bootstrap {}",
+                                    relay_addr, bootstrap
+                                );
+                                return;
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "Failed to set up relay via {}: {}",
+                                    bootstrap, e
+                                );
+                            }
+                        }
+                    }
+
+                    warn!("Failed to set up proactive relay on any bootstrap node");
+                } else {
+                    debug!("NAT check: not symmetric NAT, no relay needed");
+                }
+            });
+        }
 
         Ok(connected)
     }
@@ -2923,9 +3072,11 @@ impl P2pEndpoint {
     fn spawn_session_driver(&self) {
         let inner = Arc::clone(&self.inner);
         let shutdown = self.shutdown.clone();
+        let event_tx_for_nat = self.event_tx.clone();
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_millis(500));
+            let mut relay_event_sent = false;
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             loop {
@@ -2959,6 +3110,36 @@ impl P2pEndpoint {
                 // These are addresses from relayed PUNCH_ME_NOW that need fully tracked
                 // outgoing connections (not fire-and-forget).
                 inner.process_pending_hole_punches().await;
+
+                // Forward peer address updates as P2pEvents so the upper layer
+                // (saorsa-core) can update its DHT routing table.
+                {
+                    let mut rx = inner.peer_address_update_rx.lock().await;
+                    while let Ok((peer_addr, advertised_addr)) = rx.try_recv() {
+                        info!(
+                            "Peer {} advertised address {} — forwarding to P2pEvent",
+                            peer_addr, advertised_addr
+                        );
+                        let _ = event_tx_for_nat.send(P2pEvent::PeerAddressUpdated {
+                            peer_addr,
+                            advertised_addr,
+                        });
+                    }
+                }
+
+                // Emit RelayEstablished once when relay becomes active.
+                // Upper layers use this to trigger a DHT self-lookup for
+                // relay address propagation.
+                if !relay_event_sent {
+                    if let Some(relay_addr) = inner.relay_public_addr() {
+                        info!(
+                            "Relay established at {} — emitting RelayEstablished event",
+                            relay_addr
+                        );
+                        let _ = event_tx_for_nat.send(P2pEvent::RelayEstablished { relay_addr });
+                        relay_event_sent = true;
+                    }
+                }
             }
         });
     }
@@ -3076,6 +3257,69 @@ impl P2pEndpoint {
                     public_key: None,
                     side: Side::Server,
                 });
+
+                // Spawn a reader task for the connection so incoming streams
+                // (DHT, chunk protocol) are actually read. Without this, relayed
+                // connections are registered but never processed.
+                match inner.get_connection(&addr) {
+                    Ok(Some(conn)) => {
+                        info!(
+                            "Incoming connection forwarder: spawning reader task for {}",
+                            addr
+                        );
+                        let data_tx = data_tx.clone();
+                        let event_tx_for_reader = event_tx.clone();
+                        let exit_tx = reader_exit_tx.clone();
+                        let inner_for_reader = Arc::clone(&inner);
+                        reader_tasks.lock().await.spawn(async move {
+                            info!("Reader task STARTED for {} (via forwarder)", addr);
+                            match inner_for_reader.add_connection(addr, conn.clone()) {
+                                Ok(()) => {}
+                                Err(e) => {
+                                    warn!("Reader task: add_connection FAILED for {}: {:?}", addr, e);
+                                }
+                            }
+                            loop {
+                                let mut recv_stream = match conn.accept_uni().await {
+                                    Ok(stream) => stream,
+                                    Err(e) => {
+                                        info!("Reader task for {} (forwarder) ending: {}", addr, e);
+                                        break;
+                                    }
+                                };
+                                let data = match recv_stream.read_to_end(max_read_bytes).await {
+                                    Ok(data) if data.is_empty() => continue,
+                                    Ok(data) => data,
+                                    Err(e) => {
+                                        info!("Reader task for {} (forwarder): read error: {}", addr, e);
+                                        break;
+                                    }
+                                };
+                                let data_len = data.len();
+                                let _ = event_tx_for_reader.send(P2pEvent::DataReceived {
+                                    addr, bytes: data_len,
+                                });
+                                if data_tx.try_send((addr, data)).is_err() {
+                                    warn!("Reader task for {} (forwarder): data channel full, dropping {} bytes", addr, data_len);
+                                }
+                            }
+                            let _ = exit_tx.send(addr);
+                            addr
+                        });
+                    }
+                    Ok(None) => {
+                        warn!(
+                            "Incoming connection forwarder: get_connection({}) returned None — no reader task",
+                            addr
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Incoming connection forwarder: get_connection({}) failed: {} — no reader task",
+                            addr, e
+                        );
+                    }
+                }
             }
         });
     }

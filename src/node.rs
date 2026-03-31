@@ -357,7 +357,9 @@ impl Node {
             // Events without direct NodeEvent equivalents are ignored
             P2pEvent::NatTraversalProgress { .. }
             | P2pEvent::BootstrapStatus { .. }
-            | P2pEvent::PeerAuthenticated { .. } => None,
+            | P2pEvent::PeerAuthenticated { .. }
+            | P2pEvent::PeerAddressUpdated { .. }
+            | P2pEvent::RelayEstablished { .. } => None,
         }
     }
 
