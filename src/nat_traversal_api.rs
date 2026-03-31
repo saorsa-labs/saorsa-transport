@@ -5596,15 +5596,17 @@ impl NatTraversalEndpoint {
             self.relay_setup_attempted
                 .store(true, std::sync::atomic::Ordering::Relaxed);
 
-            // Find a bootstrap node to use as relay
-            let bootstrap_addr = {
+            // Collect ALL bootstrap nodes as relay candidates, not just the first.
+            // The spawned task iterates through them until one succeeds.
+            let relay_candidates: Vec<SocketAddr> = {
                 let nodes = self.bootstrap_nodes.read();
-                nodes.first().map(|n| n.address)
+                nodes.iter().map(|n| n.address).collect()
             };
 
-            if let Some(bootstrap) = bootstrap_addr {
+            if relay_candidates.is_empty() {
+                debug!("Symmetric NAT detected but no bootstrap nodes available for relay");
+            } else {
                 // Clone self reference for the spawned task
-                // We need: connections, relay_sessions, inner_endpoint, config, relay_manager
                 let connections = self.connections.clone();
                 let relay_sessions = self.relay_sessions.clone();
                 let relay_setup_attempted = self.relay_setup_attempted.clone();
@@ -5614,18 +5616,38 @@ impl NatTraversalEndpoint {
                 let server_config = self.server_config.clone();
 
                 tokio::spawn(async move {
-                    // Create a minimal NatTraversalEndpoint-like context for setup_proactive_relay
-                    // We just need the relay session to be established and the endpoint rebound
                     info!(
-                        "Spawning proactive relay setup for symmetric NAT via {}",
-                        bootstrap
+                        "Spawning proactive relay setup for symmetric NAT — {} candidates",
+                        relay_candidates.len()
                     );
 
-                    // Reuse existing connection to bootstrap
-                    let connection = match connections.get(&bootstrap) {
-                        Some(conn) if conn.close_reason().is_none() => conn.clone(),
-                        _ => {
-                            warn!("No active connection to bootstrap {} for relay setup", bootstrap);
+                    let mut connection = None;
+                    let mut bootstrap = relay_candidates[0]; // default, overwritten on success
+
+                    for candidate in &relay_candidates {
+                        match connections.get(candidate) {
+                            Some(conn) if conn.close_reason().is_none() => {
+                                info!("Relay candidate {} — active connection, trying", candidate);
+                                bootstrap = *candidate;
+                                connection = Some(conn.clone());
+                                break;
+                            }
+                            Some(_) => {
+                                debug!("Relay candidate {} — connection closed, skipping", candidate);
+                            }
+                            None => {
+                                debug!("Relay candidate {} — no connection, skipping", candidate);
+                            }
+                        }
+                    }
+
+                    let connection = match connection {
+                        Some(c) => c,
+                        None => {
+                            warn!(
+                                "No active connection to any relay candidate ({} tried), will retry",
+                                relay_candidates.len()
+                            );
                             relay_setup_attempted.store(false, std::sync::atomic::Ordering::Relaxed);
                             return;
                         }
@@ -5816,8 +5838,6 @@ impl NatTraversalEndpoint {
                         relay_public_addr, advertised
                     );
                 });
-            } else {
-                debug!("Symmetric NAT detected but no bootstrap nodes available for relay");
             }
         }
 
