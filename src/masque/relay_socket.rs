@@ -47,11 +47,7 @@ impl fmt::Debug for MasqueRelaySocket {
             .field("relay_public_addr", &self.relay_public_addr)
             .field(
                 "recv_queue_len",
-                &self
-                    .recv_queue
-                    .lock()
-                    .map(|q| q.len())
-                    .unwrap_or(0),
+                &self.recv_queue.lock().map(|q| q.len()).unwrap_or(0),
             )
             .finish()
     }
@@ -179,8 +175,18 @@ impl AsyncUdpSocket for MasqueRelaySocket {
 
         if let Ok(mut queue) = self.recv_queue.lock() {
             if let Some((payload, source)) = queue.pop_front() {
-                let len = payload.len().min(bufs[0].len());
-                bufs[0][..len].copy_from_slice(&payload[..len]);
+                // Drop oversized payloads rather than truncating — a truncated
+                // QUIC packet fails MAC verification and stalls the connection.
+                if payload.len() > bufs[0].len() {
+                    tracing::warn!(
+                        payload_len = payload.len(),
+                        buf_len = bufs[0].len(),
+                        "MasqueRelaySocket: payload exceeds receive buffer; dropping packet"
+                    );
+                    return Poll::Ready(Ok(0));
+                }
+                let len = payload.len();
+                bufs[0][..len].copy_from_slice(&payload);
 
                 let mut recv_meta = RecvMeta::default();
                 recv_meta.len = len;

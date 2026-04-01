@@ -310,7 +310,8 @@ pub struct NatTraversalEndpoint {
     /// When present, allows using transport-provided sockets instead of creating new ones
     transport_registry: Option<Arc<TransportRegistry>>,
     /// Channel for receiving peer address updates (ADD_ADDRESS → DHT bridge)
-    pub(crate) peer_address_update_rx: TokioMutex<mpsc::UnboundedReceiver<(SocketAddr, SocketAddr)>>,
+    pub(crate) peer_address_update_rx:
+        TokioMutex<mpsc::UnboundedReceiver<(SocketAddr, SocketAddr)>>,
     /// Whether symmetric NAT relay setup has been attempted (one-shot)
     relay_setup_attempted: Arc<std::sync::atomic::AtomicBool>,
     /// Relay address to re-advertise to new peers (set after proactive relay setup)
@@ -1398,7 +1399,9 @@ impl NatTraversalEndpoint {
             peer_address_update_rx: TokioMutex::new(peer_addr_rx),
             relay_setup_attempted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             relay_public_addr: Arc::new(std::sync::Mutex::new(None)),
-            relay_advertised_peers: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            relay_advertised_peers: Arc::new(std::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
             server_config: relay_server_config,
             transport_listener_handles: Arc::new(ParkingMutex::new(Vec::new())),
             constrained_engine,
@@ -1806,7 +1809,9 @@ impl NatTraversalEndpoint {
             peer_address_update_rx: TokioMutex::new(peer_addr_rx),
             relay_setup_attempted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             relay_public_addr: Arc::new(std::sync::Mutex::new(None)),
-            relay_advertised_peers: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            relay_advertised_peers: Arc::new(std::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
             server_config: relay_server_config,
             transport_listener_handles: Arc::new(ParkingMutex::new(Vec::new())),
             constrained_engine,
@@ -2024,6 +2029,13 @@ impl NatTraversalEndpoint {
         self.inner_endpoint.as_ref()
     }
 
+    /// Register a peer ID at the low-level endpoint for PUNCH_ME_NOW routing.
+    pub fn register_connection_peer_id(&self, addr: SocketAddr, peer_id: PeerId) {
+        if let Some(ep) = &self.inner_endpoint {
+            ep.register_connection_peer_id(addr, peer_id);
+        }
+    }
+
     /// Get the event callback
     pub fn get_event_callback(&self) -> Option<&Arc<dyn Fn(NatTraversalEvent) + Send + Sync>> {
         self.event_callback.as_ref()
@@ -2110,6 +2122,18 @@ impl NatTraversalEndpoint {
         target_addr: SocketAddr,
         coordinator: SocketAddr,
     ) -> Result<(), NatTraversalError> {
+        self.initiate_nat_traversal_for_peer(target_addr, coordinator, None)
+    }
+
+    /// Like `initiate_nat_traversal` but with an optional peer ID for
+    /// PUNCH_ME_NOW routing. When provided, the coordinator uses the peer ID
+    /// to find the target connection — essential for symmetric NAT.
+    pub fn initiate_nat_traversal_for_peer(
+        &self,
+        target_addr: SocketAddr,
+        coordinator: SocketAddr,
+        target_peer_id: Option<[u8; 32]>,
+    ) -> Result<(), NatTraversalError> {
         // CRITICAL: Check for existing connection FIRST - no NAT traversal needed if already connected.
         // This prevents wasting resources on hole punching when we already have a direct connection.
         if self.has_existing_connection(&target_addr) {
@@ -2144,7 +2168,7 @@ impl NatTraversalEndpoint {
         // state machine to continue progressing through phases (Synchronization,
         // Punching, Validation) which can create duplicate connections that
         // interfere with the established hole-punched connection.
-        self.send_coordination_request(target_addr, coordinator)?;
+        self.send_coordination_request_with_peer_id(target_addr, coordinator, target_peer_id)?;
 
         // Emit event
         if let Some(ref callback) = self.event_callback {
@@ -2725,7 +2749,13 @@ impl NatTraversalEndpoint {
         // Create event channel
         let (event_tx, event_rx) = mpsc::unbounded_channel();
 
-        Ok((endpoint, event_tx, event_rx, local_addr, server_config_for_relay))
+        Ok((
+            endpoint,
+            event_tx,
+            event_rx,
+            local_addr,
+            server_config_for_relay,
+        ))
     }
 
     /// Start listening for incoming connections (async version)
@@ -2927,12 +2957,22 @@ impl NatTraversalEndpoint {
                                                 // Send response with length prefix (stream stays open for data)
                                                 let response_bytes = response.encode();
                                                 let len = response_bytes.len() as u32;
-                                                if let Err(e) = send_stream.write_all(&len.to_be_bytes()).await {
-                                                    warn!("Failed to send relay response length to {}: {}", addr, e);
+                                                if let Err(e) =
+                                                    send_stream.write_all(&len.to_be_bytes()).await
+                                                {
+                                                    warn!(
+                                                        "Failed to send relay response length to {}: {}",
+                                                        addr, e
+                                                    );
                                                     return;
                                                 }
-                                                if let Err(e) = send_stream.write_all(&response_bytes).await {
-                                                    warn!("Failed to send relay response to {}: {}", addr, e);
+                                                if let Err(e) =
+                                                    send_stream.write_all(&response_bytes).await
+                                                {
+                                                    warn!(
+                                                        "Failed to send relay response to {}: {}",
+                                                        addr, e
+                                                    );
                                                     return;
                                                 }
                                                 // Do NOT call finish() — stream stays open for forwarding
@@ -3383,14 +3423,16 @@ impl NatTraversalEndpoint {
             None => return true, // No relay — nothing to monitor
         };
 
-        // Check if any relay session is still active
+        // Check the specific session for the advertised relay address.
+        // Other relay sessions may exist but are irrelevant — peers are
+        // using relay_addr, so that's the one that must be healthy.
         for entry in self.relay_sessions.iter() {
-            if entry.value().is_active() {
-                return true;
+            if entry.value().public_address == Some(relay_addr) {
+                return entry.value().is_active();
             }
         }
 
-        // All relay sessions are dead
+        // No matching session found
         warn!(
             "Relay session for {} is dead — resetting for re-establishment",
             relay_addr
@@ -3435,7 +3477,13 @@ impl NatTraversalEndpoint {
     pub async fn establish_relay_session(
         &self,
         relay_addr: SocketAddr,
-    ) -> Result<(Option<SocketAddr>, Option<Arc<crate::masque::MasqueRelaySocket>>), NatTraversalError> {
+    ) -> Result<
+        (
+            Option<SocketAddr>,
+            Option<Arc<crate::masque::MasqueRelaySocket>>,
+        ),
+        NatTraversalError,
+    > {
         // Check if we already have an active session to this relay
         // DashMap provides lock-free .get() that returns Option<Ref<K, V>>
         if let Some(session) = self.relay_sessions.get(&relay_addr) {
@@ -3453,10 +3501,7 @@ impl NatTraversalEndpoint {
         // already listening for bidi streams.
         let connection = if let Some(existing) = self.connections.get(&relay_addr) {
             if existing.close_reason().is_none() {
-                info!(
-                    "Reusing existing peer connection to relay {}",
-                    relay_addr
-                );
+                info!("Reusing existing peer connection to relay {}", relay_addr);
                 existing.clone()
             } else {
                 // Existing connection is dead — fall back to creating a new one
@@ -3533,9 +3578,8 @@ impl NatTraversalEndpoint {
         );
 
         // Create the MasqueRelaySocket from the open streams
-        let relay_socket = public_address.map(|addr| {
-            crate::masque::MasqueRelaySocket::new(send_stream, recv_stream, addr)
-        });
+        let relay_socket = public_address
+            .map(|addr| crate::masque::MasqueRelaySocket::new(send_stream, recv_stream, addr));
 
         // Store the session
         let session = RelaySession {
@@ -3834,6 +3878,17 @@ impl NatTraversalEndpoint {
     /// If the connection exists but is dead (has a `close_reason`), removes it
     /// from the connection table and returns `false`. This enables automatic
     /// cleanup of phantom connections during deduplication checks.
+    /// Check if a peer with the given ID has an active connection,
+    /// returning its actual socket address if found. This is essential
+    /// for symmetric NAT where the peer's address in the DHT differs
+    /// from the connection's actual address.
+    pub fn find_connection_by_peer_id(&self, peer_id: &[u8; 32]) -> Option<SocketAddr> {
+        if let Some(ep) = &self.inner_endpoint {
+            return ep.peer_connection_addr_by_id(peer_id);
+        }
+        None
+    }
+
     pub fn is_connected(&self, addr: &SocketAddr) -> bool {
         if let Some(entry) = self.connections.get(addr) {
             if let Some(reason) = entry.value().close_reason() {
@@ -4122,14 +4177,10 @@ impl NatTraversalEndpoint {
         // Step 1: Establish relay session with bootstrap
         let (public_addr, relay_socket) = self.establish_relay_session(bootstrap_addr).await?;
         let relay_public_addr = public_addr.ok_or_else(|| {
-            NatTraversalError::ConnectionFailed(
-                "Relay did not provide public address".to_string(),
-            )
+            NatTraversalError::ConnectionFailed("Relay did not provide public address".to_string())
         })?;
         let relay_socket = relay_socket.ok_or_else(|| {
-            NatTraversalError::ConnectionFailed(
-                "Relay did not provide socket".to_string(),
-            )
+            NatTraversalError::ConnectionFailed("Relay did not provide socket".to_string())
         })?;
 
         info!(
@@ -5631,7 +5682,8 @@ impl NatTraversalEndpoint {
             return Ok(());
         }
 
-        // Check for symmetric NAT (port diversity)
+        // Symmetric NAT detected — set up a proactive relay so inbound connections
+        // can reach this node. The relay address is advertised via ADD_ADDRESS.
         if self.is_symmetric_nat() {
             // Mark as attempted before spawning to avoid races
             self.relay_setup_attempted
@@ -5674,7 +5726,10 @@ impl NatTraversalEndpoint {
                                 break;
                             }
                             Some(_) => {
-                                debug!("Relay candidate {} — connection closed, skipping", candidate);
+                                debug!(
+                                    "Relay candidate {} — connection closed, skipping",
+                                    candidate
+                                );
                             }
                             None => {
                                 debug!("Relay candidate {} — no connection, skipping", candidate);
@@ -5689,7 +5744,8 @@ impl NatTraversalEndpoint {
                                 "No active connection to any relay candidate ({} tried), will retry",
                                 relay_candidates.len()
                             );
-                            relay_setup_attempted.store(false, std::sync::atomic::Ordering::Relaxed);
+                            relay_setup_attempted
+                                .store(false, std::sync::atomic::Ordering::Relaxed);
                             return;
                         }
                     };
@@ -5699,7 +5755,8 @@ impl NatTraversalEndpoint {
                         Ok(streams) => streams,
                         Err(e) => {
                             warn!("Failed to open relay stream to {}: {}", bootstrap, e);
-                            relay_setup_attempted.store(false, std::sync::atomic::Ordering::Relaxed);
+                            relay_setup_attempted
+                                .store(false, std::sync::atomic::Ordering::Relaxed);
                             return;
                         }
                     };
@@ -5734,14 +5791,16 @@ impl NatTraversalEndpoint {
                         return;
                     }
 
-                    let response = match ConnectUdpResponse::decode(&mut bytes::Bytes::from(response_bytes)) {
-                        Ok(r) => r,
-                        Err(e) => {
-                            warn!("Invalid relay response: {}", e);
-                            relay_setup_attempted.store(false, std::sync::atomic::Ordering::Relaxed);
-                            return;
-                        }
-                    };
+                    let response =
+                        match ConnectUdpResponse::decode(&mut bytes::Bytes::from(response_bytes)) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                warn!("Invalid relay response: {}", e);
+                                relay_setup_attempted
+                                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                                return;
+                            }
+                        };
 
                     if !response.is_success() {
                         warn!("Relay rejected: {:?}", response.reason);
@@ -5856,7 +5915,9 @@ impl NatTraversalEndpoint {
                     });
 
                     // Store for re-advertisement to future peers
-                    if let Ok(mut a) = relay_public_addr_store.lock() { *a = Some(relay_public_addr); }
+                    if let Ok(mut a) = relay_public_addr_store.lock() {
+                        *a = Some(relay_public_addr);
+                    }
 
                     // Advertise relay address to all connected peers
                     let mut advertised = 0;
@@ -5866,7 +5927,9 @@ impl NatTraversalEndpoint {
                         match conn.send_nat_address_advertisement(relay_public_addr, 100) {
                             Ok(_) => {
                                 advertised += 1;
-                                if let Ok(mut p) = relay_advertised_peers_store.lock() { p.insert(peer); }
+                                if let Ok(mut p) = relay_advertised_peers_store.lock() {
+                                    p.insert(peer);
+                                }
                             }
                             Err(e) => {
                                 debug!("Failed to advertise relay to {}: {}", entry.key(), e);
@@ -5887,21 +5950,39 @@ impl NatTraversalEndpoint {
             let relay_addr = self.relay_public_addr.lock().ok().and_then(|g| *g);
             if let Some(relay_addr) = relay_addr {
                 let unadvertised: Vec<SocketAddr> = {
-                    let advertised = self.relay_advertised_peers.lock().unwrap_or_else(|e| e.into_inner());
-                    self.connections.iter()
-                        .filter(|e| !advertised.contains(e.key()) && e.value().close_reason().is_none())
+                    let advertised = self
+                        .relay_advertised_peers
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    self.connections
+                        .iter()
+                        .filter(|e| {
+                            !advertised.contains(e.key()) && e.value().close_reason().is_none()
+                        })
                         .map(|e| *e.key())
                         .collect()
                 };
                 if !unadvertised.is_empty() {
-                    info!("Relay re-advertise: {} new peers to notify about {}", unadvertised.len(), relay_addr);
+                    info!(
+                        "Relay re-advertise: {} new peers to notify about {}",
+                        unadvertised.len(),
+                        relay_addr
+                    );
                 }
                 for peer_addr in unadvertised {
                     if let Some(mut entry) = self.connections.get_mut(&peer_addr) {
-                        match entry.value_mut().send_nat_address_advertisement(relay_addr, 100) {
+                        match entry
+                            .value_mut()
+                            .send_nat_address_advertisement(relay_addr, 100)
+                        {
                             Ok(_) => {
-                                info!("Re-advertised relay {} to new peer {}", relay_addr, peer_addr);
-                                if let Ok(mut a) = self.relay_advertised_peers.lock() { a.insert(peer_addr); }
+                                info!(
+                                    "Re-advertised relay {} to new peer {}",
+                                    relay_addr, peer_addr
+                                );
+                                if let Ok(mut a) = self.relay_advertised_peers.lock() {
+                                    a.insert(peer_addr);
+                                }
                             }
                             Err(_) => {}
                         }
@@ -5970,7 +6051,18 @@ impl NatTraversalEndpoint {
         target_addr: SocketAddr,
         coordinator: SocketAddr,
     ) -> Result<(), NatTraversalError> {
-        let target_wire_id = Self::wire_id_from_addr(target_addr);
+        self.send_coordination_request_with_peer_id(target_addr, coordinator, None)
+    }
+
+    fn send_coordination_request_with_peer_id(
+        &self,
+        target_addr: SocketAddr,
+        coordinator: SocketAddr,
+        target_peer_id: Option<[u8; 32]>,
+    ) -> Result<(), NatTraversalError> {
+        // Use peer ID if provided (works for symmetric NAT), fall back to
+        // wire_id_from_addr (works for cone NAT where address is stable).
+        let target_wire_id = target_peer_id.unwrap_or_else(|| Self::wire_id_from_addr(target_addr));
         info!(
             "Sending PUNCH_ME_NOW coordination request for {} to coordinator {}",
             target_addr, coordinator
@@ -6019,6 +6111,11 @@ impl NatTraversalEndpoint {
             // Use round 1 for initial coordination
             match conn.send_nat_punch_via_relay(target_wire_id, our_external_address, 1) {
                 Ok(()) => {
+                    // Wake the connection driver immediately so the queued
+                    // PUNCH_ME_NOW frame is transmitted without waiting for
+                    // the next keep-alive or scheduled poll. Without this,
+                    // idle connections delay transmission by up to 15s.
+                    conn.wake_transmit();
                     info!(
                         "Successfully queued PUNCH_ME_NOW for relay to {}",
                         target_addr

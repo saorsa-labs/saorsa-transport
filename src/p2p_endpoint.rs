@@ -163,6 +163,11 @@ pub struct P2pEndpoint {
     /// Registered when ConnectionAccepted/Established fires for constrained transports.
     constrained_peer_addrs: Arc<RwLock<HashMap<ConstrainedConnectionId, TransportAddr>>>,
 
+    /// Target peer ID for the next hole-punch attempt. When set, the
+    /// PUNCH_ME_NOW uses this instead of wire_id_from_addr, allowing the
+    /// coordinator to match by peer identity (works for symmetric NAT).
+    hole_punch_target_peer_id: Arc<tokio::sync::Mutex<Option<[u8; 32]>>>,
+
     /// Channel sender for data received from QUIC reader tasks and constrained poller
     data_tx: mpsc::Sender<(SocketAddr, Vec<u8>)>,
 
@@ -751,6 +756,7 @@ impl P2pEndpoint {
             router: Arc::new(RwLock::new(router)),
             constrained_connections: Arc::new(RwLock::new(HashMap::new())),
             constrained_peer_addrs: Arc::new(RwLock::new(HashMap::new())),
+            hole_punch_target_peer_id: Arc::new(tokio::sync::Mutex::new(None)),
             data_tx,
             data_rx: Arc::new(tokio::sync::Mutex::new(data_rx)),
             reader_tasks,
@@ -1337,6 +1343,18 @@ impl P2pEndpoint {
     ///     ConnectionMethod::Relayed { relay } => println!("Relayed via {}", relay),
     /// }
     /// ```
+    /// Set the target peer ID for the next hole-punch attempt. When set, the
+    /// PUNCH_ME_NOW frame carries the peer ID instead of a socket-address-derived
+    /// wire ID, allowing the coordinator to find the target connection by
+    /// authenticated identity — essential for symmetric NAT where the address
+    /// differs per peer.
+    ///
+    /// Cleared after each `connect_with_fallback` call.
+    pub async fn set_hole_punch_target_peer_id(&self, peer_id: Option<[u8; 32]>) {
+        *self.hole_punch_target_peer_id.lock().await = peer_id;
+    }
+
+    /// Connect with automatic fallback: Direct → HolePunch → Relay.
     pub async fn connect_with_fallback(
         &self,
         target_ipv4: Option<SocketAddr>,
@@ -1416,29 +1434,38 @@ impl P2pEndpoint {
         target_ipv6: Option<SocketAddr>,
         strategy_config: Option<StrategyConfig>,
     ) -> Result<(PeerConnection, ConnectionMethod), EndpointError> {
-        // Build strategy config with coordinator and relay from our config
+        // Build strategy config with coordinator and relay from our config.
+        // Collect ALL coordinator candidates so we can rotate on failure.
         let mut config = strategy_config.unwrap_or_default();
-        if config.coordinator.is_none() {
-            // Try known_peers first (configured bootstrap nodes)
-            config.coordinator = self
-                .config
-                .known_peers
-                .first()
-                .and_then(|addr| addr.as_socket_addr());
+        let target = target_ipv4.or(target_ipv6);
+        let mut coordinator_candidates: Vec<SocketAddr> = Vec::new();
 
-            // If no known_peers, use any currently connected peer as coordinator.
-            // In the symmetric P2P architecture, any connected node can coordinate
-            // NAT traversal for us.
-            if config.coordinator.is_none() {
-                let peers = self.connected_peers.read().await;
-                let target = target_ipv4.or(target_ipv6);
-                config.coordinator = peers.keys().find(|&&addr| Some(addr) != target).copied();
-                if let Some(coord) = config.coordinator {
-                    info!(
-                        "Using connected peer {} as NAT traversal coordinator",
-                        coord
-                    );
+        // Add known_peers first (configured bootstrap nodes)
+        for addr in &self.config.known_peers {
+            if let Some(sa) = addr.as_socket_addr() {
+                if Some(sa) != target {
+                    coordinator_candidates.push(sa);
                 }
+            }
+        }
+        // Add all connected peers as fallback candidates
+        {
+            let peers = self.connected_peers.read().await;
+            for &addr in peers.keys() {
+                if Some(addr) != target && !coordinator_candidates.contains(&addr) {
+                    coordinator_candidates.push(addr);
+                }
+            }
+        }
+
+        if config.coordinator.is_none() {
+            config.coordinator = coordinator_candidates.first().copied();
+            if let Some(coord) = config.coordinator {
+                info!(
+                    "Using {} as NAT traversal coordinator ({} candidates total)",
+                    coord,
+                    coordinator_candidates.len()
+                );
             }
         }
         if config.relay_addrs.is_empty() {
@@ -1679,7 +1706,21 @@ impl P2pEndpoint {
                             }
                             strategy.record_holepunch_error(round, e.to_string());
                             if strategy.should_retry_holepunch() {
-                                debug!("Hole-punch round {} failed, retrying", round);
+                                // Try a different coordinator for the next round.
+                                // The current coordinator may be behind NAT itself
+                                // and unable to relay PUNCH_ME_NOW to the target.
+                                if let Some(next) = coordinator_candidates.get(round as usize) {
+                                    info!(
+                                        "Hole-punch round {} failed, trying coordinator {} next",
+                                        round, next
+                                    );
+                                    strategy.set_coordinator(*next);
+                                } else {
+                                    debug!(
+                                        "Hole-punch round {} failed, no more coordinators",
+                                        round
+                                    );
+                                }
                                 strategy.increment_round();
                             } else {
                                 debug!("Hole-punch failed after {} rounds", round);
@@ -1699,7 +1740,13 @@ impl P2pEndpoint {
                             }
                             strategy.record_holepunch_error(round, "Timeout".to_string());
                             if strategy.should_retry_holepunch() {
-                                debug!("Hole-punch round {} timed out, retrying", round);
+                                if let Some(next) = coordinator_candidates.get(round as usize) {
+                                    info!(
+                                        "Hole-punch round {} timed out, trying coordinator {} next",
+                                        round, next
+                                    );
+                                    strategy.set_coordinator(*next);
+                                }
                                 strategy.increment_round();
                             } else {
                                 debug!("Hole-punch timed out after {} rounds", round);
@@ -1882,13 +1929,24 @@ impl P2pEndpoint {
             );
         }
 
-        // Initiate NAT traversal — sends PUNCH_ME_NOW to coordinator
-        info!(
-            "try_hole_punch: calling initiate_nat_traversal({}, {})",
-            target, coordinator
-        );
+        // Initiate NAT traversal — sends PUNCH_ME_NOW to coordinator.
+        // Use the stored target peer ID if available (for symmetric NAT routing).
+        // Clone (not take) — the peer ID is needed across multiple
+        // hole-punch rounds within connect_with_fallback.
+        let target_peer_id = *self.hole_punch_target_peer_id.lock().await;
+        if target_peer_id.is_some() {
+            info!(
+                "try_hole_punch: calling initiate_nat_traversal({}, {}) with peer ID",
+                target, coordinator
+            );
+        } else {
+            info!(
+                "try_hole_punch: calling initiate_nat_traversal({}, {}) with address-based wire ID",
+                target, coordinator
+            );
+        }
         self.inner
-            .initiate_nat_traversal(target, coordinator)
+            .initiate_nat_traversal_for_peer(target, coordinator, target_peer_id)
             .map_err(EndpointError::NatTraversal)?;
         info!("try_hole_punch: initiate_nat_traversal returned OK");
 
@@ -1926,12 +1984,25 @@ impl P2pEndpoint {
                 return Err(EndpointError::ShuttingDown);
             }
 
-            // Check NatTraversalEndpoint's connections
-            if self.inner.is_connected(&target) {
-                info!("try_hole_punch: connection to {} established!", target);
+            // Check for connection by address first (fast path for cone NAT),
+            // then by peer ID (handles symmetric NAT where the return
+            // connection has a different port than the DHT address).
+            let connected_addr = if self.inner.is_connected(&target) {
+                Some(target)
+            } else if let Some(ref pid) = target_peer_id {
+                self.find_connection_by_peer_id(pid)
+            } else {
+                None
+            };
+
+            if let Some(actual_addr) = connected_addr {
+                info!(
+                    "try_hole_punch: connection to {} established (actual addr: {})!",
+                    target, actual_addr
+                );
                 let peer_conn = PeerConnection {
                     public_key: None,
-                    remote_addr: TransportAddr::Quic(target),
+                    remote_addr: TransportAddr::Quic(actual_addr),
                     authenticated: true,
                     connected_at: Instant::now(),
                     last_activity: Instant::now(),
@@ -1939,11 +2010,13 @@ impl P2pEndpoint {
                 self.connected_peers
                     .write()
                     .await
-                    .insert(target, peer_conn.clone());
+                    .insert(actual_addr, peer_conn.clone());
                 return Ok(peer_conn);
             }
 
             // Check P2pEndpoint's connected_peers (populated by saorsa-core)
+            // Try both the target address and, for symmetric NAT, any
+            // connection matching the peer ID.
             {
                 let peers = self.connected_peers.read().await;
                 if let Some(existing) = peers.get(&target) {
@@ -1995,9 +2068,8 @@ impl P2pEndpoint {
             relay_addr, public_addr
         );
 
-        let relay_socket = relay_socket.ok_or_else(|| {
-            EndpointError::Connection("Relay did not provide socket".to_string())
-        })?;
+        let relay_socket = relay_socket
+            .ok_or_else(|| EndpointError::Connection("Relay did not provide socket".to_string()))?;
 
         // Step 4: Create a new Quinn endpoint with the relay socket
         let existing_endpoint = self
@@ -2010,9 +2082,8 @@ impl P2pEndpoint {
             .clone()
             .ok_or_else(|| EndpointError::Config("No client config available".to_string()))?;
 
-        let runtime = crate::high_level::default_runtime().ok_or_else(|| {
-            EndpointError::Config("No async runtime available".to_string())
-        })?;
+        let runtime = crate::high_level::default_runtime()
+            .ok_or_else(|| EndpointError::Config("No async runtime available".to_string()))?;
 
         let mut relay_endpoint = crate::high_level::Endpoint::new_with_abstract_socket(
             crate::EndpointConfig::default(),
@@ -2569,10 +2640,7 @@ impl P2pEndpoint {
                                 return;
                             }
                             Err(e) => {
-                                warn!(
-                                    "Failed to set up relay via {}: {}",
-                                    bootstrap, e
-                                );
+                                warn!("Failed to set up relay via {}: {}", bootstrap, e);
                             }
                         }
                     }
@@ -2618,6 +2686,21 @@ impl P2pEndpoint {
     /// Tries both the plain and IPv4-mapped address forms because the DashMap
     /// key format depends on whether the connection was established on a
     /// dual-stack socket (IPv6-mapped) or IPv4-only (plain).
+    /// Check if a peer with the given ID has an active connection,
+    /// returning the actual socket address. For symmetric NAT, the
+    /// address differs from the DHT address.
+    pub fn find_connection_by_peer_id(&self, peer_id: &[u8; 32]) -> Option<SocketAddr> {
+        self.inner.find_connection_by_peer_id(peer_id)
+    }
+
+    /// Register a peer ID at the low-level endpoint for PUNCH_ME_NOW relay
+    /// routing. Called when the identity exchange completes on a connection.
+    pub fn register_connection_peer_id(&self, addr: SocketAddr, peer_id: [u8; 32]) {
+        self.inner
+            .register_connection_peer_id(addr, crate::nat_traversal_api::PeerId(peer_id));
+    }
+
+    /// Check if a peer is connected at the transport level.
     pub fn inner_is_connected(&self, addr: &SocketAddr) -> bool {
         if self.inner.is_connected(addr) {
             debug!("inner_is_connected: {} found (exact match)", addr);
@@ -3355,6 +3438,7 @@ impl Clone for P2pEndpoint {
             router: Arc::clone(&self.router),
             constrained_connections: Arc::clone(&self.constrained_connections),
             constrained_peer_addrs: Arc::clone(&self.constrained_peer_addrs),
+            hole_punch_target_peer_id: Arc::clone(&self.hole_punch_target_peer_id),
             data_tx: self.data_tx.clone(),
             data_rx: Arc::clone(&self.data_rx),
             reader_tasks: Arc::clone(&self.reader_tasks),
