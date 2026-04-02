@@ -113,6 +113,9 @@ pub struct Endpoint {
     /// Pending hole-punch connection attempts to initiate
     /// These are generated when a target node receives a relayed PUNCH_ME_NOW
     pending_hole_punch_addrs: Vec<SocketAddr>,
+    /// Pending peer address updates from ADD_ADDRESS frames.
+    /// Each entry is (peer_connection_addr, new_advertised_addr).
+    pending_peer_address_updates: Vec<(SocketAddr, SocketAddr)>,
 }
 
 /// Deterministic 32-byte wire ID from a SocketAddr, used to correlate
@@ -158,6 +161,7 @@ impl Endpoint {
             address_change_callback: None,
             pending_relay_events: Vec::new(),
             pending_hole_punch_addrs: Vec::new(),
+            pending_peer_address_updates: Vec::new(),
         }
     }
 
@@ -232,12 +236,46 @@ impl Endpoint {
         self.pending_hole_punch_addrs.drain(..)
     }
 
+    /// Drain pending peer address updates from ADD_ADDRESS frames.
+    /// Returns (peer_connection_addr, advertised_addr) pairs.
+    pub fn drain_peer_address_updates(
+        &mut self,
+    ) -> impl Iterator<Item = (SocketAddr, SocketAddr)> + '_ {
+        self.pending_peer_address_updates.drain(..)
+    }
+
     /// Set the peer ID for an existing connection
     pub fn set_connection_peer_id(&mut self, connection_handle: ConnectionHandle, peer_id: PeerId) {
         if let Some(connection) = self.connections.get_mut(connection_handle.0) {
             connection.peer_id = Some(peer_id);
             self.register_peer(peer_id, connection_handle);
         }
+    }
+
+    /// Get the remote address of a peer's connection by peer ID.
+    pub fn peer_connection_addr(&self, peer_id: &PeerId) -> Option<SocketAddr> {
+        let handle = self.peer_connections.get(peer_id)?;
+        let meta = self.connections.get(handle.0)?;
+        Some(meta.addresses.remote)
+    }
+
+    /// Find the connection handle for a given remote address.
+    pub fn connection_handle_for_addr(&self, addr: &SocketAddr) -> Option<ConnectionHandle> {
+        let normalized = crate::shared::normalize_socket_addr(*addr);
+        let alt = crate::shared::dual_stack_alternate(addr);
+
+        for (idx, meta) in self.connections.iter() {
+            let remote = meta.addresses.remote;
+            if remote == normalized {
+                return Some(ConnectionHandle(idx));
+            }
+            if let Some(ref a) = alt {
+                if remote == *a {
+                    return Some(ConnectionHandle(idx));
+                }
+            }
+        }
+        None
     }
 
     /// Get relay statistics for monitoring
@@ -290,35 +328,45 @@ impl Endpoint {
             }
             RelayPunchMeNow(target_peer_id, punch_me_now, _sender_addr) => {
                 // Relay PUNCH_ME_NOW to the target peer.
-                // target_peer_id = wire_id_from_addr(target_address) computed by the sender.
-                // We recompute this hash for each connection's remote address to find the target.
+                // target_peer_id contains the target's authenticated peer ID (32 bytes).
+                // Look up the connection by peer ID first (works for symmetric NAT where
+                // the socket address differs per peer). Fall back to wire_id address
+                // matching for backward compatibility.
+                let peer_id = PeerId(target_peer_id);
                 tracing::info!(
-                    "RelayPunchMeNow received: target_wire_id={:?}, {} connections to check",
-                    &target_peer_id[..8],
+                    "RelayPunchMeNow received: target_peer={}, {} connections to check",
+                    hex::encode(&target_peer_id[..8]),
                     self.connections.len()
                 );
-                let found = self.connections.iter().find_map(|(idx, meta)| {
-                    let wire_id = wire_id_from_addr(meta.addresses.remote);
-                    tracing::debug!(
-                        "  checking connection {} remote={}: wire_id={:?} match={}",
-                        idx,
-                        meta.addresses.remote,
-                        &wire_id[..8],
-                        wire_id == target_peer_id
+
+                // Primary: look up by authenticated peer ID
+                let found = if let Some(handle) = self.lookup_peer_connection(&peer_id) {
+                    let remote = self.connections[handle.0].addresses.remote;
+                    tracing::info!(
+                        "Found target peer {} via peer ID lookup (remote={})",
+                        hex::encode(&target_peer_id[..8]),
+                        remote
                     );
-                    if wire_id == target_peer_id {
-                        Some((ConnectionHandle(idx), meta.addresses.remote))
-                    } else {
-                        None
-                    }
-                });
+                    Some((handle, remote))
+                } else {
+                    // Fallback: wire_id address matching (backward compat)
+                    tracing::debug!(
+                        "Peer ID lookup missed, falling back to wire_id address matching"
+                    );
+                    self.connections.iter().find_map(|(idx, meta)| {
+                        let wire_id = wire_id_from_addr(meta.addresses.remote);
+                        if wire_id == target_peer_id {
+                            Some((ConnectionHandle(idx), meta.addresses.remote))
+                        } else {
+                            None
+                        }
+                    })
+                };
+
                 if let Some((target_ch, target_addr)) = found {
                     if self.relay_frame_to_connection(target_ch, punch_me_now) {
                         self.relay_stats.requests_relayed += 1;
-                        tracing::info!(
-                            "Relayed PUNCH_ME_NOW to {} via wire_id lookup",
-                            target_addr
-                        );
+                        tracing::info!("Relayed PUNCH_ME_NOW to {} via peer lookup", target_addr);
                     } else {
                         tracing::warn!(
                             "Failed to relay PUNCH_ME_NOW to connection {:?} for {}",
@@ -328,7 +376,7 @@ impl Endpoint {
                     }
                 } else {
                     tracing::warn!(
-                        "No connection found for PUNCH_ME_NOW relay target (wire_id {:?})",
+                        "No connection found for PUNCH_ME_NOW relay target (peer_id {:?})",
                         &target_peer_id[..8]
                     );
                 }
@@ -350,6 +398,18 @@ impl Endpoint {
                 // This event serves as notification to the endpoint for potential coordination
                 // with other components or logging/metrics collection
                 debug!("NAT candidate {} validated successfully", address);
+            }
+            PeerAddressAdvertised {
+                peer_addr,
+                advertised_addr,
+            } => {
+                tracing::info!(
+                    "Peer {} advertised new address {}",
+                    peer_addr,
+                    advertised_addr
+                );
+                self.pending_peer_address_updates
+                    .push((peer_addr, advertised_addr));
             }
             InitiateHolePunch { peer_address } => {
                 // Queue a hole-punch connection attempt as a relay event.
