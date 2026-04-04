@@ -178,9 +178,9 @@ pub struct StrategyConfig {
 impl Default for StrategyConfig {
     fn default() -> Self {
         Self {
-            ipv4_timeout: Duration::from_secs(2),
-            ipv6_timeout: Duration::from_secs(2),
-            holepunch_timeout: Duration::from_secs(3),
+            ipv4_timeout: Duration::from_secs(3),
+            ipv6_timeout: Duration::from_secs(3),
+            holepunch_timeout: Duration::from_secs(8),
             relay_timeout: Duration::from_secs(10),
             max_holepunch_rounds: 2,
             ipv6_enabled: true,
@@ -484,9 +484,9 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = StrategyConfig::default();
-        assert_eq!(config.ipv4_timeout, Duration::from_secs(2));
-        assert_eq!(config.ipv6_timeout, Duration::from_secs(2));
-        assert_eq!(config.holepunch_timeout, Duration::from_secs(3));
+        assert_eq!(config.ipv4_timeout, Duration::from_secs(3));
+        assert_eq!(config.ipv6_timeout, Duration::from_secs(3));
+        assert_eq!(config.holepunch_timeout, Duration::from_secs(8));
         assert_eq!(config.relay_timeout, Duration::from_secs(10));
         assert_eq!(config.max_holepunch_rounds, 2);
         assert!(config.ipv6_enabled);
