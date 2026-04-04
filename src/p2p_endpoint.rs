@@ -168,10 +168,11 @@ pub struct P2pEndpoint {
     /// Registered when ConnectionAccepted/Established fires for constrained transports.
     constrained_peer_addrs: Arc<RwLock<HashMap<ConstrainedConnectionId, TransportAddr>>>,
 
-    /// Target peer ID for the next hole-punch attempt. When set, the
-    /// PUNCH_ME_NOW uses this instead of wire_id_from_addr, allowing the
-    /// coordinator to match by peer identity (works for symmetric NAT).
-    hole_punch_target_peer_id: Arc<tokio::sync::Mutex<Option<[u8; 32]>>>,
+    /// Per-target peer IDs for hole-punch attempts. When set for a target
+    /// address, the PUNCH_ME_NOW uses the peer ID instead of wire_id_from_addr,
+    /// allowing the coordinator to match by peer identity. Keyed by target
+    /// address so concurrent dials don't race on shared state.
+    hole_punch_target_peer_ids: Arc<dashmap::DashMap<SocketAddr, [u8; 32]>>,
 
     /// Channel sender for data received from QUIC reader tasks and constrained poller
     data_tx: mpsc::Sender<(SocketAddr, Vec<u8>)>,
@@ -761,7 +762,7 @@ impl P2pEndpoint {
             router: Arc::new(RwLock::new(router)),
             constrained_connections: Arc::new(RwLock::new(HashMap::new())),
             constrained_peer_addrs: Arc::new(RwLock::new(HashMap::new())),
-            hole_punch_target_peer_id: Arc::new(tokio::sync::Mutex::new(None)),
+            hole_punch_target_peer_ids: Arc::new(dashmap::DashMap::new()),
             data_tx,
             data_rx: Arc::new(tokio::sync::Mutex::new(data_rx)),
             reader_tasks,
@@ -1196,15 +1197,15 @@ impl P2pEndpoint {
     ///     ConnectionMethod::Relayed { relay } => println!("Relayed via {}", relay),
     /// }
     /// ```
-    /// Set the target peer ID for the next hole-punch attempt. When set, the
-    /// PUNCH_ME_NOW frame carries the peer ID instead of a socket-address-derived
-    /// wire ID, allowing the coordinator to find the target connection by
-    /// authenticated identity — essential for symmetric NAT where the address
-    /// differs per peer.
+    /// Set the target peer ID for a hole-punch attempt to a specific address.
+    /// When set, the PUNCH_ME_NOW frame carries the peer ID instead of a
+    /// socket-address-derived wire ID, allowing the coordinator to find the
+    /// target connection by authenticated identity.
     ///
-    /// Cleared after each `connect_with_fallback` call.
-    pub async fn set_hole_punch_target_peer_id(&self, peer_id: Option<[u8; 32]>) {
-        *self.hole_punch_target_peer_id.lock().await = peer_id;
+    /// Keyed by target address so concurrent dials to different peers each
+    /// get their own peer ID without racing on shared state.
+    pub async fn set_hole_punch_target_peer_id(&self, target: SocketAddr, peer_id: [u8; 32]) {
+        self.hole_punch_target_peer_ids.insert(target, peer_id);
     }
 
     /// Connect with automatic fallback: Direct → HolePunch → Relay.
@@ -1785,10 +1786,9 @@ impl P2pEndpoint {
         }
 
         // Initiate NAT traversal — sends PUNCH_ME_NOW to coordinator.
-        // Use the stored target peer ID if available (for symmetric NAT routing).
-        // Clone (not take) — the peer ID is needed across multiple
-        // hole-punch rounds within connect_with_fallback.
-        let target_peer_id = *self.hole_punch_target_peer_id.lock().await;
+        // Look up the target peer ID from the per-target map. This avoids
+        // races when multiple concurrent connections share the same P2pEndpoint.
+        let target_peer_id = self.hole_punch_target_peer_ids.get(&target).map(|v| *v);
         if target_peer_id.is_some() {
             info!(
                 "try_hole_punch: calling initiate_nat_traversal({}, {}) with peer ID",
@@ -3287,7 +3287,7 @@ impl Clone for P2pEndpoint {
             router: Arc::clone(&self.router),
             constrained_connections: Arc::clone(&self.constrained_connections),
             constrained_peer_addrs: Arc::clone(&self.constrained_peer_addrs),
-            hole_punch_target_peer_id: Arc::clone(&self.hole_punch_target_peer_id),
+            hole_punch_target_peer_ids: Arc::clone(&self.hole_punch_target_peer_ids),
             data_tx: self.data_tx.clone(),
             data_rx: Arc::clone(&self.data_rx),
             reader_tasks: Arc::clone(&self.reader_tasks),
