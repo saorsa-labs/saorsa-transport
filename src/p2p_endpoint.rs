@@ -1600,21 +1600,15 @@ impl P2pEndpoint {
                             }
                             strategy.record_holepunch_error(round, e.to_string());
                             if strategy.should_retry_holepunch() {
-                                // Try a different coordinator for the next round.
-                                // The current coordinator may be behind NAT itself
-                                // and unable to relay PUNCH_ME_NOW to the target.
-                                if let Some(next) = coordinator_candidates.get(round as usize) {
-                                    info!(
-                                        "Hole-punch round {} failed, trying coordinator {} next",
-                                        round, next
-                                    );
-                                    strategy.set_coordinator(*next);
-                                } else {
-                                    debug!(
-                                        "Hole-punch round {} failed, no more coordinators",
-                                        round
-                                    );
-                                }
+                                // Keep the same coordinator for retries. The preferred
+                                // coordinator (index 0) was chosen because it has a
+                                // known connection to the target. Switching to a random
+                                // fallback wastes another round on a coordinator that
+                                // likely can't relay to the target.
+                                info!(
+                                    "Hole-punch round {} failed, retrying with same coordinator",
+                                    round
+                                );
                                 strategy.increment_round();
                             } else {
                                 debug!("Hole-punch failed after {} rounds", round);
@@ -1635,13 +1629,10 @@ impl P2pEndpoint {
                             }
                             strategy.record_holepunch_error(round, "Timeout".to_string());
                             if strategy.should_retry_holepunch() {
-                                if let Some(next) = coordinator_candidates.get(round as usize) {
-                                    info!(
-                                        "Hole-punch round {} timed out, trying coordinator {} next",
-                                        round, next
-                                    );
-                                    strategy.set_coordinator(*next);
-                                }
+                                info!(
+                                    "Hole-punch round {} timed out, retrying with same coordinator",
+                                    round
+                                );
                                 strategy.increment_round();
                             } else {
                                 debug!("Hole-punch timed out after {} rounds", round);
