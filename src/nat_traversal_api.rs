@@ -3947,27 +3947,20 @@ impl NatTraversalEndpoint {
     ) -> Result<(), NatTraversalError> {
         let observed = connection.observed_address();
         info!("add_connection: {} observed_address={:?}", addr, observed);
-        // Only insert if no existing LIVE connection. This prevents
-        // an outgoing hole-punch connection (which may die quickly)
-        // from overwriting an incoming connection that the reader task
-        // is actively using. The reader task has a clone of the
-        // connection object and continues to receive data even if the
-        // DashMap entry is replaced — but the send path looks up the
-        // DashMap, so we must keep the live connection there.
-        if let Some(existing) = self.connections.get(&addr) {
-            if existing.value().close_reason().is_none() {
-                info!(
-                    "add_connection: {} already has a live connection, skipping overwrite",
-                    addr
-                );
-                drop(existing);
-            } else {
-                drop(existing);
-                self.connections.insert(addr, connection);
-            }
-        } else {
-            self.connections.insert(addr, connection);
+        // Always overwrite with the newer connection. The previous
+        // logic skipped overwrite when the existing connection had no
+        // close_reason, but a connection can become a zombie (driver no
+        // longer polling it) while still reporting close_reason=None.
+        // Frames queued on such a connection are never transmitted.
+        // The newest connection is the one most likely to have an active
+        // driver, so always use it.
+        if self.connections.contains_key(&addr) {
+            info!(
+                "add_connection: {} replacing existing connection with newer one",
+                addr
+            );
         }
+        self.connections.insert(addr, connection);
         info!(
             "add_connection: now have {} connections",
             self.connections.len()
