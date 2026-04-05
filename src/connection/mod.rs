@@ -4173,11 +4173,15 @@ impl Connection {
                 Some(x) => x,
                 None => break,
             };
-            trace!(
-                round = %punch_me_now.round,
-                paired_with_sequence_number = %punch_me_now.paired_with_sequence_number,
-                "PUNCH_ME_NOW"
-            );
+            if let Some(ref target) = punch_me_now.target_peer_id {
+                info!(
+                    "populate_packet: ENCODING PUNCH_ME_NOW relay frame target_peer={} remote={} buf_len={} max_size={}",
+                    hex::encode(&target[..8]),
+                    self.path.remote,
+                    buf.len(),
+                    max_size,
+                );
+            }
             // Use the correct encoding format based on negotiated configuration
             if self.nat_traversal_frame_config.use_rfc_format {
                 encode_or_close!(punch_me_now.try_encode_rfc(buf), "PUNCH_ME_NOW (rfc)");
