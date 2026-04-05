@@ -375,9 +375,20 @@ impl Endpoint {
                         );
                     }
                 } else {
+                    let known_peers: Vec<String> = self
+                        .connections
+                        .iter()
+                        .filter_map(|(_, meta)| {
+                            meta.peer_id
+                                .as_ref()
+                                .map(|pid| hex::encode(&pid.0[..8]))
+                        })
+                        .collect();
                     tracing::warn!(
-                        "No connection found for PUNCH_ME_NOW relay target (peer_id {:?})",
-                        &target_peer_id[..8]
+                        "No connection found for PUNCH_ME_NOW relay target peer_id={}, checked {} connections. Known peers: [{}]",
+                        hex::encode(&target_peer_id[..8]),
+                        self.connections.len(),
+                        known_peers.join(", ")
                     );
                 }
             }

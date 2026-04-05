@@ -174,6 +174,13 @@ pub struct P2pEndpoint {
     /// address so concurrent dials don't race on shared state.
     hole_punch_target_peer_ids: Arc<dashmap::DashMap<SocketAddr, [u8; 32]>>,
 
+    /// Per-target preferred coordinator for hole-punch relay. When the DHT
+    /// lookup discovers a peer via a FindNode response from another node, that
+    /// responding node (the "referrer") has a connection to the discovered peer
+    /// and is an ideal coordinator for PUNCH_ME_NOW relay. Keyed by target
+    /// address, value is the referrer's socket address.
+    hole_punch_preferred_coordinators: Arc<dashmap::DashMap<SocketAddr, SocketAddr>>,
+
     /// Channel sender for data received from QUIC reader tasks and constrained poller
     data_tx: mpsc::Sender<(SocketAddr, Vec<u8>)>,
 
@@ -763,6 +770,7 @@ impl P2pEndpoint {
             constrained_connections: Arc::new(RwLock::new(HashMap::new())),
             constrained_peer_addrs: Arc::new(RwLock::new(HashMap::new())),
             hole_punch_target_peer_ids: Arc::new(dashmap::DashMap::new()),
+            hole_punch_preferred_coordinators: Arc::new(dashmap::DashMap::new()),
             data_tx,
             data_rx: Arc::new(tokio::sync::Mutex::new(data_rx)),
             reader_tasks,
@@ -1208,6 +1216,18 @@ impl P2pEndpoint {
         self.hole_punch_target_peer_ids.insert(target, peer_id);
     }
 
+    /// Set a preferred coordinator for hole-punching to a specific target.
+    /// The preferred coordinator is a peer that referred us to the target
+    /// during a DHT lookup, so it has a connection to the target.
+    pub async fn set_hole_punch_preferred_coordinator(
+        &self,
+        target: SocketAddr,
+        coordinator: SocketAddr,
+    ) {
+        self.hole_punch_preferred_coordinators
+            .insert(target, coordinator);
+    }
+
     /// Connect with automatic fallback: Direct → HolePunch → Relay.
     pub async fn connect_with_fallback(
         &self,
@@ -1309,6 +1329,25 @@ impl P2pEndpoint {
                 if Some(addr) != target && !coordinator_candidates.contains(&addr) {
                     coordinator_candidates.push(addr);
                 }
+            }
+        }
+
+        // If the DHT referrer set a preferred coordinator for this target,
+        // move it to the front of the candidate list so round 1 uses it.
+        if let Some(target_addr) = target {
+            if let Some(preferred) = self.hole_punch_preferred_coordinators.get(&target_addr) {
+                let preferred_addr = *preferred;
+                coordinator_candidates.retain(|a| *a != preferred_addr);
+                coordinator_candidates.insert(0, preferred_addr);
+                info!(
+                    "Using preferred coordinator {} for target {} (DHT referrer)",
+                    preferred_addr, target_addr
+                );
+            } else {
+                info!(
+                    "No preferred coordinator for target {} (not discovered via DHT referral)",
+                    target_addr
+                );
             }
         }
 
@@ -3288,6 +3327,7 @@ impl Clone for P2pEndpoint {
             constrained_connections: Arc::clone(&self.constrained_connections),
             constrained_peer_addrs: Arc::clone(&self.constrained_peer_addrs),
             hole_punch_target_peer_ids: Arc::clone(&self.hole_punch_target_peer_ids),
+            hole_punch_preferred_coordinators: Arc::clone(&self.hole_punch_preferred_coordinators),
             data_tx: self.data_tx.clone(),
             data_rx: Arc::clone(&self.data_rx),
             reader_tasks: Arc::clone(&self.reader_tasks),
