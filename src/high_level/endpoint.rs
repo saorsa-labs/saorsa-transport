@@ -424,6 +424,25 @@ impl Endpoint {
             .local_addr()
     }
 
+    /// Check whether the low-level endpoint still has an active connection
+    /// to the given address. Returns `false` for zombie connections that have
+    /// been removed from the endpoint but still exist in higher-level caches.
+    pub fn has_active_connection(&self, addr: &SocketAddr) -> bool {
+        let Ok(state) = self.inner.state.lock() else {
+            return true; // mutex poisoned, assume live
+        };
+        let normalized = crate::shared::normalize_socket_addr(*addr);
+        if state.inner.connection_handle_for_addr(&normalized).is_some() {
+            return true;
+        }
+        if let Some(alt) = crate::shared::dual_stack_alternate(&normalized) {
+            if state.inner.connection_handle_for_addr(&alt).is_some() {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Get the number of connections that are currently open
     pub fn open_connections(&self) -> usize {
         self.inner

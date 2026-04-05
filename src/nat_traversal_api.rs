@@ -6089,9 +6089,11 @@ impl NatTraversalEndpoint {
             our_external_address
         );
 
-        // Find the connection to the coordinator via direct lookup instead of
-        // iterating all shards. Try the normalized address first, then the
-        // dual-stack alternate (IPv4 ↔ IPv4-mapped IPv6).
+        // Find the connection to the coordinator. Prefer the DashMap (fast),
+        // but verify it's still actively driven by the low-level endpoint.
+        // Connections can become zombies — their driver stopped polling but
+        // close_reason() still returns None. Frames queued on zombies are
+        // never encoded into QUIC packets.
         let normalized_coordinator = normalize_socket_addr(coordinator);
         let coord_conn = self.connections.get(&normalized_coordinator).or_else(|| {
             dual_stack_alternate(&normalized_coordinator).and_then(|alt| self.connections.get(&alt))
@@ -6099,31 +6101,51 @@ impl NatTraversalEndpoint {
 
         if let Some(entry) = coord_conn {
             let conn = entry.value();
-            info!(
-                "Sending PUNCH_ME_NOW via coordinator {} (normalized: {}) to target {}",
-                coordinator, normalized_coordinator, target_addr
-            );
 
-            // Use round 1 for initial coordination
-            match conn.send_nat_punch_via_relay(target_wire_id, our_external_address, 1) {
-                Ok(()) => {
-                    // Wake the connection driver immediately so the queued
-                    // PUNCH_ME_NOW frame is transmitted without waiting for
-                    // the next keep-alive or scheduled poll. Without this,
-                    // idle connections delay transmission by up to 15s.
-                    conn.wake_transmit();
-                    info!(
-                        "Successfully queued PUNCH_ME_NOW for relay to {}",
-                        target_addr
-                    );
-                    return Ok(());
-                }
-                Err(e) => {
-                    warn!("Failed to queue PUNCH_ME_NOW frame: {:?}", e);
-                    return Err(NatTraversalError::CoordinationFailed(format!(
-                        "Failed to send PUNCH_ME_NOW: {:?}",
-                        e
-                    )));
+            // Verify the low-level endpoint still tracks this connection.
+            // If it doesn't, the connection is a zombie — remove it and
+            // fall through to establish a new one.
+            let is_live = if let Some(ep) = &self.inner_endpoint {
+                ep.has_active_connection(&normalized_coordinator)
+            } else {
+                true // no endpoint, assume live
+            };
+
+            if !is_live {
+                warn!(
+                    "Coordinator connection {} is zombie (not in low-level endpoint), removing from DashMap",
+                    normalized_coordinator
+                );
+                drop(entry);
+                self.connections.remove(&normalized_coordinator);
+                // Fall through to "establish new connection" below
+            } else {
+                info!(
+                    "Sending PUNCH_ME_NOW via coordinator {} (normalized: {}) to target {}",
+                    coordinator, normalized_coordinator, target_addr
+                );
+
+                // Use round 1 for initial coordination
+                match conn.send_nat_punch_via_relay(target_wire_id, our_external_address, 1) {
+                    Ok(()) => {
+                        // Wake the connection driver immediately so the queued
+                        // PUNCH_ME_NOW frame is transmitted without waiting for
+                        // the next keep-alive or scheduled poll. Without this,
+                        // idle connections delay transmission by up to 15s.
+                        conn.wake_transmit();
+                        info!(
+                            "Successfully queued PUNCH_ME_NOW for relay to {}",
+                            target_addr
+                        );
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        warn!("Failed to queue PUNCH_ME_NOW frame: {:?}", e);
+                        return Err(NatTraversalError::CoordinationFailed(format!(
+                            "Failed to send PUNCH_ME_NOW: {:?}",
+                            e
+                        )));
+                    }
                 }
             }
         }
