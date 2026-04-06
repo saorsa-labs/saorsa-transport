@@ -567,34 +567,6 @@ impl BootstrapNode {
     }
 }
 
-/// A candidate pair for hole punching (ICE-like)
-#[derive(Debug, Clone)]
-pub struct CandidatePair {
-    /// Local candidate address
-    pub local_candidate: CandidateAddress,
-    /// Remote candidate address
-    pub remote_candidate: CandidateAddress,
-    /// Combined priority for this pair
-    pub priority: u64,
-    /// Current state of this candidate pair
-    pub state: CandidatePairState,
-}
-
-/// State of a candidate pair during hole punching
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CandidatePairState {
-    /// Waiting to be checked
-    Waiting,
-    /// Currently being checked
-    InProgress,
-    /// Check succeeded
-    Succeeded,
-    /// Check failed
-    Failed,
-    /// Cancelled due to higher priority success
-    Cancelled,
-}
-
 /// Active NAT traversal session state
 #[derive(Debug)]
 struct NatTraversalSession {
@@ -3236,20 +3208,12 @@ impl NatTraversalEndpoint {
         Ok(connection)
     }
 
-    // ─────────────────────────────────────────────────────────────────────
-    // Note: the historical `NatTraversalEndpoint::connect_with_fallback`
-    // method that lived here has been removed. It was an unused duplicate
-    // of `P2pEndpoint::connect_with_fallback` (in `p2p_endpoint.rs`), which
-    // is the actual production entry point reached through `LinkTransport::
-    // dial_addr` and the `saorsa-transport` example binary. The removed
-    // copy delegated to `attempt_hole_punching` (also removed below), an
-    // implementation that crafted a hand-rolled "PATH_CHALLENGE" UDP
-    // datagram on a freshly bound socket — both unworkable in practice
-    // (the bind raced Quinn for the port; the bytes were not a valid
-    // QUIC packet so the receiver dropped them) and misleading during
-    // debugging because the surrounding `#[allow(dead_code)]` markers
-    // disguised that nothing in the path could ever succeed.
-    // ─────────────────────────────────────────────────────────────────────
+    // Removed: the duplicate `NatTraversalEndpoint::connect_with_fallback`.
+    // Production hole-punch fallback lives in
+    // `crate::p2p_endpoint::P2pEndpoint::connect_with_fallback`, reached via
+    // `LinkTransport::dial_addr` and the `saorsa-transport` example binary.
+    // See the tombstone further down this file for the deleted helpers and
+    // why they could never have worked.
 
     /// Get the relay manager for advanced relay operations
     ///
@@ -4671,32 +4635,25 @@ impl NatTraversalEndpoint {
         Ok(frame)
     }
 
-    // ─────────────────────────────────────────────────────────────────────
-    // Removed: the dead `attempt_hole_punching` /
-    // `attempt_quic_hole_punching` / `get_candidate_pairs_for_addr` /
-    // `calculate_candidate_pair_priority` / `create_path_challenge_packet`
-    // / `store_successful_candidate_pair` / `get_successful_candidate_address`
-    // chain. These were only ever called from the duplicate
-    // `NatTraversalEndpoint::connect_with_fallback` (also removed above)
-    // and could not have worked in production:
-    //
-    //   1. `attempt_quic_hole_punching` bound a fresh `std::net::UdpSocket`
-    //      to the local candidate address, which always fails on a real
-    //      node because Quinn already owns the port — UDP binds are
-    //      exclusive.
-    //   2. The "QUIC packet" it sent was a hand-rolled byte sequence
-    //      (`0x40 [0,0,0,1] 0x1a <8 random>`) that is not a valid
-    //      encrypted QUIC packet, so any receiving Quinn endpoint
-    //      silently dropped it.
-    //   3. The success branch then waited 100 ms on a blocking
-    //      `recv_from` for a "response" that no compliant peer would
-    //      ever send.
+    // Removed: the dead `attempt_hole_punching` chain
+    // (`attempt_quic_hole_punching`, `get_candidate_pairs_for_addr`,
+    // `calculate_candidate_pair_priority`, `create_path_challenge_packet`,
+    // `store_successful_candidate_pair`, `get_successful_candidate_address`).
+    // Only ever called from the duplicate
+    // `NatTraversalEndpoint::connect_with_fallback` (also removed). Could
+    // not have worked in production: it bound a fresh `std::net::UdpSocket`
+    // to a port Quinn already owned (UDP binds are exclusive), then sent a
+    // hand-rolled `0x40 [0,0,0,1] 0x1a <8 random>` byte sequence that is
+    // not a valid encrypted QUIC packet (any receiver drops it), then
+    // blocked the async runtime in a 100 ms `recv_from` for a response no
+    // compliant peer would ever send. The `#[allow(dead_code)]` markers on
+    // every function disguised this from grep-driven debugging.
     //
     // Production hole-punch coordination lives in
     // `crate::p2p_endpoint::P2pEndpoint::connect_with_fallback_inner`,
-    // which uses the proper coordinator-mediated PUNCH_ME_NOW flow
-    // implemented elsewhere in this file.
-    // ─────────────────────────────────────────────────────────────────────
+    // which drives the coordinator-mediated PUNCH_ME_NOW flow whose
+    // server-side helpers (`send_coordination_request_with_peer_id`, etc.)
+    // are defined later in this file.
 
     /// Attempt connection to a specific candidate address
     fn attempt_connection_to_candidate(
