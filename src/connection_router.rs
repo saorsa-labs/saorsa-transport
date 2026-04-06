@@ -1083,24 +1083,27 @@ impl ConnectionRouter {
         // Adjust stats for fallback: the inner select_engine_detailed call
         // incremented the *preferred* counter, so when we actually fell
         // back we need to decrement it and increment the one we chose.
+        // Both operations must be atomic so concurrent callers (now allowed
+        // because the function takes `&self`) cannot lose updates.
         if result.is_fallback {
             match engine {
                 ProtocolEngine::Quic => {
                     self.stats.quic_selections.fetch_add(1, Ordering::Relaxed);
-                    // saturating_sub via CAS loop on relaxed load/store
-                    let cur = self.stats.constrained_selections.load(Ordering::Relaxed);
-                    self.stats
-                        .constrained_selections
-                        .store(cur.saturating_sub(1), Ordering::Relaxed);
+                    let _ = self.stats.constrained_selections.fetch_update(
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                        |v| Some(v.saturating_sub(1)),
+                    );
                 }
                 ProtocolEngine::Constrained => {
                     self.stats
                         .constrained_selections
                         .fetch_add(1, Ordering::Relaxed);
-                    let cur = self.stats.quic_selections.load(Ordering::Relaxed);
-                    self.stats
-                        .quic_selections
-                        .store(cur.saturating_sub(1), Ordering::Relaxed);
+                    let _ = self.stats.quic_selections.fetch_update(
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                        |v| Some(v.saturating_sub(1)),
+                    );
                 }
             }
         }

@@ -1014,9 +1014,14 @@ impl P2pEndpoint {
             return Err(EndpointError::ShuttingDown);
         }
 
-        // Use the router to determine the appropriate engine
-        let mut router = self.router.write().await;
-        let engine = router.select_engine_for_addr(addr);
+        // Use the router to determine the appropriate engine.
+        //
+        // Engine selection only needs a read lock now that
+        // `select_engine_for_addr` takes `&self` and uses atomic counters.
+        // The Constrained branch then re-acquires a write lock for
+        // `router.connect(addr)`, which is still `&mut self`. The QUIC
+        // branch never needs a write lock at all.
+        let engine = self.router.read().await.select_engine_for_addr(addr);
 
         info!("Connecting to {} via {:?} engine", addr, engine);
 
@@ -1029,11 +1034,11 @@ impl P2pEndpoint {
                         addr
                     ))
                 })?;
-                drop(router); // Release lock before async operation
                 self.connect(socket_addr).await
             }
             ProtocolEngine::Constrained => {
-                // For constrained transports, use the router's constrained connection
+                // For constrained transports, use the router's constrained connection.
+                let mut router = self.router.write().await;
                 let _routed = router.connect(addr).map_err(|e| {
                     EndpointError::Connection(format!("Constrained connection failed: {}", e))
                 })?;
