@@ -92,6 +92,19 @@ const STALE_REAPER_INTERVAL: Duration = Duration::from_secs(10);
 /// through the pinhole needs only 1-2 RTTs (~600ms at 300ms worst-case RTT).
 const POST_HOLEPUNCH_DIRECT_RETRY_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// Per-attempt hole-punch timeout used when rotating through a list of
+/// preferred coordinators. Kept short so a busy or unreachable coordinator
+/// is abandoned quickly and the next one in the list is tried; the *last*
+/// coordinator in the rotation falls back to the strategy's full
+/// hole-punch timeout to give it time to actually complete the punch.
+///
+/// Tuned for the Tier 2 + Tier 4 (lite) coordinator-rotation flow: 1.5s
+/// is comfortably above one round-trip on most internet links but well
+/// below the strategy default (~8s), so the worst-case wait for K
+/// preferred coordinators is roughly `(K-1) * 1.5s + 8s` instead of
+/// `K * 8s`.
+const PER_COORDINATOR_QUICK_HOLEPUNCH_TIMEOUT: Duration = Duration::from_millis(1500);
+
 use crate::SHUTDOWN_DRAIN_TIMEOUT;
 
 /// Extract the raw SPKI (SubjectPublicKeyInfo) bytes from a QUIC connection's
@@ -176,12 +189,17 @@ pub struct P2pEndpoint {
     /// address so concurrent dials don't race on shared state.
     hole_punch_target_peer_ids: Arc<dashmap::DashMap<SocketAddr, [u8; 32]>>,
 
-    /// Per-target preferred coordinator for hole-punch relay. When the DHT
-    /// lookup discovers a peer via a FindNode response from another node, that
-    /// responding node (the "referrer") has a connection to the discovered peer
-    /// and is an ideal coordinator for PUNCH_ME_NOW relay. Keyed by target
-    /// address, value is the referrer's socket address.
-    hole_punch_preferred_coordinators: Arc<dashmap::DashMap<SocketAddr, SocketAddr>>,
+    /// Per-target preferred coordinators for hole-punch relay. When the DHT
+    /// lookup discovers a peer via FindNode responses from one or more peers,
+    /// those responding nodes (the "referrers") all have a connection to the
+    /// discovered peer and are good coordinator candidates. Keyed by target
+    /// address, value is an ordered list of referrer socket addresses ranked
+    /// best-first by the caller (e.g. by DHT lookup round, trust score).
+    /// During hole-punching the list is iterated front to back: the first
+    /// candidates get a short per-attempt timeout so we rotate quickly past
+    /// busy or unreachable coordinators; the last candidate gets the full
+    /// hole-punch timeout to give it time to actually complete the punch.
+    hole_punch_preferred_coordinators: Arc<dashmap::DashMap<SocketAddr, Vec<SocketAddr>>>,
 
     /// Channel sender for data received from QUIC reader tasks and constrained poller
     data_tx: mpsc::Sender<(SocketAddr, Vec<u8>)>,
@@ -1227,16 +1245,61 @@ impl P2pEndpoint {
         self.hole_punch_target_peer_ids.insert(target, peer_id);
     }
 
-    /// Set a preferred coordinator for hole-punching to a specific target.
-    /// The preferred coordinator is a peer that referred us to the target
-    /// during a DHT lookup, so it has a connection to the target.
+    /// Set an ordered list of preferred coordinators for hole-punching to a
+    /// specific target.
+    ///
+    /// The caller (typically saorsa-core's DHT layer) is expected to rank
+    /// the list best-first using its own quality signals — e.g. DHT lookup
+    /// round, trust score, observed latency. During hole-punching the list
+    /// is iterated front to back: the first `coordinators.len() - 1` get a
+    /// short per-attempt timeout so a busy or unreachable coordinator is
+    /// abandoned quickly; the last coordinator gets the full strategy
+    /// hole-punch timeout to give it time to complete the punch.
+    ///
+    /// Empty `coordinators` removes any preferred coordinators for `target`.
+    ///
+    /// ## Interaction with `StrategyConfig::max_holepunch_rounds`
+    ///
+    /// Each rotation step in the connect loop calls
+    /// `ConnectionStrategy::increment_round`, so the strategy's per-round
+    /// counter and the rotation index advance together. With the default
+    /// `max_holepunch_rounds = 2`, supplying `K ≥ 2` preferred coordinators
+    /// gives each coordinator (including the final one) exactly one
+    /// attempt — the rotation fully replaces the legacy retry loop and the
+    /// worst-case dial time is `(K-1) * 1.5s + 8s`.
+    ///
+    /// If a caller has explicitly raised `max_holepunch_rounds` (e.g.
+    /// `with_max_holepunch_rounds(5)`) **and** also supplies a preferred
+    /// list, the *final* coordinator inherits the leftover round budget
+    /// — it will be retried `max_rounds - K + 1` times at the full
+    /// hole-punch timeout. This is usually fine but worth knowing if you
+    /// were expecting the rotation to be the only retry mechanism.
+    pub async fn set_hole_punch_preferred_coordinators(
+        &self,
+        target: SocketAddr,
+        coordinators: Vec<SocketAddr>,
+    ) {
+        if coordinators.is_empty() {
+            self.hole_punch_preferred_coordinators.remove(&target);
+        } else {
+            self.hole_punch_preferred_coordinators
+                .insert(target, coordinators);
+        }
+    }
+
+    /// Set a single preferred coordinator for hole-punching to a specific
+    /// target.
+    ///
+    /// Thin wrapper around [`Self::set_hole_punch_preferred_coordinators`]
+    /// retained for callers that have only one coordinator candidate. New
+    /// callers should prefer the list form.
     pub async fn set_hole_punch_preferred_coordinator(
         &self,
         target: SocketAddr,
         coordinator: SocketAddr,
     ) {
-        self.hole_punch_preferred_coordinators
-            .insert(target, coordinator);
+        self.set_hole_punch_preferred_coordinators(target, vec![coordinator])
+            .await;
     }
 
     /// Connect with automatic fallback: Direct → HolePunch → Relay.
@@ -1312,6 +1375,38 @@ impl P2pEndpoint {
         result
     }
 
+    /// Merge a ranked list of preferred hole-punch coordinators into the
+    /// front of `coordinator_candidates`, preserving the relative order of
+    /// `preferred` and removing any pre-existing duplicates from the
+    /// candidate list.
+    ///
+    /// After this call returns, `coordinator_candidates[0..preferred.len()]`
+    /// equals `preferred` (in order). The hole-punch loop uses
+    /// `preferred.len()` directly to decide which attempts get the short
+    /// rotation timeout vs. the strategy's full hole-punch timeout.
+    ///
+    /// Pure function (no `&self`, no I/O) — extracted from
+    /// `connect_with_fallback_inner` so the front-insertion behaviour can
+    /// be unit-tested without spinning up a full endpoint.
+    fn merge_preferred_coordinators(
+        coordinator_candidates: &mut Vec<SocketAddr>,
+        preferred: &[SocketAddr],
+    ) {
+        if preferred.is_empty() {
+            return;
+        }
+        // Drop any pre-existing copies of the preferred entries from the
+        // tail so we don't end up with duplicates after the front-insert.
+        coordinator_candidates.retain(|a| !preferred.contains(a));
+        // Build the merged list in one allocation rather than calling
+        // `Vec::insert(0, ..)` in a loop (which shifts the entire tail
+        // on every iteration — O(N·M) instead of O(N+M)).
+        let mut merged = Vec::with_capacity(preferred.len() + coordinator_candidates.len());
+        merged.extend_from_slice(preferred);
+        merged.append(coordinator_candidates);
+        *coordinator_candidates = merged;
+    }
+
     /// Inner implementation of connect_with_fallback (separated for dedup wrapper).
     async fn connect_with_fallback_inner(
         &self,
@@ -1343,17 +1438,32 @@ impl P2pEndpoint {
             }
         }
 
-        // If the DHT referrer set a preferred coordinator for this target,
-        // move it to the front of the candidate list so round 1 uses it.
+        // If the DHT layer set preferred coordinators for this target, move
+        // them to the front of the candidate list in order so the hole-punch
+        // loop tries them first. Each preferred coordinator is removed from
+        // its existing position (if any) before being inserted at the front
+        // so the relative ordering of the preferred list is preserved.
+        //
+        // `preferred_coordinator_count` is captured for the hole-punch loop:
+        // when > 0 the loop rotates through `coordinator_candidates[0..count]`
+        // with `PER_COORDINATOR_QUICK_HOLEPUNCH_TIMEOUT` per non-final attempt,
+        // and the strategy's full timeout for the last attempt. When 0 the
+        // loop falls back to the existing single-coordinator retry behaviour.
+        let mut preferred_coordinator_count: usize = 0;
         if let Some(target_addr) = target {
             if let Some(preferred) = self.hole_punch_preferred_coordinators.get(&target_addr) {
-                let preferred_addr = *preferred;
-                coordinator_candidates.retain(|a| *a != preferred_addr);
-                coordinator_candidates.insert(0, preferred_addr);
-                info!(
-                    "Using preferred coordinator {} for target {} (DHT referrer)",
-                    preferred_addr, target_addr
-                );
+                let preferred_list: Vec<SocketAddr> = preferred.clone();
+                drop(preferred); // Release the DashMap entry guard before mutating coordinator_candidates.
+                Self::merge_preferred_coordinators(&mut coordinator_candidates, &preferred_list);
+                preferred_coordinator_count = preferred_list.len();
+                if preferred_coordinator_count > 0 {
+                    info!(
+                        "Using {} preferred coordinator(s) for target {} (DHT referrers): {:?}",
+                        preferred_list.len(),
+                        target_addr,
+                        preferred_list
+                    );
+                }
             } else {
                 info!(
                     "No preferred coordinator for target {} (not discovered via DHT referral)",
@@ -1437,6 +1547,14 @@ impl P2pEndpoint {
         if let Some(v4) = target_ipv4 {
             direct_addresses.push(v4);
         }
+
+        // Index of the preferred coordinator currently being attempted (when
+        // `preferred_coordinator_count > 0`). The hole-punch loop advances
+        // this on each failed round and uses it together with
+        // `preferred_coordinator_count` to decide whether the *next* attempt
+        // is the final one (full strategy timeout) or an interim rotation
+        // attempt (`PER_COORDINATOR_QUICK_HOLEPUNCH_TIMEOUT`).
+        let mut current_preferred_coordinator_idx: usize = 0;
 
         loop {
             // Check if a previous hole-punch attempt established the connection
@@ -1578,44 +1696,113 @@ impl P2pEndpoint {
                         .or(target_ipv6)
                         .ok_or(EndpointError::NoAddress)?;
 
+                    // Coordinator-rotation policy (Tier 2):
+                    //
+                    // When `preferred_coordinator_count > 0` we have a ranked
+                    // list of DHT-supplied coordinators at
+                    // `coordinator_candidates[0..preferred_coordinator_count]`
+                    // and we rotate through them on each failed round. The
+                    // first `count - 1` attempts use a short timeout
+                    // (`PER_COORDINATOR_QUICK_HOLEPUNCH_TIMEOUT`) so a busy or
+                    // unreachable coordinator is abandoned quickly; the final
+                    // attempt uses the strategy's full hole-punch timeout to
+                    // give it time to actually complete.
+                    //
+                    // When `preferred_coordinator_count == 0` (no DHT
+                    // referrers — first contact, or non-DHT dial) we fall
+                    // back to the legacy single-coordinator behaviour:
+                    // strategy timeout per round, retry the same coordinator
+                    // until `should_retry_holepunch` is exhausted.
+                    let is_rotating = preferred_coordinator_count > 0;
+                    let is_final_rotation_attempt = is_rotating
+                        && current_preferred_coordinator_idx + 1 >= preferred_coordinator_count;
+                    let attempt_timeout = if is_rotating && !is_final_rotation_attempt {
+                        PER_COORDINATOR_QUICK_HOLEPUNCH_TIMEOUT
+                    } else {
+                        strategy.holepunch_timeout()
+                    };
+
+                    // Invariant: while rotating, the strategy's current
+                    // coordinator must equal `coordinator_candidates[idx]`.
+                    // This is maintained by `set_coordinator()` on every
+                    // rotation step; the assert catches any future
+                    // regression where a caller sets the strategy's
+                    // coordinator out of band without updating the
+                    // candidate list.
+                    debug_assert!(
+                        !is_rotating
+                            || coordinator_candidates
+                                .get(current_preferred_coordinator_idx)
+                                .copied()
+                                == Some(coordinator),
+                        "rotation index out of sync with strategy coordinator: idx={}, coord={}, candidates={:?}",
+                        current_preferred_coordinator_idx,
+                        coordinator,
+                        coordinator_candidates,
+                    );
+
                     info!(
-                        "Trying hole-punch to {} via {} (round {})",
-                        target, coordinator, round
+                        "Trying hole-punch to {} via {} (round {}, attempt timeout {:?}, rotating={})",
+                        target, coordinator, round, attempt_timeout, is_rotating
                     );
 
                     // Use our existing NAT traversal infrastructure
-                    match timeout(
-                        strategy.holepunch_timeout(),
-                        self.try_hole_punch(target, coordinator),
-                    )
-                    .await
-                    {
+                    let attempt_result =
+                        timeout(attempt_timeout, self.try_hole_punch(target, coordinator)).await;
+
+                    // Common post-attempt step: try a quick direct connect.
+                    // The NAT binding may have been created by the target's
+                    // outgoing packets even though our try_hole_punch didn't
+                    // detect the connection.
+                    let post_direct = async {
+                        if let Ok(Ok(peer_conn)) =
+                            timeout(POST_HOLEPUNCH_DIRECT_RETRY_TIMEOUT, self.connect(target)).await
+                        {
+                            info!("✓ Post-hole-punch direct connect succeeded to {}", target);
+                            Some(peer_conn)
+                        } else {
+                            None
+                        }
+                    };
+
+                    match attempt_result {
                         Ok(Ok(conn)) => {
                             info!("✓ Hole-punch succeeded to {} via {}", target, coordinator);
                             return Ok((conn, ConnectionMethod::HolePunched { coordinator }));
                         }
                         Ok(Err(e)) => {
-                            // After a failed hole-punch round, try a quick direct
-                            // connect — the NAT binding may have been created by
-                            // the target's outgoing packets even though our
-                            // try_hole_punch didn't detect the connection.
-                            if let Ok(Ok(peer_conn)) =
-                                timeout(POST_HOLEPUNCH_DIRECT_RETRY_TIMEOUT, self.connect(target))
-                                    .await
-                            {
-                                info!("✓ Post-hole-punch direct connect succeeded to {}", target);
+                            if let Some(peer_conn) = post_direct.await {
                                 return Ok((
                                     peer_conn,
                                     ConnectionMethod::HolePunched { coordinator },
                                 ));
                             }
                             strategy.record_holepunch_error(round, e.to_string());
-                            if strategy.should_retry_holepunch() {
-                                // Keep the same coordinator for retries. The preferred
-                                // coordinator (index 0) was chosen because it has a
-                                // known connection to the target. Switching to a random
-                                // fallback wastes another round on a coordinator that
-                                // likely can't relay to the target.
+                            // Bounds-safe rotation: bail out of rotation and
+                            // fall back to relay if for any reason the index
+                            // would go out of bounds (defensive — by
+                            // construction the bound holds while
+                            // `current_preferred_coordinator_idx + 1 < preferred_coordinator_count`).
+                            let next_coord = if is_rotating && !is_final_rotation_attempt {
+                                coordinator_candidates
+                                    .get(current_preferred_coordinator_idx + 1)
+                                    .copied()
+                            } else {
+                                None
+                            };
+                            if let Some(next_coord) = next_coord {
+                                current_preferred_coordinator_idx += 1;
+                                info!(
+                                    "Hole-punch via {} failed ({}), rotating to preferred coordinator {}/{}: {}",
+                                    coordinator,
+                                    e,
+                                    current_preferred_coordinator_idx + 1,
+                                    preferred_coordinator_count,
+                                    next_coord
+                                );
+                                strategy.set_coordinator(next_coord);
+                                strategy.increment_round();
+                            } else if strategy.should_retry_holepunch() {
                                 info!(
                                     "Hole-punch round {} failed, retrying with same coordinator",
                                     round
@@ -1627,19 +1814,33 @@ impl P2pEndpoint {
                             }
                         }
                         Err(_) => {
-                            // Same: try a quick direct connect after timeout
-                            if let Ok(Ok(peer_conn)) =
-                                timeout(POST_HOLEPUNCH_DIRECT_RETRY_TIMEOUT, self.connect(target))
-                                    .await
-                            {
-                                info!("✓ Post-hole-punch direct connect succeeded to {}", target);
+                            if let Some(peer_conn) = post_direct.await {
                                 return Ok((
                                     peer_conn,
                                     ConnectionMethod::HolePunched { coordinator },
                                 ));
                             }
                             strategy.record_holepunch_error(round, "Timeout".to_string());
-                            if strategy.should_retry_holepunch() {
+                            let next_coord = if is_rotating && !is_final_rotation_attempt {
+                                coordinator_candidates
+                                    .get(current_preferred_coordinator_idx + 1)
+                                    .copied()
+                            } else {
+                                None
+                            };
+                            if let Some(next_coord) = next_coord {
+                                current_preferred_coordinator_idx += 1;
+                                info!(
+                                    "Hole-punch via {} timed out after {:?}, rotating to preferred coordinator {}/{}: {}",
+                                    coordinator,
+                                    attempt_timeout,
+                                    current_preferred_coordinator_idx + 1,
+                                    preferred_coordinator_count,
+                                    next_coord
+                                );
+                                strategy.set_coordinator(next_coord);
+                                strategy.increment_round();
+                            } else if strategy.should_retry_holepunch() {
                                 info!(
                                     "Hole-punch round {} timed out, retrying with same coordinator",
                                     round
@@ -3818,5 +4019,87 @@ mod tests {
         // Verify transport address is preserved
         assert_eq!(conn.remote_addr, TransportAddr::Quic(socket_addr));
         assert!(conn.authenticated);
+    }
+
+    // ---- Tier 2: preferred-coordinator front-merge ----
+
+    fn make_addr(octet: u8) -> SocketAddr {
+        SocketAddr::from(([10, 0, 0, octet], 9000))
+    }
+
+    #[test]
+    fn merge_preferred_coordinators_empty_preferred_is_no_op() {
+        let mut candidates = vec![make_addr(1), make_addr(2)];
+        let original = candidates.clone();
+        P2pEndpoint::merge_preferred_coordinators(&mut candidates, &[]);
+        assert_eq!(
+            candidates, original,
+            "empty preferred must not mutate the candidate list"
+        );
+    }
+
+    #[test]
+    fn merge_preferred_coordinators_inserts_at_front_in_order() {
+        let mut candidates = vec![make_addr(10), make_addr(11)];
+        let preferred = vec![make_addr(1), make_addr(2), make_addr(3)];
+        P2pEndpoint::merge_preferred_coordinators(&mut candidates, &preferred);
+
+        assert_eq!(
+            candidates,
+            vec![
+                make_addr(1),
+                make_addr(2),
+                make_addr(3),
+                make_addr(10),
+                make_addr(11),
+            ],
+            "preferred entries must occupy [0..preferred.len()] in order"
+        );
+    }
+
+    #[test]
+    fn merge_preferred_coordinators_dedupes_existing_entries() {
+        // make_addr(2) is BOTH a pre-existing candidate AND in the preferred
+        // list. After the merge it should appear exactly once, at its
+        // preferred-list position (index 1), not at its original tail spot.
+        let mut candidates = vec![make_addr(2), make_addr(10), make_addr(11)];
+        let preferred = vec![make_addr(1), make_addr(2)];
+        P2pEndpoint::merge_preferred_coordinators(&mut candidates, &preferred);
+
+        assert_eq!(
+            candidates,
+            vec![make_addr(1), make_addr(2), make_addr(10), make_addr(11),],
+            "duplicate preferred entries must end up in the preferred slot, not the tail"
+        );
+        // No accidental duplication.
+        assert_eq!(
+            candidates.iter().filter(|a| **a == make_addr(2)).count(),
+            1,
+            "make_addr(2) must appear exactly once after dedup"
+        );
+    }
+
+    #[test]
+    fn merge_preferred_coordinators_only_dedupes_preferred_entries() {
+        // Pre-existing candidates that are NOT in the preferred list must
+        // remain in their original tail order.
+        let mut candidates = vec![make_addr(10), make_addr(11), make_addr(12)];
+        let preferred = vec![make_addr(1)];
+        P2pEndpoint::merge_preferred_coordinators(&mut candidates, &preferred);
+
+        assert_eq!(
+            candidates,
+            vec![make_addr(1), make_addr(10), make_addr(11), make_addr(12),],
+            "non-preferred candidates must keep their original relative order"
+        );
+    }
+
+    #[test]
+    fn merge_preferred_coordinators_works_on_empty_candidate_list() {
+        let mut candidates: Vec<SocketAddr> = Vec::new();
+        let preferred = vec![make_addr(1), make_addr(2)];
+        P2pEndpoint::merge_preferred_coordinators(&mut candidates, &preferred);
+
+        assert_eq!(candidates, vec![make_addr(1), make_addr(2)]);
     }
 }

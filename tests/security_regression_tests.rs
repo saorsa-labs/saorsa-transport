@@ -37,6 +37,8 @@ fn test_peer_config() -> NatTraversalConfig {
         transport_registry: None,
         max_message_size: saorsa_transport::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
         allow_loopback: true,
+        coordinator_max_active_relays: 32,
+        coordinator_relay_slot_idle_timeout: Duration::from_secs(5),
         upnp: Default::default(),
     }
 }
@@ -62,6 +64,8 @@ fn test_server_config() -> NatTraversalConfig {
         transport_registry: None,
         max_message_size: saorsa_transport::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
         allow_loopback: true,
+        coordinator_max_active_relays: 32,
+        coordinator_relay_slot_idle_timeout: Duration::from_secs(5),
         upnp: Default::default(),
     }
 }
@@ -110,6 +114,8 @@ async fn test_error_handling_no_panic() {
         transport_registry: None,
         max_message_size: saorsa_transport::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
         allow_loopback: true,
+        coordinator_max_active_relays: 32,
+        coordinator_relay_slot_idle_timeout: Duration::from_secs(5),
         upnp: Default::default(),
     };
 
@@ -139,6 +145,8 @@ async fn test_error_handling_no_panic() {
         transport_registry: None,
         max_message_size: saorsa_transport::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
         allow_loopback: true,
+        coordinator_max_active_relays: 32,
+        coordinator_relay_slot_idle_timeout: Duration::from_secs(5),
         upnp: Default::default(),
     };
 
@@ -231,6 +239,8 @@ async fn test_malformed_config_handling() {
         transport_registry: None,
         max_message_size: saorsa_transport::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
         allow_loopback: true,
+        coordinator_max_active_relays: 32,
+        coordinator_relay_slot_idle_timeout: Duration::from_secs(5),
         upnp: Default::default(),
     };
 
@@ -261,6 +271,8 @@ async fn test_malformed_config_handling() {
         transport_registry: None,
         max_message_size: saorsa_transport::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
         allow_loopback: true,
+        coordinator_max_active_relays: 32,
+        coordinator_relay_slot_idle_timeout: Duration::from_secs(5),
         upnp: Default::default(),
     };
 
@@ -298,6 +310,8 @@ async fn test_input_sanitization() {
         transport_registry: None,
         max_message_size: saorsa_transport::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
         allow_loopback: true,
+        coordinator_max_active_relays: 32,
+        coordinator_relay_slot_idle_timeout: Duration::from_secs(5),
         upnp: Default::default(),
     };
 
@@ -370,6 +384,8 @@ mod specific_regression_tests {
             transport_registry: None,
             max_message_size: saorsa_transport::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
             allow_loopback: true,
+            coordinator_max_active_relays: 32,
+            coordinator_relay_slot_idle_timeout: Duration::from_secs(5),
             upnp: Default::default(),
         };
 
@@ -422,6 +438,8 @@ mod specific_regression_tests {
             transport_registry: None,
             max_message_size: saorsa_transport::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
             allow_loopback: true,
+            coordinator_max_active_relays: 32,
+            coordinator_relay_slot_idle_timeout: Duration::from_secs(5),
             upnp: Default::default(),
         };
 
