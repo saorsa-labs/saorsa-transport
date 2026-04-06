@@ -65,6 +65,19 @@ pub struct TransportConfig {
 
     /// Allow loopback addresses as valid NAT traversal candidates
     pub(crate) allow_loopback: bool,
+
+    /// Maximum number of concurrent hole-punch relay slots this node will
+    /// service when acting as a coordinator (Tier 4 lite back-pressure).
+    /// When the active count reaches this cap, incoming `PUNCH_ME_NOW`
+    /// frames that would otherwise be relayed are silently refused so the
+    /// initiator advances to its next preferred coordinator.
+    pub(crate) coordinator_max_active_relays: usize,
+
+    /// Reclamation timeout for stale coordinator relay slots. Acts as a
+    /// safety net so a relay slot cannot leak forever if a peer crashes
+    /// mid-coordination, a NAT rebind silently drops the session, or a
+    /// follow-up signal is lost.
+    pub(crate) coordinator_relay_slot_timeout: Duration,
 }
 
 impl TransportConfig {
@@ -470,6 +483,21 @@ impl TransportConfig {
         self.allow_loopback = allow;
         self
     }
+
+    /// Cap on simultaneous hole-punch relay slots when this node acts as a
+    /// coordinator. Higher = more concurrency capacity, lower = stricter
+    /// back-pressure shedding under storm load. Default: 32.
+    pub fn coordinator_max_active_relays(&mut self, max: usize) -> &mut Self {
+        self.coordinator_max_active_relays = max;
+        self
+    }
+
+    /// Maximum lifetime of a coordinator relay slot before it is reclaimed
+    /// by the inline garbage-collection sweep. Default: 5 seconds.
+    pub fn coordinator_relay_slot_timeout(&mut self, timeout: Duration) -> &mut Self {
+        self.coordinator_relay_slot_timeout = timeout;
+        self
+    }
 }
 
 impl Default for TransportConfig {
@@ -523,6 +551,11 @@ impl Default for TransportConfig {
                 ml_dsa_65: false,
             }),
             allow_loopback: false,
+            // Tier 4 (lite) coordinator back-pressure defaults. See
+            // `coordinator_max_active_relays`/`coordinator_relay_slot_timeout`
+            // setters for the rationale behind these numbers.
+            coordinator_max_active_relays: 32,
+            coordinator_relay_slot_timeout: Duration::from_secs(5),
         }
     }
 }
@@ -559,6 +592,8 @@ impl fmt::Debug for TransportConfig {
             address_discovery_config,
             pqc_algorithms,
             allow_loopback,
+            coordinator_max_active_relays,
+            coordinator_relay_slot_timeout,
         } = self;
         fmt.debug_struct("TransportConfig")
             .field("max_concurrent_bidi_streams", max_concurrent_bidi_streams)
@@ -591,6 +626,14 @@ impl fmt::Debug for TransportConfig {
             .field("address_discovery_config", address_discovery_config)
             .field("pqc_algorithms", pqc_algorithms)
             .field("allow_loopback", allow_loopback)
+            .field(
+                "coordinator_max_active_relays",
+                coordinator_max_active_relays,
+            )
+            .field(
+                "coordinator_relay_slot_timeout",
+                coordinator_relay_slot_timeout,
+            )
             .finish_non_exhaustive()
     }
 }

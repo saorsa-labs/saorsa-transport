@@ -492,6 +492,45 @@ pub struct NatTraversalConfig {
     #[serde(default)]
     pub allow_loopback: bool,
 
+    /// Maximum number of concurrent hole-punch relay slots this node will
+    /// service as a coordinator.
+    ///
+    /// When the active relay count reaches this cap, incoming `PUNCH_ME_NOW`
+    /// frames that would otherwise be relayed are *silently refused*: the
+    /// coordinator drops the relay without notifying the initiator. The
+    /// initiator's per-attempt timeout (Tier 2 rotation) drives it to
+    /// advance to the next preferred coordinator in its list.
+    ///
+    /// Defaults to [`NatTraversalConfig::DEFAULT_COORDINATOR_MAX_ACTIVE_RELAYS`]
+    /// (32). Picked as roughly 32% of saorsa-core's 100-connection cap so
+    /// the coordinator still has headroom for its own peer traffic, while
+    /// being low enough that a cold-start storm is shed and pushed onto
+    /// alternates.
+    ///
+    /// Each "active relay" represents one in-flight initiator→target
+    /// coordination, indexed by `(initiator_peer_id, target_peer_id)`. The
+    /// counter is decremented when the relay completes or after
+    /// [`Self::coordinator_relay_slot_timeout`] elapses (whichever first).
+    #[serde(default = "default_coordinator_max_active_relays")]
+    pub coordinator_max_active_relays: usize,
+
+    /// Maximum lifetime of a coordinator relay slot before it is reclaimed
+    /// by the inline garbage-collection sweep.
+    ///
+    /// A successful hole-punch typically completes in 1-3 seconds; this
+    /// timeout exists purely as a safety net so that a relay slot cannot
+    /// leak forever if a peer crashes mid-coordination, a NAT rebind
+    /// silently drops the session, or a follow-up signal is lost. Without
+    /// it the active-relay counter would drift upward over time and the
+    /// coordinator would eventually refuse legitimate traffic.
+    ///
+    /// Defaults to [`NatTraversalConfig::DEFAULT_COORDINATOR_RELAY_SLOT_TIMEOUT`]
+    /// (5 seconds): comfortably above the worst-case successful punch
+    /// latency on high-RTT links, but short enough to keep ghost slots
+    /// from impacting steady-state burst capacity.
+    #[serde(default = "default_coordinator_relay_slot_timeout")]
+    pub coordinator_relay_slot_timeout: Duration,
+
     /// Best-effort UPnP IGD port mapping configuration.
     ///
     /// When enabled, the endpoint asks the local Internet Gateway Device
@@ -507,6 +546,24 @@ pub struct NatTraversalConfig {
 
 fn default_max_message_size() -> usize {
     crate::unified_config::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE
+}
+
+fn default_coordinator_max_active_relays() -> usize {
+    NatTraversalConfig::DEFAULT_COORDINATOR_MAX_ACTIVE_RELAYS
+}
+
+fn default_coordinator_relay_slot_timeout() -> Duration {
+    NatTraversalConfig::DEFAULT_COORDINATOR_RELAY_SLOT_TIMEOUT
+}
+
+impl NatTraversalConfig {
+    /// Default cap on simultaneous coordinator relay slots.
+    /// See [`Self::coordinator_max_active_relays`] for rationale.
+    pub const DEFAULT_COORDINATOR_MAX_ACTIVE_RELAYS: usize = 32;
+
+    /// Default reclamation timeout for stale coordinator relay slots.
+    /// See [`Self::coordinator_relay_slot_timeout`] for rationale.
+    pub const DEFAULT_COORDINATOR_RELAY_SLOT_TIMEOUT: Duration = Duration::from_secs(5);
 }
 
 /// Convert `max_message_size` to a QUIC `VarInt` for stream/send window configuration.
@@ -1088,6 +1145,8 @@ impl Default for NatTraversalConfig {
             transport_registry: None, // Use direct UDP binding by default
             max_message_size: crate::unified_config::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
             allow_loopback: false,
+            coordinator_max_active_relays: Self::DEFAULT_COORDINATOR_MAX_ACTIVE_RELAYS,
+            coordinator_relay_slot_timeout: Self::DEFAULT_COORDINATOR_RELAY_SLOT_TIMEOUT,
             upnp: crate::upnp::UpnpConfig::default(),
         }
     }
@@ -1137,6 +1196,20 @@ impl ConfigValidator for NatTraversalConfig {
                 "max_concurrent_attempts cannot exceed max_candidates".to_string(),
             ));
         }
+
+        // Validate coordinator back-pressure limits (Tier 4 lite).
+        validate_range(
+            self.coordinator_max_active_relays,
+            1,
+            256,
+            "coordinator_max_active_relays",
+        )?;
+        validate_duration(
+            self.coordinator_relay_slot_timeout,
+            Duration::from_millis(100),
+            Duration::from_secs(60),
+            "coordinator_relay_slot_timeout",
+        )?;
 
         Ok(())
     }
@@ -2613,6 +2686,8 @@ impl NatTraversalEndpoint {
             };
             transport_config.nat_traversal_config(Some(nat_config));
             transport_config.allow_loopback(config.allow_loopback);
+            transport_config.coordinator_max_active_relays(config.coordinator_max_active_relays);
+            transport_config.coordinator_relay_slot_timeout(config.coordinator_relay_slot_timeout);
 
             server_config.transport_config(Arc::new(transport_config));
 
@@ -2684,6 +2759,8 @@ impl NatTraversalEndpoint {
             };
             transport_config.nat_traversal_config(Some(nat_config));
             transport_config.allow_loopback(config.allow_loopback);
+            transport_config.coordinator_max_active_relays(config.coordinator_max_active_relays);
+            transport_config.coordinator_relay_slot_timeout(config.coordinator_relay_slot_timeout);
 
             client_config.transport_config(Arc::new(transport_config));
 

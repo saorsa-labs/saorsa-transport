@@ -1820,15 +1820,25 @@ impl NatTraversalState {
     ///
     /// v0.13.0: Role parameter removed - all nodes are symmetric P2P nodes.
     /// Every node can initiate, accept, and coordinate NAT traversal.
+    ///
+    /// `coordinator_max_active_relays` and `coordinator_relay_slot_timeout`
+    /// configure Tier 4 (lite) coordinator-side back-pressure: when this
+    /// node acts as a hole-punch coordinator, it will silently refuse new
+    /// `PUNCH_ME_NOW` relays once `coordinator_max_active_relays` slots are
+    /// in flight, and reclaim stale slots that exceed the timeout.
     pub(super) fn new(
         max_candidates: u32,
         coordination_timeout: Duration,
         allow_loopback: bool,
+        coordinator_max_active_relays: usize,
+        coordinator_relay_slot_timeout: Duration,
     ) -> Self {
         // v0.13.0: All nodes can coordinate - always create coordinator
         let bootstrap_coordinator = Some(BootstrapCoordinator::new(
             BootstrapConfig::default(),
             allow_loopback,
+            coordinator_max_active_relays,
+            coordinator_relay_slot_timeout,
         ));
 
         Self {
@@ -3556,6 +3566,22 @@ pub(crate) struct BootstrapCoordinator {
     security_validator: SecurityValidationState,
     /// Statistics for bootstrap operations
     stats: BootstrapStats,
+    /// Active hole-punch relay slots indexed by `(initiator_peer_id,
+    /// target_peer_id)`. Each entry records the wall-clock arrival time of
+    /// the `PUNCH_ME_NOW` frame that opened the slot. Slots are reclaimed
+    /// either implicitly (when a follow-up frame from the same pair lands)
+    /// or by the inline garbage-collection sweep run on every incoming
+    /// frame: any slot older than `coordinator_relay_slot_timeout` is
+    /// evicted before the back-pressure check, which keeps the active
+    /// count from leaking on ghost sessions where the initiator crashed
+    /// or the target became unreachable mid-coordination.
+    relay_slots: HashMap<(PeerId, PeerId), Instant>,
+    /// Cap on simultaneous relay slots (Tier 4 lite back-pressure).
+    /// Plumbed from [`crate::config::TransportConfig::coordinator_max_active_relays`].
+    relay_slot_capacity: usize,
+    /// Reclamation timeout for stale relay slots. Plumbed from
+    /// [`crate::config::TransportConfig::coordinator_relay_slot_timeout`].
+    relay_slot_timeout: Duration,
 }
 // Removed legacy CoordinationSessionId type
 /// Peer identifier for bootstrap coordination
@@ -3641,18 +3667,46 @@ pub(crate) struct BootstrapStats {
     successful_coordinations: u64,
     /// Security rejections
     security_rejections: u64,
+    /// Refusals due to active-relay back-pressure (Tier 4 lite). Tracks the
+    /// number of `PUNCH_ME_NOW` frames silently dropped because the
+    /// coordinator was at `relay_slot_capacity` when they arrived.
+    backpressure_refusals: u64,
 }
 // Removed session state machine enums and recovery actions
 impl BootstrapCoordinator {
-    /// Create a new bootstrap coordinator
-    pub(crate) fn new(_config: BootstrapConfig, allow_loopback: bool) -> Self {
+    /// Create a new bootstrap coordinator.
+    ///
+    /// `relay_slot_capacity` and `relay_slot_timeout` configure the
+    /// Tier 4 (lite) back-pressure: incoming `PUNCH_ME_NOW` relay frames
+    /// are silently refused once `relay_slot_capacity` slots are in
+    /// flight, and any slot older than `relay_slot_timeout` is reclaimed
+    /// by the inline garbage-collection sweep on every incoming frame.
+    pub(crate) fn new(
+        _config: BootstrapConfig,
+        allow_loopback: bool,
+        relay_slot_capacity: usize,
+        relay_slot_timeout: Duration,
+    ) -> Self {
         Self {
             address_observations: HashMap::new(),
             peer_index: HashMap::new(),
             coordination_table: HashMap::new(),
             security_validator: SecurityValidationState::new(allow_loopback),
             stats: BootstrapStats::default(),
+            relay_slots: HashMap::new(),
+            relay_slot_capacity,
+            relay_slot_timeout,
         }
+    }
+
+    /// Reclaim relay slots whose arrival timestamp is older than the
+    /// configured `relay_slot_timeout`. Called inline at the start of
+    /// every `PUNCH_ME_NOW` frame so that ghost slots from crashed peers
+    /// or dropped sessions cannot leak the active-relay counter.
+    fn sweep_stale_relay_slots(&mut self, now: Instant) {
+        let timeout = self.relay_slot_timeout;
+        self.relay_slots
+            .retain(|_, &mut arrived_at| now.duration_since(arrived_at) < timeout);
     }
     /// Observe a peer's address from an incoming connection
     ///
@@ -3789,6 +3843,37 @@ impl BootstrapCoordinator {
                 );
             })?;
 
+        // Tier 4 (lite) back-pressure: only the relay branch (where the
+        // frame carries an explicit `target_peer_id`) consumes a slot. If
+        // we are at capacity for active relays, silently drop the frame —
+        // the initiator's per-attempt timeout (Tier 2 rotation) will move
+        // it on to its next preferred coordinator.
+        //
+        // Inline garbage-collection sweep first so any stale slots from
+        // crashed peers are reclaimed before the cap check.
+        if let Some(target_peer_id) = frame.target_peer_id {
+            self.sweep_stale_relay_slots(now);
+            let slot_key = (from_peer, target_peer_id);
+            // Re-arming an existing slot for the same (initiator, target)
+            // pair does not consume an additional slot — common during
+            // multi-round coordination where the same pair re-sends.
+            let already_active = self.relay_slots.contains_key(&slot_key);
+            if !already_active && self.relay_slots.len() >= self.relay_slot_capacity {
+                self.stats.backpressure_refusals =
+                    self.stats.backpressure_refusals.saturating_add(1);
+                debug!(
+                    "PUNCH_ME_NOW relay refused: coordinator at capacity ({}/{}) — initiator {:?} → target {:?}",
+                    self.relay_slots.len(),
+                    self.relay_slot_capacity,
+                    hex::encode(&from_peer[..8]),
+                    hex::encode(&target_peer_id[..8])
+                );
+                return Ok(None);
+            }
+            // Accept: insert/refresh the slot timestamp.
+            self.relay_slots.insert(slot_key, now);
+        }
+
         // Track coordination entry minimally
         let _entry = self
             .coordination_table
@@ -3907,6 +3992,8 @@ mod tests {
             10,                      // max_candidates
             Duration::from_secs(30), // coordination_timeout
             true,                    // allow_loopback for tests
+            32,                      // coordinator_max_active_relays
+            Duration::from_secs(5),  // coordinator_relay_slot_timeout
         )
     }
 
@@ -4289,6 +4376,8 @@ mod tests {
             100, // max_candidates (high enough to not limit)
             Duration::from_secs(30),
             true, // allow_loopback for tests
+            32,
+            Duration::from_secs(5),
         );
         let now = Instant::now();
 
@@ -4319,7 +4408,13 @@ mod tests {
     #[test]
     fn test_add_pairs_at_exact_limit() {
         // Test behavior when exactly at the limit
-        let mut state = NatTraversalState::new(100, Duration::from_secs(30), true);
+        let mut state = NatTraversalState::new(
+            100,
+            Duration::from_secs(30),
+            true,
+            32,
+            Duration::from_secs(5),
+        );
         let now = Instant::now();
 
         // Add candidates to get close to limit (14 × 14 = 196 pairs)
@@ -4399,7 +4494,13 @@ mod tests {
     #[test]
     fn test_incremental_add_with_zero_remaining_capacity() {
         // Test that incremental add gracefully handles zero capacity
-        let mut state = NatTraversalState::new(100, Duration::from_secs(30), true);
+        let mut state = NatTraversalState::new(
+            100,
+            Duration::from_secs(30),
+            true,
+            32,
+            Duration::from_secs(5),
+        );
         let now = Instant::now();
 
         // Fill up to the limit
@@ -4429,6 +4530,209 @@ mod tests {
         assert!(
             state.candidate_pairs.len() <= 200,
             "Should handle limit gracefully without panic"
+        );
+    }
+
+    // ---- Tier 4 (lite): coordinator-side back-pressure ----
+
+    /// Helper: build a `BootstrapCoordinator` with controllable cap and
+    /// timeout for back-pressure tests.
+    fn make_bp_coordinator(capacity: usize, timeout: Duration) -> BootstrapCoordinator {
+        BootstrapCoordinator::new(
+            BootstrapConfig::default(),
+            true, // allow_loopback so test addrs aren't rejected
+            capacity,
+            timeout,
+        )
+    }
+
+    /// Helper: build a `PunchMeNow` frame for the relay path (with target).
+    fn make_relay_frame(round: u64, target_peer_id: [u8; 32]) -> crate::frame::PunchMeNow {
+        crate::frame::PunchMeNow {
+            round: VarInt::from_u64(round).unwrap_or(VarInt::from_u32(0)),
+            paired_with_sequence_number: VarInt::from_u32(0),
+            address: SocketAddr::from(([127, 0, 0, 1], 9000)),
+            target_peer_id: Some(target_peer_id),
+        }
+    }
+
+    fn peer_id_with_byte(byte: u8) -> [u8; 32] {
+        let mut id = [0u8; 32];
+        id[0] = byte;
+        id
+    }
+
+    #[test]
+    fn coordinator_accepts_relay_under_capacity() {
+        let mut coord = make_bp_coordinator(4, Duration::from_secs(5));
+        let now = Instant::now();
+        let from = peer_id_with_byte(0x01);
+        let target = peer_id_with_byte(0x02);
+        let frame = make_relay_frame(1, target);
+        let source_addr = SocketAddr::from(([127, 0, 0, 1], 5000));
+
+        let result = coord
+            .process_punch_me_now_frame(from, source_addr, &frame, now)
+            .expect("relay under cap should not error");
+
+        assert!(
+            result.is_some(),
+            "relay under capacity should produce a coordination frame"
+        );
+        assert_eq!(coord.relay_slots.len(), 1, "one slot should be allocated");
+        assert_eq!(
+            coord.stats.backpressure_refusals, 0,
+            "no refusal stat increment expected when under cap"
+        );
+    }
+
+    #[test]
+    fn coordinator_refuses_silently_at_capacity() {
+        let capacity = 2;
+        let mut coord = make_bp_coordinator(capacity, Duration::from_secs(5));
+        let now = Instant::now();
+        let source_addr = SocketAddr::from(([127, 0, 0, 1], 5000));
+
+        // Fill capacity with two distinct (initiator, target) pairs.
+        for i in 0..capacity {
+            let from = peer_id_with_byte(0x10 + i as u8);
+            let target = peer_id_with_byte(0x20 + i as u8);
+            let frame = make_relay_frame(i as u64 + 1, target);
+            let result = coord
+                .process_punch_me_now_frame(from, source_addr, &frame, now)
+                .expect("under-cap relay should not error");
+            assert!(result.is_some(), "slot {} should be accepted", i);
+        }
+        assert_eq!(coord.relay_slots.len(), capacity);
+
+        // The next distinct pair must be silently refused: Ok(None).
+        let overflow_from = peer_id_with_byte(0xFE);
+        let overflow_target = peer_id_with_byte(0xFD);
+        let overflow_frame = make_relay_frame(99, overflow_target);
+        let result = coord
+            .process_punch_me_now_frame(overflow_from, source_addr, &overflow_frame, now)
+            .expect("at-cap refusal must be silent (no error)");
+
+        assert!(
+            result.is_none(),
+            "at-cap refusal must produce no coordination frame"
+        );
+        assert_eq!(
+            coord.relay_slots.len(),
+            capacity,
+            "refused frame must not consume a slot"
+        );
+        assert_eq!(
+            coord.stats.backpressure_refusals, 1,
+            "back-pressure stat must increment on refusal"
+        );
+    }
+
+    #[test]
+    fn coordinator_re_arms_existing_slot_without_consuming_capacity() {
+        let mut coord = make_bp_coordinator(2, Duration::from_secs(5));
+        let now = Instant::now();
+        let source_addr = SocketAddr::from(([127, 0, 0, 1], 5000));
+        let from = peer_id_with_byte(0x01);
+        let target = peer_id_with_byte(0x02);
+        let frame = make_relay_frame(1, target);
+
+        // Fill the first slot.
+        coord
+            .process_punch_me_now_frame(from, source_addr, &frame, now)
+            .expect("first frame ok");
+        assert_eq!(coord.relay_slots.len(), 1);
+
+        // Re-send for the same (from, target) pair: must not consume an
+        // additional slot, must still be accepted.
+        let later = now + Duration::from_millis(500);
+        let result = coord
+            .process_punch_me_now_frame(from, source_addr, &frame, later)
+            .expect("re-arm ok");
+        assert!(result.is_some(), "re-armed slot should still be relayed");
+        assert_eq!(
+            coord.relay_slots.len(),
+            1,
+            "re-arming the same pair must not allocate a second slot"
+        );
+        // Slot timestamp should refresh to the later instant.
+        let slot_arrived = coord
+            .relay_slots
+            .get(&(from, target))
+            .copied()
+            .expect("slot present");
+        assert_eq!(
+            slot_arrived, later,
+            "re-arm must refresh the slot timestamp"
+        );
+    }
+
+    #[test]
+    fn coordinator_sweep_reclaims_stale_slots() {
+        let timeout = Duration::from_secs(5);
+        let mut coord = make_bp_coordinator(2, timeout);
+        let now = Instant::now();
+        let source_addr = SocketAddr::from(([127, 0, 0, 1], 5000));
+
+        // Fill capacity.
+        for i in 0..2u8 {
+            let from = peer_id_with_byte(0x10 + i);
+            let target = peer_id_with_byte(0x20 + i);
+            let frame = make_relay_frame(i as u64 + 1, target);
+            coord
+                .process_punch_me_now_frame(from, source_addr, &frame, now)
+                .expect("under-cap ok");
+        }
+        assert_eq!(coord.relay_slots.len(), 2);
+
+        // Advance well past the slot timeout. The next incoming frame's
+        // inline sweep must reclaim both stale slots before applying the
+        // back-pressure check.
+        let much_later = now + timeout + Duration::from_secs(1);
+        let new_from = peer_id_with_byte(0xAA);
+        let new_target = peer_id_with_byte(0xBB);
+        let new_frame = make_relay_frame(42, new_target);
+        let result = coord
+            .process_punch_me_now_frame(new_from, source_addr, &new_frame, much_later)
+            .expect("post-sweep frame should succeed");
+
+        assert!(
+            result.is_some(),
+            "frame after sweep must be accepted (capacity reclaimed)"
+        );
+        assert_eq!(
+            coord.relay_slots.len(),
+            1,
+            "stale slots must be reclaimed; only the new one remains"
+        );
+        assert_eq!(
+            coord.stats.backpressure_refusals, 0,
+            "no refusal expected because sweep freed capacity in time"
+        );
+    }
+
+    #[test]
+    fn coordinator_non_relay_frame_does_not_consume_slot() {
+        // PUNCH_ME_NOW without a target_peer_id is the response/echo path,
+        // not a relay request — it must NOT consume a back-pressure slot.
+        let mut coord = make_bp_coordinator(1, Duration::from_secs(5));
+        let now = Instant::now();
+        let source_addr = SocketAddr::from(([127, 0, 0, 1], 5000));
+        let from = peer_id_with_byte(0x01);
+
+        let frame = crate::frame::PunchMeNow {
+            round: VarInt::from_u32(1),
+            paired_with_sequence_number: VarInt::from_u32(0),
+            address: SocketAddr::from(([127, 0, 0, 1], 9000)),
+            target_peer_id: None,
+        };
+        let _ = coord
+            .process_punch_me_now_frame(from, source_addr, &frame, now)
+            .expect("non-relay frame ok");
+        assert_eq!(
+            coord.relay_slots.len(),
+            0,
+            "non-relay frame must not consume a slot"
         );
     }
 }

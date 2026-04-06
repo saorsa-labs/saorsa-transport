@@ -4535,6 +4535,8 @@ impl Connection {
             max_candidates,
             coordination_timeout,
             self.config.allow_loopback,
+            self.config.coordinator_max_active_relays,
+            self.config.coordinator_relay_slot_timeout,
         ));
 
         trace!("NAT traversal initialized for symmetric P2P node");
@@ -4733,6 +4735,8 @@ impl Connection {
             8,
             Duration::from_secs(10),
             self.config.allow_loopback,
+            self.config.coordinator_max_active_relays,
+            self.config.coordinator_relay_slot_timeout,
         ));
     }
 

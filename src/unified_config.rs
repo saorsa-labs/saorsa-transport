@@ -317,6 +317,10 @@ impl P2pConfig {
             transport_registry: Some(Arc::new(self.transport_registry.clone())),
             max_message_size: self.max_message_size,
             allow_loopback: self.nat.allow_loopback,
+            coordinator_max_active_relays:
+                crate::nat_traversal_api::NatTraversalConfig::DEFAULT_COORDINATOR_MAX_ACTIVE_RELAYS,
+            coordinator_relay_slot_timeout:
+                crate::nat_traversal_api::NatTraversalConfig::DEFAULT_COORDINATOR_RELAY_SLOT_TIMEOUT,
             upnp: self.nat.upnp.clone(),
         }
     }
