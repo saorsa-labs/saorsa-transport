@@ -346,6 +346,14 @@ pub struct NatTraversalEndpoint {
     /// Tracks when each connection was first observed as closed.
     /// Used to enforce a grace period before removing dead connections.
     closed_at: dashmap::DashMap<SocketAddr, std::time::Instant>,
+    /// Best-effort UPnP IGD port mapping service.
+    ///
+    /// The endpoint is the sole owner of the service — the discovery
+    /// manager only holds a [`crate::upnp::UpnpStateRx`] read handle —
+    /// so [`Self::shutdown`] can `take()` the service and call
+    /// [`crate::upnp::UpnpMappingService::shutdown`] for graceful
+    /// teardown including the gateway-side `DeletePortMapping` request.
+    upnp_service: parking_lot::Mutex<Option<crate::upnp::UpnpMappingService>>,
 }
 
 /// Configuration for NAT traversal behavior
@@ -487,6 +495,18 @@ pub struct NatTraversalConfig {
     /// Default: `false`
     #[serde(default)]
     pub allow_loopback: bool,
+
+    /// Best-effort UPnP IGD port mapping configuration.
+    ///
+    /// When enabled, the endpoint asks the local Internet Gateway Device
+    /// (UPnP-capable router) to forward its UDP port. The mapping is
+    /// surfaced as a high-priority NAT traversal candidate when the
+    /// gateway cooperates, and silently degrades to a no-op when the
+    /// gateway is absent, has UPnP disabled, or refuses the request.
+    ///
+    /// Default: enabled with a one-hour lease.
+    #[serde(default)]
+    pub upnp: crate::upnp::UpnpConfig,
 }
 
 fn default_max_message_size() -> usize {
@@ -1100,6 +1120,7 @@ impl Default for NatTraversalConfig {
             transport_registry: None, // Use direct UDP binding by default
             max_message_size: crate::unified_config::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
             allow_loopback: false,
+            upnp: crate::upnp::UpnpConfig::default(),
         }
     }
 }
@@ -1297,11 +1318,25 @@ impl NatTraversalEndpoint {
         let (inner_endpoint, event_tx, event_rx, local_addr, relay_server_config) =
             Self::create_inner_endpoint(&config, token_store, registry_ref, None).await?;
 
-        // Update discovery manager with the actual bound address
+        // Spawn the best-effort UPnP service against the actual bound port
+        // before installing the read handle on the discovery manager. The
+        // service starts a background task that probes the local IGD
+        // gateway and never blocks endpoint construction — failure
+        // transitions to `Unavailable` and is invisible to the rest of
+        // the endpoint. The endpoint owns the service exclusively so
+        // shutdown can reclaim it for graceful unmap.
+        let upnp_service =
+            crate::upnp::UpnpMappingService::start(local_addr.port(), config.upnp.clone());
+        let upnp_state_rx = upnp_service.subscribe();
+
+        // Update discovery manager with the actual bound address and
+        // attach the UPnP read handle so port-mapped candidates flow
+        // through local-phase scans.
         {
             // parking_lot::Mutex doesn't poison - no need for map_err
             let mut discovery = discovery_manager.lock();
             discovery.set_bound_address(local_addr);
+            discovery.set_upnp_state_rx(upnp_state_rx);
             info!(
                 "Updated discovery manager with bound address: {}",
                 local_addr
@@ -1411,6 +1446,7 @@ impl NatTraversalEndpoint {
             handshake_tx: hs_tx,
             handshake_rx: TokioMutex::new(hs_rx),
             closed_at: dashmap::DashMap::new(),
+            upnp_service: parking_lot::Mutex::new(Some(upnp_service)),
         };
 
         // Multi-transport listening: Spawn receive tasks for all online transports
@@ -1707,11 +1743,25 @@ impl NatTraversalEndpoint {
         let (inner_endpoint, event_tx, event_rx, local_addr, relay_server_config) =
             Self::create_inner_endpoint(&config, token_store, registry_ref, quinn_socket).await?;
 
-        // Update discovery manager with the actual bound address
+        // Spawn the best-effort UPnP service against the actual bound port
+        // before installing the read handle on the discovery manager. The
+        // service starts a background task that probes the local IGD
+        // gateway and never blocks endpoint construction — failure
+        // transitions to `Unavailable` and is invisible to the rest of
+        // the endpoint. The endpoint owns the service exclusively so
+        // shutdown can reclaim it for graceful unmap.
+        let upnp_service =
+            crate::upnp::UpnpMappingService::start(local_addr.port(), config.upnp.clone());
+        let upnp_state_rx = upnp_service.subscribe();
+
+        // Update discovery manager with the actual bound address and
+        // attach the UPnP read handle so port-mapped candidates flow
+        // through local-phase scans.
         {
             // parking_lot::Mutex doesn't poison - no need for map_err
             let mut discovery = discovery_manager.lock();
             discovery.set_bound_address(local_addr);
+            discovery.set_upnp_state_rx(upnp_state_rx);
             info!(
                 "Updated discovery manager with bound address: {}",
                 local_addr
@@ -1821,6 +1871,7 @@ impl NatTraversalEndpoint {
             handshake_tx: hs_tx,
             handshake_rx: TokioMutex::new(hs_rx),
             closed_at: dashmap::DashMap::new(),
+            upnp_service: parking_lot::Mutex::new(Some(upnp_service)),
         };
 
         // Multi-transport listening: Spawn receive tasks for all online transports
@@ -4635,6 +4686,17 @@ impl NatTraversalEndpoint {
         self.incoming_notify.notify_waiters();
         self.shutdown_notify.notify_waiters();
 
+        // Best-effort UPnP teardown. The endpoint is the sole owner of
+        // the service (the discovery manager only holds a read-only
+        // `UpnpStateRx`), so we can move it out and call its async
+        // shutdown directly. Failures are swallowed inside the service —
+        // the lease is the ultimate safety net. The mutex guard is
+        // dropped before the await so the resulting future stays `Send`.
+        let upnp_service = self.upnp_service.lock().take();
+        if let Some(service) = upnp_service {
+            service.shutdown().await;
+        }
+
         // Close all active connections
         // DashMap: collect addresses then remove them one by one
         let addrs: Vec<SocketAddr> = self.connections.iter().map(|e| *e.key()).collect();
@@ -4863,13 +4925,19 @@ impl NatTraversalEndpoint {
 
         // Create candidate pairs with priorities (ICE-like pairing)
         let mut candidate_pairs = Vec::new();
+        // Both `Local` and `PortMapped` describe the local endpoint's
+        // reachability — the former from a host interface, the latter from
+        // a router-side port mapping. Treat both as the local side.
+        let is_local_side = |source: CandidateSource| {
+            matches!(source, CandidateSource::Local | CandidateSource::PortMapped)
+        };
         let local_candidates = discovery_candidates
             .iter()
-            .filter(|c| matches!(c.source, CandidateSource::Local))
+            .filter(|c| is_local_side(c.source))
             .collect::<Vec<_>>();
         let remote_candidates = discovery_candidates
             .iter()
-            .filter(|c| !matches!(c.source, CandidateSource::Local))
+            .filter(|c| !is_local_side(c.source))
             .collect::<Vec<_>>();
 
         // Pair each local candidate with each remote candidate
@@ -4916,8 +4984,16 @@ impl NatTraversalEndpoint {
         // ICE candidate pair priority formula: min(G,D) * 2^32 + max(G,D) * 2 + (G>D ? 1 : 0)
         // Where G is controlling agent priority, D is controlled agent priority
 
+        // ICE-style type preference for router-guaranteed port mappings.
+        // Slotted between ServerReflexive (100) and Host (126): port-mapped
+        // addresses are reflexive (the gateway sees us through NAT) but
+        // come with an explicit forwarding commitment for the lease
+        // duration, so they outrank ordinary OBSERVED_ADDRESS reports.
+        const PORT_MAPPED_TYPE_PREFERENCE: u32 = 110;
+
         let local_type_preference = match local.source {
             CandidateSource::Local => 126,
+            CandidateSource::PortMapped => PORT_MAPPED_TYPE_PREFERENCE,
             CandidateSource::Observed { .. } => 100,
             CandidateSource::Predicted => 75,
             CandidateSource::Peer => 50,
@@ -4925,6 +5001,7 @@ impl NatTraversalEndpoint {
 
         let remote_type_preference = match remote.source {
             CandidateSource::Local => 126,
+            CandidateSource::PortMapped => PORT_MAPPED_TYPE_PREFERENCE,
             CandidateSource::Observed { .. } => 100,
             CandidateSource::Predicted => 75,
             CandidateSource::Peer => 50,
@@ -6058,10 +6135,13 @@ impl NatTraversalEndpoint {
         let target_wire_id = target_peer_id.unwrap_or_else(|| Self::wire_id_from_addr(target_addr));
         info!(
             "Sending PUNCH_ME_NOW coordination request for {} to coordinator {} (wire_id={}, from_peer_id={}, from_addr={})",
-            target_addr, coordinator,
+            target_addr,
+            coordinator,
             hex::encode(&target_wire_id[..8]),
-            target_peer_id.map(|p| hex::encode(&p[..8])).unwrap_or_else(|| "none".to_string()),
-            !target_peer_id.is_some(),
+            target_peer_id
+                .map(|p| hex::encode(&p[..8]))
+                .unwrap_or_else(|| "none".to_string()),
+            target_peer_id.is_none(),
         );
 
         // Get our external address - this is where the target peer should punch to

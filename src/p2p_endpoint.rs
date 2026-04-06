@@ -1822,7 +1822,10 @@ impl P2pEndpoint {
         if let Some(ref pid) = target_peer_id {
             info!(
                 "try_hole_punch: calling initiate_nat_traversal({}, {}) with peer ID {} (dashmap key={})",
-                target, coordinator, hex::encode(&pid[..8]), target
+                target,
+                coordinator,
+                hex::encode(&pid[..8]),
+                target
             );
         } else {
             info!(
