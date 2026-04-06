@@ -268,11 +268,12 @@ fn test_connection_close() {
 
 use saorsa_transport::connection_router::{ConnectionRouter, RouterConfig};
 use saorsa_transport::transport::ProtocolEngine;
+use std::sync::atomic::Ordering;
 
 /// Test that ConnectionRouter correctly selects Constrained engine for BLE addresses
 #[test]
 fn test_router_selects_constrained_for_ble() {
-    let mut router = ConnectionRouter::new(RouterConfig::default());
+    let router = ConnectionRouter::new(RouterConfig::default());
 
     let ble_addr = TransportAddr::Ble {
         mac: [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
@@ -288,14 +289,14 @@ fn test_router_selects_constrained_for_ble() {
 
     // Verify stats tracking
     let stats = router.stats();
-    assert_eq!(stats.constrained_selections, 1);
-    assert_eq!(stats.quic_selections, 0);
+    assert_eq!(stats.constrained_selections.load(Ordering::Relaxed), 1);
+    assert_eq!(stats.quic_selections.load(Ordering::Relaxed), 0);
 }
 
 /// Test that ConnectionRouter correctly selects QUIC engine for UDP addresses
 #[test]
 fn test_router_selects_quic_for_udp() {
-    let mut router = ConnectionRouter::new(RouterConfig::default());
+    let router = ConnectionRouter::new(RouterConfig::default());
 
     let udp_addr = TransportAddr::Udp("127.0.0.1:9000".parse().unwrap());
 
@@ -304,14 +305,14 @@ fn test_router_selects_quic_for_udp() {
 
     // Verify stats tracking
     let stats = router.stats();
-    assert_eq!(stats.quic_selections, 1);
-    assert_eq!(stats.constrained_selections, 0);
+    assert_eq!(stats.quic_selections.load(Ordering::Relaxed), 1);
+    assert_eq!(stats.constrained_selections.load(Ordering::Relaxed), 0);
 }
 
 /// Test mixed transport selection (UDP and BLE peers)
 #[test]
 fn test_mixed_transport_selection() {
-    let mut router = ConnectionRouter::new(RouterConfig::default());
+    let router = ConnectionRouter::new(RouterConfig::default());
 
     let udp_addr = TransportAddr::Udp("192.168.1.100:8080".parse().unwrap());
     let ble_addr = TransportAddr::Ble {
@@ -339,8 +340,8 @@ fn test_mixed_transport_selection() {
 
     // Verify cumulative stats
     let stats = router.stats();
-    assert_eq!(stats.quic_selections, 1);
-    assert_eq!(stats.constrained_selections, 2);
+    assert_eq!(stats.quic_selections.load(Ordering::Relaxed), 1);
+    assert_eq!(stats.constrained_selections.load(Ordering::Relaxed), 2);
 }
 
 /// Test synthetic socket address generation for BLE

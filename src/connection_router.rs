@@ -64,6 +64,7 @@
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::constrained::{
     AdapterEvent, ConnectionId as ConstrainedConnId, ConstrainedError, ConstrainedHandle,
@@ -786,8 +787,18 @@ impl RouterEvent {
     }
 }
 
-/// Router statistics
-#[derive(Debug, Clone, Default)]
+/// Router statistics.
+///
+/// Selection counters (`quic_selections`, `constrained_selections`,
+/// `fallback_selections`) are stored as [`AtomicU64`] so the selection
+/// methods can take `&self` and be called under a `RwLock::read()` guard.
+/// Without this, every outbound send on a `P2pEndpoint` had to acquire an
+/// exclusive write lock on the router just to bump a counter, serialising
+/// all sends through a single lock (see p2p_endpoint.rs `send()`).
+///
+/// Other counters are still plain `u64` because they are only touched on
+/// `&mut self` paths (connect/accept/event-loop).
+#[derive(Debug, Default)]
 pub struct RouterStats {
     /// Total connections routed through QUIC
     pub quic_connections: u64,
@@ -810,17 +821,40 @@ pub struct RouterStats {
     /// Connection failures
     pub connection_failures: u64,
 
-    /// Engine selection decisions (QUIC chosen)
-    pub quic_selections: u64,
+    /// Engine selection decisions (QUIC chosen). Atomic so the selection
+    /// path does not require exclusive access.
+    pub quic_selections: AtomicU64,
 
-    /// Engine selection decisions (Constrained chosen)
-    pub constrained_selections: u64,
+    /// Engine selection decisions (Constrained chosen). Atomic so the
+    /// selection path does not require exclusive access.
+    pub constrained_selections: AtomicU64,
 
-    /// Fallback selections (when preferred engine unavailable)
-    pub fallback_selections: u64,
+    /// Fallback selections (when preferred engine unavailable). Atomic so
+    /// the selection path does not require exclusive access.
+    pub fallback_selections: AtomicU64,
 
     /// Total events processed
     pub events_processed: u64,
+}
+
+impl Clone for RouterStats {
+    fn clone(&self) -> Self {
+        Self {
+            quic_connections: self.quic_connections,
+            constrained_connections: self.constrained_connections,
+            quic_bytes_sent: self.quic_bytes_sent,
+            constrained_bytes_sent: self.constrained_bytes_sent,
+            quic_bytes_received: self.quic_bytes_received,
+            constrained_bytes_received: self.constrained_bytes_received,
+            connection_failures: self.connection_failures,
+            quic_selections: AtomicU64::new(self.quic_selections.load(Ordering::Relaxed)),
+            constrained_selections: AtomicU64::new(
+                self.constrained_selections.load(Ordering::Relaxed),
+            ),
+            fallback_selections: AtomicU64::new(self.fallback_selections.load(Ordering::Relaxed)),
+            events_processed: self.events_processed,
+        }
+    }
 }
 
 /// Connection router for automatic protocol engine selection
@@ -913,17 +947,19 @@ impl ConnectionRouter {
         self.quic_endpoint.is_some()
     }
 
-    /// Select the appropriate protocol engine for a transport
-    pub fn select_engine(&mut self, capabilities: &TransportCapabilities) -> ProtocolEngine {
+    /// Select the appropriate protocol engine for a transport.
+    ///
+    /// Takes `&self` — selection counters are atomic so this can run under
+    /// a read-lock guard without serialising all callers.
+    pub fn select_engine(&self, capabilities: &TransportCapabilities) -> ProtocolEngine {
         let result = self.select_engine_detailed(capabilities);
         result.engine
     }
 
-    /// Select engine with detailed selection result
-    pub fn select_engine_detailed(
-        &mut self,
-        capabilities: &TransportCapabilities,
-    ) -> SelectionResult {
+    /// Select engine with detailed selection result.
+    ///
+    /// Takes `&self` — selection counters are atomic.
+    pub fn select_engine_detailed(&self, capabilities: &TransportCapabilities) -> SelectionResult {
         let supports_quic = capabilities.supports_full_quic();
 
         let (engine, reason) = if supports_quic {
@@ -939,10 +975,16 @@ impl ConnectionRouter {
             (ProtocolEngine::Constrained, SelectionReason::TooConstrained)
         };
 
-        // Update selection stats
+        // Update selection stats via atomic counters.
         match engine {
-            ProtocolEngine::Quic => self.stats.quic_selections += 1,
-            ProtocolEngine::Constrained => self.stats.constrained_selections += 1,
+            ProtocolEngine::Quic => {
+                self.stats.quic_selections.fetch_add(1, Ordering::Relaxed);
+            }
+            ProtocolEngine::Constrained => {
+                self.stats
+                    .constrained_selections
+                    .fetch_add(1, Ordering::Relaxed);
+            }
         }
 
         tracing::debug!(
@@ -962,12 +1004,13 @@ impl ConnectionRouter {
         }
     }
 
-    /// Select engine with fallback support
+    /// Select engine with fallback support.
     ///
-    /// If the preferred engine is unavailable (e.g., QUIC endpoint not initialized),
-    /// this method will attempt to use the fallback engine.
+    /// If the preferred engine is unavailable (e.g., QUIC endpoint not
+    /// initialized), this method will attempt to use the fallback engine.
+    /// Takes `&self` — all mutations are via atomic counters.
     pub fn select_engine_with_fallback(
-        &mut self,
+        &self,
         capabilities: &TransportCapabilities,
         quic_available: bool,
         constrained_available: bool,
@@ -979,7 +1022,9 @@ impl ConnectionRouter {
             ProtocolEngine::Quic if quic_available => (ProtocolEngine::Quic, preferred),
             ProtocolEngine::Quic if constrained_available => {
                 // Fall back to constrained
-                self.stats.fallback_selections += 1;
+                self.stats
+                    .fallback_selections
+                    .fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(
                     preferred = "QUIC",
                     fallback = "Constrained",
@@ -1000,7 +1045,9 @@ impl ConnectionRouter {
             }
             ProtocolEngine::Constrained if quic_available && capabilities.supports_full_quic() => {
                 // Fall back to QUIC (only if transport supports it)
-                self.stats.fallback_selections += 1;
+                self.stats
+                    .fallback_selections
+                    .fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(
                     preferred = "Constrained",
                     fallback = "QUIC",
@@ -1033,17 +1080,27 @@ impl ConnectionRouter {
             }
         };
 
-        // Adjust stats for fallback
+        // Adjust stats for fallback: the inner select_engine_detailed call
+        // incremented the *preferred* counter, so when we actually fell
+        // back we need to decrement it and increment the one we chose.
         if result.is_fallback {
             match engine {
                 ProtocolEngine::Quic => {
-                    self.stats.quic_selections += 1;
-                    self.stats.constrained_selections =
-                        self.stats.constrained_selections.saturating_sub(1);
+                    self.stats.quic_selections.fetch_add(1, Ordering::Relaxed);
+                    // saturating_sub via CAS loop on relaxed load/store
+                    let cur = self.stats.constrained_selections.load(Ordering::Relaxed);
+                    self.stats
+                        .constrained_selections
+                        .store(cur.saturating_sub(1), Ordering::Relaxed);
                 }
                 ProtocolEngine::Constrained => {
-                    self.stats.constrained_selections += 1;
-                    self.stats.quic_selections = self.stats.quic_selections.saturating_sub(1);
+                    self.stats
+                        .constrained_selections
+                        .fetch_add(1, Ordering::Relaxed);
+                    let cur = self.stats.quic_selections.load(Ordering::Relaxed);
+                    self.stats
+                        .quic_selections
+                        .store(cur.saturating_sub(1), Ordering::Relaxed);
                 }
             }
         }
@@ -1051,13 +1108,17 @@ impl ConnectionRouter {
         Ok(result)
     }
 
-    /// Select engine based on destination address
-    pub fn select_engine_for_addr(&mut self, addr: &TransportAddr) -> ProtocolEngine {
+    /// Select engine based on destination address.
+    ///
+    /// Takes `&self` so the hot send path can hold only a read lock.
+    pub fn select_engine_for_addr(&self, addr: &TransportAddr) -> ProtocolEngine {
         self.select_engine_for_addr_detailed(addr).engine
     }
 
-    /// Select engine based on destination address with detailed result
-    pub fn select_engine_for_addr_detailed(&mut self, addr: &TransportAddr) -> SelectionResult {
+    /// Select engine based on destination address with detailed result.
+    ///
+    /// Takes `&self` so the hot send path can hold only a read lock.
+    pub fn select_engine_for_addr_detailed(&self, addr: &TransportAddr) -> SelectionResult {
         // Determine capabilities based on address type
         let capabilities = Self::capabilities_for_addr(addr);
         self.select_engine_detailed(&capabilities)
@@ -1416,17 +1477,17 @@ mod tests {
 
     #[test]
     fn test_engine_selection_for_quic() {
-        let mut router = ConnectionRouter::new(RouterConfig::default());
+        let router = ConnectionRouter::new(RouterConfig::default());
         let addr = TransportAddr::Quic("127.0.0.1:9000".parse().unwrap());
 
         let engine = router.select_engine_for_addr(&addr);
         assert_eq!(engine, ProtocolEngine::Quic);
-        assert_eq!(router.stats().quic_selections, 1);
+        assert_eq!(router.stats().quic_selections.load(Ordering::Relaxed), 1);
     }
 
     #[test]
     fn test_engine_selection_for_ble() {
-        let mut router = ConnectionRouter::new(RouterConfig::default());
+        let router = ConnectionRouter::new(RouterConfig::default());
         let addr = TransportAddr::Ble {
             mac: [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
             psm: 128,
@@ -1434,12 +1495,18 @@ mod tests {
 
         let engine = router.select_engine_for_addr(&addr);
         assert_eq!(engine, ProtocolEngine::Constrained);
-        assert_eq!(router.stats().constrained_selections, 1);
+        assert_eq!(
+            router
+                .stats()
+                .constrained_selections
+                .load(Ordering::Relaxed),
+            1
+        );
     }
 
     #[test]
     fn test_engine_selection_for_lora() {
-        let mut router = ConnectionRouter::new(RouterConfig::default());
+        let router = ConnectionRouter::new(RouterConfig::default());
         let addr = TransportAddr::LoRa {
             dev_addr: [0x12, 0x34, 0x56, 0x78],
             freq_hz: 868_000_000,
@@ -1549,7 +1616,7 @@ mod tests {
 
     #[test]
     fn test_router_stats() {
-        let mut router = ConnectionRouter::new(RouterConfig::default());
+        let router = ConnectionRouter::new(RouterConfig::default());
 
         // Make some selections
         let quic_addr = TransportAddr::Quic("127.0.0.1:9000".parse().unwrap());
@@ -1563,8 +1630,8 @@ mod tests {
         let _ = router.select_engine_for_addr(&ble_addr);
 
         let stats = router.stats();
-        assert_eq!(stats.quic_selections, 2);
-        assert_eq!(stats.constrained_selections, 1);
+        assert_eq!(stats.quic_selections.load(Ordering::Relaxed), 2);
+        assert_eq!(stats.constrained_selections.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -1608,7 +1675,7 @@ mod tests {
 
     #[test]
     fn test_select_engine_detailed_udp() {
-        let mut router = ConnectionRouter::new(RouterConfig::default());
+        let router = ConnectionRouter::new(RouterConfig::default());
         let capabilities = TransportCapabilities::broadband();
 
         let result = router.select_engine_detailed(&capabilities);
@@ -1620,7 +1687,7 @@ mod tests {
 
     #[test]
     fn test_select_engine_detailed_ble() {
-        let mut router = ConnectionRouter::new(RouterConfig::default());
+        let router = ConnectionRouter::new(RouterConfig::default());
         let capabilities = TransportCapabilities::ble();
 
         let result = router.select_engine_detailed(&capabilities);
@@ -1634,7 +1701,7 @@ mod tests {
         // Configure router to prefer constrained even for broadband
         let mut config = RouterConfig::default();
         config.prefer_quic = false;
-        let mut router = ConnectionRouter::new(config);
+        let router = ConnectionRouter::new(config);
         let capabilities = TransportCapabilities::broadband();
 
         let result = router.select_engine_detailed(&capabilities);
@@ -1644,7 +1711,7 @@ mod tests {
 
     #[test]
     fn test_select_engine_with_fallback_quic_available() {
-        let mut router = ConnectionRouter::new(RouterConfig::default());
+        let router = ConnectionRouter::new(RouterConfig::default());
         let capabilities = TransportCapabilities::broadband();
 
         let result = router
@@ -1656,7 +1723,7 @@ mod tests {
 
     #[test]
     fn test_select_engine_with_fallback_to_constrained() {
-        let mut router = ConnectionRouter::new(RouterConfig::default());
+        let router = ConnectionRouter::new(RouterConfig::default());
         let capabilities = TransportCapabilities::broadband();
 
         // QUIC unavailable, constrained available
@@ -1666,13 +1733,16 @@ mod tests {
         assert_eq!(result.engine, ProtocolEngine::Constrained);
         assert!(result.is_fallback);
         assert_eq!(result.reason, SelectionReason::QuicUnavailableFallback);
-        assert_eq!(router.stats().fallback_selections, 1);
+        assert_eq!(
+            router.stats().fallback_selections.load(Ordering::Relaxed),
+            1
+        );
     }
 
     #[test]
     fn test_select_engine_with_fallback_constrained_preferred() {
         let config = RouterConfig::for_ble_focus();
-        let mut router = ConnectionRouter::new(config);
+        let router = ConnectionRouter::new(config);
         let capabilities = TransportCapabilities::broadband();
 
         // Constrained preferred but unavailable, QUIC available
@@ -1690,7 +1760,7 @@ mod tests {
 
     #[test]
     fn test_select_engine_with_fallback_no_engines() {
-        let mut router = ConnectionRouter::new(RouterConfig::default());
+        let router = ConnectionRouter::new(RouterConfig::default());
         let capabilities = TransportCapabilities::broadband();
 
         // Neither engine available
@@ -1766,16 +1836,22 @@ mod tests {
 
     #[test]
     fn test_fallback_stats_tracking() {
-        let mut router = ConnectionRouter::new(RouterConfig::default());
+        let router = ConnectionRouter::new(RouterConfig::default());
         let capabilities = TransportCapabilities::broadband();
 
         // Normal selection - no fallback
         let _ = router.select_engine_with_fallback(&capabilities, true, true);
-        assert_eq!(router.stats().fallback_selections, 0);
+        assert_eq!(
+            router.stats().fallback_selections.load(Ordering::Relaxed),
+            0
+        );
 
         // Fallback selection
         let _ = router.select_engine_with_fallback(&capabilities, false, true);
-        assert_eq!(router.stats().fallback_selections, 1);
+        assert_eq!(
+            router.stats().fallback_selections.load(Ordering::Relaxed),
+            1
+        );
     }
 
     // ========================================================================
@@ -1892,7 +1968,7 @@ mod tests {
     fn test_router_with_fallback_quic_unavailable_but_transport_supports() {
         // When QUIC is unavailable but transport supports QUIC,
         // should fall back to constrained
-        let mut router = ConnectionRouter::new(RouterConfig::default());
+        let router = ConnectionRouter::new(RouterConfig::default());
         let capabilities = TransportCapabilities::broadband();
 
         let result = router

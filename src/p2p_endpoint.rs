@@ -2264,11 +2264,18 @@ impl P2pEndpoint {
             }
         };
 
-        // Select protocol engine based on transport address
-        let engine = {
-            let mut router = self.router.write().await;
-            router.select_engine_for_addr(&transport_addr)
-        };
+        // Select protocol engine based on transport address.
+        //
+        // Uses a read lock: `select_engine_for_addr` takes `&self` and
+        // updates its stats counters via atomics. The previous code held
+        // an exclusive write lock here, which serialised every outbound
+        // send on the endpoint through a single lock and was a dominant
+        // contention point at high node counts (1000-node testnet).
+        let engine = self
+            .router
+            .read()
+            .await
+            .select_engine_for_addr(&transport_addr);
 
         match engine {
             crate::transport::ProtocolEngine::Quic => {
