@@ -385,9 +385,7 @@ impl Endpoint {
                         .connections
                         .iter()
                         .filter_map(|(_, meta)| {
-                            meta.peer_id
-                                .as_ref()
-                                .map(|pid| hex::encode(&pid.0[..8]))
+                            meta.peer_id.as_ref().map(|pid| hex::encode(&pid.0[..8]))
                         })
                         .collect();
                     tracing::warn!(
