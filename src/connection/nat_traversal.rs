@@ -3885,7 +3885,7 @@ impl BootstrapCoordinator {
         self.cleanup_completed_sessions(now);
 
         // Track coordination entry minimally
-        let _entry = self
+        let entry = self
             .coordination_table
             .entry(frame.round)
             .or_insert(CoordinationEntry {
@@ -3896,10 +3896,10 @@ impl BootstrapCoordinator {
             });
         // Update target if provided later
         if let Some(peer_b) = frame.target_peer_id {
-            if _entry.peer_b.is_none() {
-                _entry.peer_b = Some(peer_b);
+            if entry.peer_b.is_none() {
+                entry.peer_b = Some(peer_b);
             }
-            _entry.address_hint = frame.address;
+            entry.address_hint = frame.address;
         }
 
         // If we have a target, echo back with swapped target to coordinate
@@ -3914,7 +3914,7 @@ impl BootstrapCoordinator {
             Ok(Some(coordination_frame))
         } else {
             // Response path: mark entry completed and increment success metric
-            _entry.completed = true;
+            entry.completed = true;
             self.stats.successful_coordinations += 1;
             Ok(None)
         }
