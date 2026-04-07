@@ -5216,7 +5216,7 @@ impl NatTraversalEndpoint {
                     TraversalPhase::Connected => {
                         // Monitor connection health
                         if !self.is_connection_healthy(&target_addr) {
-                            warn!("Connection to {} is no longer healthy", target_addr);
+                            warn!("Connection to {target_addr} is no longer healthy");
                             // Could trigger reconnection logic here
                         }
                     }
@@ -6229,7 +6229,6 @@ impl NatTraversalEndpoint {
                     return Some(candidate_addr);
                 }
             }
-
             // No validated candidates, return first candidate as fallback
             if let Some(first) = session.candidates.first() {
                 debug!(
@@ -6330,15 +6329,13 @@ impl NatTraversalEndpoint {
 
     /// Check if connection is healthy
     fn is_connection_healthy(&self, addr: &SocketAddr) -> bool {
-        // In real implementation, check QUIC connection status
         // DashMap provides lock-free .get()
-        if self.connections.get(addr).is_some() {
-            // Check if connection is still active
-            // Note: Connection doesn't have is_closed/is_drained methods
-            // We use the closed() future to check if still active
-            return true; // Assume healthy if connection exists in map
+        if let Some(conn) = self.connections.get(addr) {
+            // close_reason() returns None if the connection is still open
+            conn.close_reason().is_none()
+        } else {
+            false
         }
-        true
     }
 
     /// Convert discovery events to NAT traversal events with proper address resolution
