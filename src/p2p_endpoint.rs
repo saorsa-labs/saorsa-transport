@@ -1875,12 +1875,12 @@ impl P2pEndpoint {
                             return Ok((conn, ConnectionMethod::Relayed { relay: relay_addr }));
                         }
                         Ok(Err(e)) => {
-                            debug!("Relay connection failed: {}", e);
-                            strategy.transition_to_failed(e.to_string());
+                            debug!("Relay connection failed: {e}");
+                            strategy.transition_to_next_relay(e.to_string());
                         }
                         Err(_) => {
                             debug!("Relay connection timed out");
-                            strategy.transition_to_failed("Timeout");
+                            strategy.transition_to_next_relay("Timeout");
                         }
                     }
                 }
