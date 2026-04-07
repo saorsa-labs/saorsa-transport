@@ -342,7 +342,11 @@ pub struct NatTraversalEndpoint {
     handshake_rx: TokioMutex<mpsc::Receiver<Result<(SocketAddr, InnerConnection), String>>>,
     /// Tracks when each connection was first observed as closed.
     /// Used to enforce a grace period before removing dead connections.
-    closed_at: dashmap::DashMap<SocketAddr, std::time::Instant>,
+    ///
+    /// Must stay `Arc`-wrapped: `DashMap::clone` in dashmap 6.x is a deep
+    /// copy, so spawned tasks that need to mutate `closed_at` (e.g.
+    /// `attempt_hole_punch`) must share the underlying map via `Arc`.
+    closed_at: Arc<dashmap::DashMap<SocketAddr, std::time::Instant>>,
     /// Best-effort UPnP IGD port mapping service.
     ///
     /// The endpoint is the sole owner of the service — the discovery
@@ -1496,7 +1500,7 @@ impl NatTraversalEndpoint {
             hole_punch_rx: TokioMutex::new(hole_punch_rx),
             handshake_tx: hs_tx,
             handshake_rx: TokioMutex::new(hs_rx),
-            closed_at: dashmap::DashMap::new(),
+            closed_at: Arc::new(dashmap::DashMap::new()),
             upnp_service: parking_lot::Mutex::new(Some(upnp_service)),
         };
 
@@ -1920,7 +1924,7 @@ impl NatTraversalEndpoint {
             hole_punch_rx: TokioMutex::new(hole_punch_rx),
             handshake_tx: hs_tx,
             handshake_rx: TokioMutex::new(hs_rx),
-            closed_at: dashmap::DashMap::new(),
+            closed_at: Arc::new(dashmap::DashMap::new()),
             upnp_service: parking_lot::Mutex::new(Some(upnp_service)),
         };
 
@@ -2904,6 +2908,7 @@ impl NatTraversalEndpoint {
             }
         };
         let connections_clone = self.connections.clone();
+        let closed_at_clone = self.closed_at.clone();
         let emitted_events_clone = self.emitted_established_events.clone();
         let relay_server_clone = self.relay_server.clone();
         let incoming_notify_clone = self.incoming_notify.clone();
@@ -2915,6 +2920,7 @@ impl NatTraversalEndpoint {
                 shutdown_clone,
                 event_tx,
                 connections_clone,
+                closed_at_clone,
                 emitted_events_clone,
                 relay_server_clone,
                 incoming_notify_clone,
@@ -2932,6 +2938,7 @@ impl NatTraversalEndpoint {
         shutdown: Arc<AtomicBool>,
         event_tx: mpsc::UnboundedSender<NatTraversalEvent>,
         connections: Arc<dashmap::DashMap<SocketAddr, InnerConnection>>,
+        closed_at: Arc<dashmap::DashMap<SocketAddr, std::time::Instant>>,
         emitted_events: Arc<dashmap::DashSet<SocketAddr>>,
         relay_server: Option<Arc<MasqueRelayServer>>,
         incoming_notify: Arc<tokio::sync::Notify>,
@@ -2942,6 +2949,7 @@ impl NatTraversalEndpoint {
                 Some(connecting) => {
                     let event_tx = event_tx.clone();
                     let connections = connections.clone();
+                    let closed_at = closed_at.clone();
                     let emitted_events = emitted_events.clone();
                     let relay_server = relay_server.clone();
                     let incoming_notify = incoming_notify.clone();
@@ -2960,6 +2968,13 @@ impl NatTraversalEndpoint {
                                 // Always overwrite — the latest connection from the
                                 // accept handler is most likely alive, replacing any
                                 // dead duplicate from simultaneous-open.
+                                //
+                                // Clear any stale `closed_at` entry first — otherwise
+                                // the next time this fresh connection closes,
+                                // `poll_closed_connections` would inherit the previous
+                                // closure's timestamp, suppress its `ConnectionLost`
+                                // event, and reap the entry immediately.
+                                closed_at.remove(&remote_address);
                                 connections.insert(remote_address, connection.clone());
 
                                 // Notify the P2pEndpoint's forwarder about the new connection
@@ -3931,6 +3946,11 @@ impl NatTraversalEndpoint {
                 addr
             );
         }
+        // Clear any stale `closed_at` entry left over from a previous closure
+        // of this address — otherwise the next time this fresh connection
+        // closes, `poll_closed_connections` would suppress its
+        // `ConnectionLost` event and reap the entry immediately.
+        self.closed_at.remove(&addr);
         self.connections.insert(addr, connection);
         info!(
             "add_connection: now have {} connections",
@@ -6690,8 +6710,12 @@ impl NatTraversalEndpoint {
         // Step 2: Drop the active_sessions ref before accessing connections
         // (ref is dropped when session goes out of scope at end of if block)
 
-        // Step 3: Now safe to insert into connections keyed by remote address
+        // Step 3: Now safe to insert into connections keyed by remote address.
+        // Clear any stale `closed_at` entry left over from a previous closure
+        // of this address so the fresh connection gets a full grace window
+        // when it eventually closes (see `poll_closed_connections`).
         let remote_address = connection.remote_address();
+        self.closed_at.remove(&remote_address);
         self.connections.insert(remote_address, connection.clone());
 
         // Extract public key for event
