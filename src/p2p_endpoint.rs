@@ -958,6 +958,10 @@ impl P2pEndpoint {
             .add_connection(addr, connection.clone())
             .map_err(EndpointError::NatTraversal)?;
 
+        // We connected directly to this peer, so it is publicly reachable
+        // and can serve as a NAT traversal coordinator.
+        self.inner.set_can_coordinate(&addr, true);
+
         // Spawn handler (we initiated the connection = Client side)
         self.inner
             .spawn_connection_handler(addr, connection, Side::Client)
@@ -1961,6 +1965,9 @@ impl P2pEndpoint {
         self.inner
             .add_connection(addr, connection.clone())
             .map_err(EndpointError::NatTraversal)?;
+
+        // Direct outbound connection succeeded -- peer is publicly reachable
+        self.inner.set_can_coordinate(&addr, true);
 
         // Spawn connection handler (Client side - we initiated)
         self.inner
