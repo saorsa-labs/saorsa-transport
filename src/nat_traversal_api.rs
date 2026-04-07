@@ -5430,7 +5430,12 @@ impl NatTraversalEndpoint {
                     );
 
                     let mut connection = None;
-                    let mut bootstrap = relay_candidates[0]; // default, overwritten on success
+                    let Some(&first_candidate) = relay_candidates.first() else {
+                        warn!("No relay candidates available for symmetric NAT setup");
+                        relay_setup_attempted.store(false, std::sync::atomic::Ordering::Relaxed);
+                        return;
+                    };
+                    let mut bootstrap = first_candidate; // default, overwritten on success
 
                     for candidate in &relay_candidates {
                         match connections.get(candidate) {
@@ -6217,13 +6222,12 @@ impl NatTraversalEndpoint {
             }
 
             // For testing: if we're in punching phase and have candidates, simulate success with the first one
-            if session.phase == TraversalPhase::Punching && !session.candidates.is_empty() {
-                let candidate_addr = session.candidates[0].address;
-                info!(
-                    "Simulating successful punch for testing: {} at {}",
-                    addr, candidate_addr
-                );
-                return Some(candidate_addr);
+            if session.phase == TraversalPhase::Punching {
+                if let Some(first_candidate) = session.candidates.first() {
+                    let candidate_addr = first_candidate.address;
+                    info!("Simulating successful punch for testing: {addr} at {candidate_addr}",);
+                    return Some(candidate_addr);
+                }
             }
 
             // No validated candidates, return first candidate as fallback
