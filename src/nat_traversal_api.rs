@@ -4876,6 +4876,7 @@ impl NatTraversalEndpoint {
                     if let Some(event_tx) = &self.event_tx {
                         let event_tx = event_tx.clone();
                         let connections = self.connections.clone();
+                        let closed_at = self.closed_at.clone();
                         let incoming_notify = self.incoming_notify.clone();
                         let accepted_addrs_tx = self.accepted_addrs_tx.clone();
                         let address = candidate.address;
@@ -4887,18 +4888,17 @@ impl NatTraversalEndpoint {
                                     // Check if another task already inserted a live
                                     // connection. A closed entry in the grace window
                                     // must not block replacement with the new one.
-                                    if let Some(existing) = connections.get(&remote) {
-                                        if existing.value().close_reason().is_none() {
-                                            debug!(
-                                                "Connection already exists for {}, discarding duplicate from {}",
-                                                remote, address
-                                            );
-                                            drop(existing);
-                                            // Close the duplicate connection to free resources
-                                            connection.close(0u32.into(), b"duplicate connection");
-                                            return;
-                                        }
-                                        drop(existing);
+                                    let has_live_existing = connections
+                                        .get(&remote)
+                                        .is_some_and(|e| e.value().close_reason().is_none());
+                                    if has_live_existing {
+                                        debug!(
+                                            "Connection already exists for {}, discarding duplicate from {}",
+                                            remote, address
+                                        );
+                                        // Close the duplicate connection to free resources
+                                        connection.close(0u32.into(), b"duplicate connection");
+                                        return;
                                     }
 
                                     info!("Successfully connected to {} for {}", address, remote);
@@ -4908,19 +4908,23 @@ impl NatTraversalEndpoint {
 
                                     // Store the connection, but don't overwrite an existing
                                     // live connection. The reader task may have already
-                                    // registered the incoming connection from the same peer.
-                                    if let Some(existing) = connections.get(&remote) {
-                                        if existing.value().close_reason().is_none() {
-                                            info!(
-                                                "attempt_hole_punch: {} already has live connection, skipping insert",
-                                                remote
-                                            );
-                                            drop(existing);
-                                        } else {
-                                            drop(existing);
-                                            connections.insert(remote, connection.clone());
-                                        }
+                                    // registered the incoming connection from the same peer
+                                    // between the duplicate-check above and now (TOCTOU).
+                                    let still_has_live = connections
+                                        .get(&remote)
+                                        .is_some_and(|e| e.value().close_reason().is_none());
+                                    if still_has_live {
+                                        info!(
+                                            "attempt_hole_punch: {} already has live connection, skipping insert",
+                                            remote
+                                        );
                                     } else {
+                                        // Clear any stale `closed_at` entry left over from a
+                                        // previous closure of this address — otherwise the
+                                        // next time this fresh connection closes,
+                                        // `poll_closed_connections` would suppress its
+                                        // `ConnectionLost` event and reap immediately.
+                                        closed_at.remove(&remote);
                                         connections.insert(remote, connection.clone());
                                     }
 
@@ -5891,6 +5895,13 @@ impl NatTraversalEndpoint {
             if is_stale {
                 drop(entry);
                 self.connections.remove(&normalized_coordinator);
+                // Also clear `closed_at` so the next observed close gets a
+                // fresh grace window. Without this, the next time a
+                // connection to `normalized_coordinator` closes,
+                // `poll_closed_connections` would see the stale timestamp
+                // from the previous closure, suppress its `ConnectionLost`
+                // event, and reap the entry immediately.
+                self.closed_at.remove(&normalized_coordinator);
                 // Fall through to "establish new connection" below
             } else {
                 info!(
@@ -5938,6 +5949,7 @@ impl NatTraversalEndpoint {
 
                     // Spawn task to handle connection and send coordination
                     let connections = self.connections.clone();
+                    let closed_at = self.closed_at.clone();
                     let external_addr = our_external_address;
 
                     tokio::spawn(async move {
@@ -5950,22 +5962,24 @@ impl NatTraversalEndpoint {
                                 // Check if another task already established a live
                                 // coordinator connection. A closed entry in the
                                 // grace window must not block replacement.
-                                if let Some(existing) = connections.get(&coordinator) {
-                                    if existing.value().close_reason().is_none() {
-                                        debug!(
-                                            "Coordinator connection already exists for {}, discarding duplicate",
-                                            coordinator
-                                        );
-                                        drop(existing);
-                                        // Close the duplicate connection to free resources
-                                        connection.close(0u32.into(), b"duplicate coordinator");
-                                        return;
-                                    }
-                                    drop(existing);
+                                let has_live_existing = connections
+                                    .get(&coordinator)
+                                    .is_some_and(|e| e.value().close_reason().is_none());
+                                if has_live_existing {
+                                    debug!(
+                                        "Coordinator connection already exists for {}, discarding duplicate",
+                                        coordinator
+                                    );
+                                    // Close the duplicate connection to free resources
+                                    connection.close(0u32.into(), b"duplicate coordinator");
+                                    return;
                                 }
 
-                                // Store the connection keyed by SocketAddr
-                                // DashMap provides lock-free .insert()
+                                // Clear any stale `closed_at` entry left over from a
+                                // previous closure of this coordinator address.
+                                closed_at.remove(&coordinator);
+                                // Store the connection keyed by SocketAddr.
+                                // DashMap provides lock-free .insert().
                                 connections.insert(coordinator, connection.clone());
 
                                 // Now send the PUNCH_ME_NOW via this new connection
@@ -6325,7 +6339,7 @@ impl NatTraversalEndpoint {
 
         // No live connection found, validation failed
         Err(NatTraversalError::ValidationFailed(format!(
-            "No connection found for {target_addr} at {address}"
+            "No live connection found for {target_addr} at {address}"
         )))
     }
 
