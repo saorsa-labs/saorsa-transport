@@ -15,6 +15,7 @@
 use std::{fmt, net::SocketAddr, sync::Arc, time::Duration};
 
 use crate::constrained::{ConstrainedEngine, EngineConfig, EngineEvent};
+use crate::reachability::TraversalMethod;
 use crate::transport::TransportRegistry;
 
 use crate::SHUTDOWN_DRAIN_TIMEOUT;
@@ -1042,6 +1043,8 @@ pub enum NatTraversalEvent {
         remote_address: SocketAddr,
         /// Who initiated the connection (Client = we connected, Server = they connected)
         side: Side,
+        /// Whether the connection was direct, hole-punched, or relayed.
+        traversal_method: TraversalMethod,
         /// ML-DSA-65 public key extracted from the TLS identity, if available
         public_key: Option<Vec<u8>>,
     },
@@ -2976,6 +2979,7 @@ impl NatTraversalEndpoint {
                                         event_tx.send(NatTraversalEvent::ConnectionEstablished {
                                             remote_address,
                                             side: Side::Server,
+                                            traversal_method: TraversalMethod::Direct,
                                             public_key,
                                         });
                                     incoming_notify.notify_one();
@@ -3346,6 +3350,7 @@ impl NatTraversalEndpoint {
             let _ = event_tx.send(NatTraversalEvent::ConnectionEstablished {
                 remote_address: remote_addr,
                 side: Side::Client,
+                traversal_method: TraversalMethod::Direct,
                 public_key,
             });
             self.incoming_notify.notify_one();
@@ -3971,11 +3976,13 @@ impl NatTraversalEndpoint {
     /// * `addr` - The remote address of the connection
     /// * `connection` - The established QUIC connection
     /// * `side` - Who initiated the connection (Client = we connected, Server = they connected)
+    /// * `traversal_method` - Whether the path is direct, hole-punched, or relayed
     pub fn spawn_connection_handler(
         &self,
         addr: SocketAddr,
         connection: InnerConnection,
         side: Side,
+        traversal_method: TraversalMethod,
     ) -> Result<(), NatTraversalError> {
         let event_tx = self.event_tx.as_ref().cloned().ok_or_else(|| {
             NatTraversalError::ConfigError("NAT traversal event channel not configured".to_string())
@@ -3992,6 +3999,7 @@ impl NatTraversalEndpoint {
             let _ = event_tx.send(NatTraversalEvent::ConnectionEstablished {
                 remote_address,
                 side,
+                traversal_method,
                 public_key,
             });
             self.incoming_notify.notify_one();
@@ -4927,6 +4935,7 @@ impl NatTraversalEndpoint {
                                         event_tx.send(NatTraversalEvent::ConnectionEstablished {
                                             remote_address: remote,
                                             side: Side::Client,
+                                            traversal_method: TraversalMethod::HolePunch,
                                             public_key,
                                         });
                                     incoming_notify.notify_one();
@@ -6641,6 +6650,7 @@ impl NatTraversalEndpoint {
             callback(NatTraversalEvent::ConnectionEstablished {
                 remote_address: candidate_address,
                 side: Side::Client,
+                traversal_method: TraversalMethod::HolePunch,
                 public_key,
             });
         }
@@ -6727,26 +6737,6 @@ impl NatTraversalEndpoint {
         } else {
             Err(NatTraversalError::PeerNotConnected)
         }
-    }
-
-    /// Get NAT traversal statistics
-    #[allow(clippy::panic)]
-    pub fn get_nat_stats(
-        &self,
-    ) -> Result<NatTraversalStatistics, Box<dyn std::error::Error + Send + Sync>> {
-        // Return default statistics for now
-        // In a real implementation, this would collect actual stats from the endpoint
-        Ok(NatTraversalStatistics {
-            active_sessions: self.active_sessions.len(),
-            // parking_lot::RwLock doesn't poison - always succeeds
-            total_bootstrap_nodes: self.bootstrap_nodes.read().len(),
-            successful_coordinations: 7,
-            average_coordination_time: self.timeout_config.nat_traversal.retry_interval,
-            total_attempts: 10,
-            successful_connections: 7,
-            direct_connections: 5,
-            relayed_connections: 2,
-        })
     }
 }
 

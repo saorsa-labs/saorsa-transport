@@ -71,9 +71,8 @@ use crate::constrained::EngineEvent;
 use crate::crypto::raw_public_keys::key_utils::generate_ml_dsa_keypair;
 use crate::happy_eyeballs::{self, HappyEyeballsConfig};
 pub use crate::nat_traversal_api::TraversalPhase;
-use crate::nat_traversal_api::{
-    NatTraversalEndpoint, NatTraversalError, NatTraversalEvent, NatTraversalStatistics,
-};
+use crate::nat_traversal_api::{NatTraversalEndpoint, NatTraversalError, NatTraversalEvent};
+use crate::reachability::{ReachabilityScope, TraversalMethod, socket_addr_scope};
 use crate::transport::{ProtocolEngine, TransportAddr, TransportRegistry};
 use crate::unified_config::P2pConfig;
 use rustls;
@@ -251,6 +250,12 @@ pub struct PeerConnection {
     /// Remote address (supports all transport types)
     pub remote_addr: TransportAddr,
 
+    /// How this connection was established.
+    pub traversal_method: TraversalMethod,
+
+    /// Who initiated the connection.
+    pub side: Side,
+
     /// Whether peer is authenticated
     pub authenticated: bool,
 
@@ -298,8 +303,20 @@ pub struct EndpointStats {
     /// Successful NAT traversals
     pub nat_traversal_successes: u64,
 
-    /// Direct connections (no NAT traversal needed)
+    /// Direct connections (no coordinator or relay needed)
     pub direct_connections: u64,
+
+    /// Currently active direct inbound connections from peers.
+    pub active_direct_incoming_connections: u64,
+
+    /// Most recent loopback-scoped direct inbound observation.
+    pub last_direct_loopback_at: Option<Instant>,
+
+    /// Most recent LAN-scoped direct inbound observation.
+    pub last_direct_local_at: Option<Instant>,
+
+    /// Most recent globally scoped direct inbound observation.
+    pub last_direct_global_at: Option<Instant>,
 
     /// Relayed connections
     pub relayed_connections: u64,
@@ -326,6 +343,10 @@ impl Default for EndpointStats {
             nat_traversal_attempts: 0,
             nat_traversal_successes: 0,
             direct_connections: 0,
+            active_direct_incoming_connections: 0,
+            last_direct_loopback_at: None,
+            last_direct_local_at: None,
+            last_direct_global_at: None,
             relayed_connections: 0,
             total_bootstrap_nodes: 0,
             connected_bootstrap_nodes: 0,
@@ -349,7 +370,7 @@ impl Default for EndpointStats {
 ///
 /// while let Ok(event) = events.recv().await {
 ///     match event {
-///         P2pEvent::PeerConnected { peer_id, addr, side } => {
+///         P2pEvent::PeerConnected { addr, public_key, side, traversal_method } => {
 ///             // Handle different transport types
 ///             match addr {
 ///                 TransportAddr::Quic(socket_addr) => {
@@ -403,6 +424,8 @@ pub enum P2pEvent {
         public_key: Option<Vec<u8>>,
         /// Who initiated the connection (Client = we connected, Server = they connected)
         side: Side,
+        /// Whether the connection was direct, hole-punched, or relayed.
+        traversal_method: TraversalMethod,
     },
 
     /// A peer has disconnected.
@@ -586,6 +609,10 @@ async fn do_cleanup_connection(
         {
             let mut s = stats.write().await;
             s.active_connections = s.active_connections.saturating_sub(1);
+            if peer_conn.traversal_method.is_direct() && peer_conn.side.is_server() {
+                s.active_direct_incoming_connections =
+                    s.active_direct_incoming_connections.saturating_sub(1);
+            }
         }
 
         let _ = event_tx.send(P2pEvent::PeerDisconnected {
@@ -650,17 +677,45 @@ impl P2pEndpoint {
                     NatTraversalEvent::ConnectionEstablished {
                         remote_address,
                         side,
+                        traversal_method,
                         public_key,
                     } => {
                         stats_guard.nat_traversal_successes += 1;
                         stats_guard.active_connections += 1;
                         stats_guard.successful_connections += 1;
 
+                        match traversal_method {
+                            TraversalMethod::Direct => {
+                                stats_guard.direct_connections += 1;
+                                if side.is_server() {
+                                    stats_guard.active_direct_incoming_connections += 1;
+                                    let now = Instant::now();
+                                    match socket_addr_scope(*remote_address) {
+                                        Some(ReachabilityScope::Loopback) => {
+                                            stats_guard.last_direct_loopback_at = Some(now);
+                                        }
+                                        Some(ReachabilityScope::LocalNetwork) => {
+                                            stats_guard.last_direct_local_at = Some(now);
+                                        }
+                                        Some(ReachabilityScope::Global) => {
+                                            stats_guard.last_direct_global_at = Some(now);
+                                        }
+                                        None => {}
+                                    }
+                                }
+                            }
+                            TraversalMethod::Relay => {
+                                stats_guard.relayed_connections += 1;
+                            }
+                            TraversalMethod::HolePunch | TraversalMethod::PortPrediction => {}
+                        }
+
                         // Broadcast event with connection direction
                         let _ = event_tx.send(P2pEvent::PeerConnected {
                             addr: TransportAddr::Quic(*remote_address),
                             public_key: public_key.clone(),
                             side: *side,
+                            traversal_method: *traversal_method,
                         });
                     }
                     NatTraversalEvent::TraversalFailed { remote_address, .. } => {
@@ -960,7 +1015,7 @@ impl P2pEndpoint {
 
         // Spawn handler (we initiated the connection = Client side)
         self.inner
-            .spawn_connection_handler(addr, connection, Side::Client)
+            .spawn_connection_handler(addr, connection, Side::Client, TraversalMethod::Direct)
             .map_err(EndpointError::NatTraversal)?;
 
         // Create peer connection record
@@ -968,6 +1023,8 @@ impl P2pEndpoint {
         let peer_conn = PeerConnection {
             public_key: remote_public_key.clone(),
             remote_addr: TransportAddr::Quic(addr),
+            traversal_method: TraversalMethod::Direct,
+            side: Side::Client,
             authenticated: true, // TLS handles authentication
             connected_at: Instant::now(),
             last_activity: Instant::now(),
@@ -999,6 +1056,7 @@ impl P2pEndpoint {
             addr: TransportAddr::Quic(addr),
             public_key: remote_public_key,
             side: Side::Client,
+            traversal_method: TraversalMethod::Direct,
         });
 
         Ok(peer_conn)
@@ -1074,6 +1132,8 @@ impl P2pEndpoint {
                 let peer_conn = PeerConnection {
                     public_key: None, // Constrained connections don't have TLS auth yet
                     remote_addr: addr.clone(),
+                    traversal_method: TraversalMethod::Direct,
+                    side: Side::Client,
                     authenticated: false,
                     connected_at: Instant::now(),
                     last_activity: Instant::now(),
@@ -1096,6 +1156,7 @@ impl P2pEndpoint {
                     addr: addr.clone(),
                     public_key: None,
                     side: Side::Client,
+                    traversal_method: TraversalMethod::Direct,
                 });
 
                 Ok(peer_conn)
@@ -1570,6 +1631,8 @@ impl P2pEndpoint {
                     let peer_conn = PeerConnection {
                         public_key: None,
                         remote_addr: TransportAddr::Quic(target_addr),
+                        traversal_method: TraversalMethod::HolePunch,
+                        side: Side::Client,
                         authenticated: true,
                         connected_at: Instant::now(),
                         last_activity: Instant::now(),
@@ -1589,6 +1652,7 @@ impl P2pEndpoint {
                         addr: TransportAddr::Quic(target_addr),
                         public_key: peer_conn.public_key.clone(),
                         side: Side::Client,
+                        traversal_method: TraversalMethod::HolePunch,
                     });
 
                     return Ok((
@@ -1964,12 +2028,14 @@ impl P2pEndpoint {
 
         // Spawn connection handler (Client side - we initiated)
         self.inner
-            .spawn_connection_handler(addr, connection, Side::Client)
+            .spawn_connection_handler(addr, connection, Side::Client, TraversalMethod::Direct)
             .map_err(EndpointError::NatTraversal)?;
 
         let peer_conn = PeerConnection {
             public_key: remote_public_key.clone(),
             remote_addr: TransportAddr::Quic(addr),
+            traversal_method: TraversalMethod::Direct,
+            side: Side::Client,
             authenticated: true,
             connected_at: Instant::now(),
             last_activity: Instant::now(),
@@ -1996,6 +2062,7 @@ impl P2pEndpoint {
             addr: TransportAddr::Quic(addr),
             public_key: remote_public_key,
             side: Side::Client,
+            traversal_method: TraversalMethod::Direct,
         });
 
         Ok(peer_conn)
@@ -2107,6 +2174,8 @@ impl P2pEndpoint {
                 let peer_conn = PeerConnection {
                     public_key: None,
                     remote_addr: TransportAddr::Quic(actual_addr),
+                    traversal_method: TraversalMethod::HolePunch,
+                    side: Side::Client,
                     authenticated: true,
                     connected_at: Instant::now(),
                     last_activity: Instant::now(),
@@ -2231,12 +2300,14 @@ impl P2pEndpoint {
             .map_err(EndpointError::NatTraversal)?;
 
         self.inner
-            .spawn_connection_handler(target, connection, Side::Client)
+            .spawn_connection_handler(target, connection, Side::Client, TraversalMethod::Relay)
             .map_err(EndpointError::NatTraversal)?;
 
         let peer_conn = PeerConnection {
             public_key: remote_public_key,
             remote_addr: TransportAddr::Quic(target),
+            traversal_method: TraversalMethod::Relay,
+            side: Side::Client,
             authenticated: true,
             connected_at: Instant::now(),
             last_activity: Instant::now(),
@@ -2262,6 +2333,28 @@ impl P2pEndpoint {
     }
 
     /// Check if we're connected to a specific address
+    async fn record_direct_incoming_stats(&self, remote_addr: SocketAddr) {
+        let mut stats = self.stats.write().await;
+        stats.active_connections += 1;
+        stats.successful_connections += 1;
+        stats.direct_connections += 1;
+        stats.active_direct_incoming_connections += 1;
+        let now = Instant::now();
+
+        match socket_addr_scope(remote_addr) {
+            Some(ReachabilityScope::Loopback) => {
+                stats.last_direct_loopback_at = Some(now);
+            }
+            Some(ReachabilityScope::LocalNetwork) => {
+                stats.last_direct_local_at = Some(now);
+            }
+            Some(ReachabilityScope::Global) => {
+                stats.last_direct_global_at = Some(now);
+            }
+            None => {}
+        }
+    }
+
     async fn is_connected_to_addr(&self, addr: SocketAddr) -> bool {
         let transport_addr = TransportAddr::Quic(addr);
         let peers = self.connected_peers.read().await;
@@ -2289,10 +2382,12 @@ impl P2pEndpoint {
                 let remote_public_key = extract_public_key_bytes_from_connection(&connection);
 
                 // They initiated the connection to us = Server side
-                if let Err(e) =
-                    self.inner
-                        .spawn_connection_handler(remote_addr, connection, Side::Server)
-                {
+                if let Err(e) = self.inner.spawn_connection_handler(
+                    remote_addr,
+                    connection,
+                    Side::Server,
+                    TraversalMethod::Direct,
+                ) {
                     error!("Failed to spawn connection handler: {}", e);
                     return None;
                 }
@@ -2301,6 +2396,8 @@ impl P2pEndpoint {
                 let peer_conn = PeerConnection {
                     public_key: remote_public_key.clone(),
                     remote_addr: TransportAddr::Quic(remote_addr),
+                    traversal_method: TraversalMethod::Direct,
+                    side: Side::Server,
                     authenticated: true, // TLS handles authentication
                     connected_at: Instant::now(),
                     last_activity: Instant::now(),
@@ -2332,17 +2429,14 @@ impl P2pEndpoint {
                     .await
                     .insert(remote_addr, peer_conn.clone());
 
-                {
-                    let mut stats = self.stats.write().await;
-                    stats.active_connections += 1;
-                    stats.successful_connections += 1;
-                }
+                self.record_direct_incoming_stats(remote_addr).await;
 
                 // They initiated the connection to us = Server side
                 let _ = self.event_tx.send(P2pEvent::PeerConnected {
                     addr: TransportAddr::Quic(remote_addr),
                     public_key: remote_public_key,
                     side: Side::Server,
+                    traversal_method: TraversalMethod::Direct,
                 });
 
                 Some(peer_conn)
@@ -2462,6 +2556,8 @@ impl P2pEndpoint {
                     let peer_conn = PeerConnection {
                         public_key: None,
                         remote_addr: TransportAddr::Quic(*addr),
+                        traversal_method: TraversalMethod::HolePunch,
+                        side: Side::Server,
                         authenticated: true,
                         connected_at: Instant::now(),
                         last_activity: Instant::now(),
@@ -2471,6 +2567,7 @@ impl P2pEndpoint {
                         addr: TransportAddr::Quic(*addr),
                         public_key: None,
                         side: Side::Server,
+                        traversal_method: TraversalMethod::HolePunch,
                     });
                     (TransportAddr::Quic(*addr), Some(conn))
                 } else {
@@ -2681,13 +2778,6 @@ impl P2pEndpoint {
                 / (stats.path.sent_packets + stats.path.lost_packets).max(1) as f64,
             last_activity,
         })
-    }
-
-    /// Get NAT traversal statistics
-    pub fn nat_stats(&self) -> Result<NatTraversalStatistics, EndpointError> {
-        self.inner
-            .get_nat_stats()
-            .map_err(|e| EndpointError::Connection(e.to_string()))
     }
 
     // === Known Peers ===
@@ -3015,6 +3105,8 @@ impl P2pEndpoint {
                 PeerConnection {
                     public_key: None,
                     remote_addr: addr.clone(),
+                    traversal_method: TraversalMethod::Direct,
+                    side,
                     authenticated: false,
                     connected_at: Instant::now(),
                     last_activity: Instant::now(),
@@ -3024,6 +3116,7 @@ impl P2pEndpoint {
                 addr: addr.clone(),
                 public_key: None,
                 side,
+                traversal_method: TraversalMethod::Direct,
             });
         }
 
@@ -3390,6 +3483,8 @@ impl P2pEndpoint {
                 let peer_conn = PeerConnection {
                     public_key: None,
                     remote_addr: TransportAddr::Quic(addr),
+                    traversal_method: TraversalMethod::HolePunch,
+                    side: Side::Server,
                     authenticated: true,
                     connected_at: Instant::now(),
                     last_activity: Instant::now(),
@@ -3460,6 +3555,7 @@ impl P2pEndpoint {
                     addr: TransportAddr::Quic(addr),
                     public_key: None,
                     side: Side::Server,
+                    traversal_method: TraversalMethod::HolePunch,
                 });
 
                 // Spawn a reader task for the connection so incoming streams
@@ -3588,6 +3684,8 @@ mod tests {
         let conn = PeerConnection {
             public_key: None,
             remote_addr: TransportAddr::Quic(socket_addr),
+            traversal_method: TraversalMethod::Direct,
+            side: Side::Client,
             authenticated: false,
             connected_at: Instant::now(),
             last_activity: Instant::now(),
@@ -3699,6 +3797,7 @@ mod tests {
             addr: TransportAddr::Quic(socket_addr),
             public_key: None,
             side: Side::Client,
+            traversal_method: TraversalMethod::Direct,
         };
 
         // Verify event fields
@@ -3706,11 +3805,13 @@ mod tests {
             addr,
             public_key,
             side,
+            traversal_method,
         } = event
         {
             assert!(public_key.is_none());
             assert_eq!(addr, TransportAddr::Quic(socket_addr));
             assert!(side.is_client());
+            assert_eq!(traversal_method, TraversalMethod::Direct);
 
             // Verify as_socket_addr() works
             let extracted = addr.as_socket_addr();
@@ -3731,6 +3832,7 @@ mod tests {
             },
             public_key: None,
             side: Side::Server,
+            traversal_method: TraversalMethod::Direct,
         };
 
         // Verify event fields
@@ -3738,10 +3840,12 @@ mod tests {
             addr,
             public_key,
             side,
+            traversal_method,
         } = event
         {
             assert!(public_key.is_none());
             assert!(side.is_server());
+            assert_eq!(traversal_method, TraversalMethod::Direct);
 
             // Verify as_socket_addr() returns None for BLE
             assert!(addr.as_socket_addr().is_none());
@@ -3778,6 +3882,7 @@ mod tests {
             addr: TransportAddr::Quic(socket_addr),
             public_key: Some(vec![0x11; 32]),
             side: Side::Client,
+            traversal_method: TraversalMethod::Direct,
         };
 
         // Verify events are Clone
@@ -3807,6 +3912,8 @@ mod tests {
         let udp_conn = PeerConnection {
             public_key: None,
             remote_addr: TransportAddr::Quic(udp_addr),
+            traversal_method: TraversalMethod::Direct,
+            side: Side::Client,
             authenticated: true,
             connected_at: Instant::now(),
             last_activity: Instant::now(),
@@ -3825,6 +3932,8 @@ mod tests {
                 mac: mac_addr,
                 psm: 128,
             },
+            traversal_method: TraversalMethod::Direct,
+            side: Side::Client,
             authenticated: true,
             connected_at: Instant::now(),
             last_activity: Instant::now(),
@@ -3842,6 +3951,7 @@ mod tests {
             addr: TransportAddr::Quic(socket_addr),
             public_key: None,
             side: Side::Client,
+            traversal_method: TraversalMethod::Direct,
         };
 
         // Verify display formatting works for logging
@@ -3871,6 +3981,8 @@ mod tests {
         let conn = PeerConnection {
             public_key: None,
             remote_addr: TransportAddr::Quic(socket_addr),
+            traversal_method: TraversalMethod::Direct,
+            side: Side::Client,
             authenticated: true,
             connected_at: Instant::now(),
             last_activity: Instant::now(),
@@ -3901,6 +4013,8 @@ mod tests {
             PeerConnection {
                 public_key: None,
                 remote_addr: TransportAddr::Quic(udp_addr),
+                traversal_method: TraversalMethod::Direct,
+                side: Side::Client,
                 authenticated: true,
                 connected_at: Instant::now(),
                 last_activity: Instant::now(),
@@ -3919,6 +4033,8 @@ mod tests {
             PeerConnection {
                 public_key: None,
                 remote_addr: ble_addr,
+                traversal_method: TraversalMethod::Direct,
+                side: Side::Client,
                 authenticated: true,
                 connected_at: Instant::now(),
                 last_activity: Instant::now(),
@@ -3961,6 +4077,8 @@ mod tests {
                 PeerConnection {
                     public_key: None,
                     remote_addr: TransportAddr::Quic(socket_addr),
+                    traversal_method: TraversalMethod::Direct,
+                    side: Side::Client,
                     authenticated: true,
                     connected_at: Instant::now(),
                     last_activity: Instant::now(),
@@ -4010,6 +4128,8 @@ mod tests {
         let mut conn = PeerConnection {
             public_key: None,
             remote_addr: TransportAddr::Quic(socket_addr),
+            traversal_method: TraversalMethod::Direct,
+            side: Side::Client,
             authenticated: false,
             connected_at: Instant::now(),
             last_activity: Instant::now(),
