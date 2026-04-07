@@ -2322,15 +2322,20 @@ impl NatTraversalEndpoint {
                         });
                     }
 
-                    // Check if any connection attempts succeeded
-                    // First, check the connections DashMap to see if a connection was established
-                    let has_connection = self.connections.contains_key(&target_addr);
+                    // Check if any connection attempts succeeded. Use the
+                    // liveness-aware helper so closed entries still in the
+                    // grace window don't spuriously promote the session.
+                    let has_connection = self.has_existing_connection(&target_addr);
 
                     if has_connection || session.session_state.connection.is_some() {
-                        // Update session_state.connection from the connections DashMap
+                        // Update session_state.connection from the connections DashMap.
+                        // Only adopt a live entry — a closed-but-retained entry from
+                        // the grace window must not become the session's connection.
                         if session.session_state.connection.is_none() {
                             if let Some(conn_ref) = self.connections.get(&target_addr) {
-                                session.session_state.connection = Some(conn_ref.clone());
+                                if conn_ref.close_reason().is_none() {
+                                    session.session_state.connection = Some(conn_ref.clone());
+                                }
                             }
                         }
 
@@ -4879,15 +4884,21 @@ impl NatTraversalEndpoint {
                             match connecting.await {
                                 Ok(connection) => {
                                     let remote = connection.remote_address();
-                                    // Check if another task already inserted a connection
-                                    if connections.contains_key(&remote) {
-                                        debug!(
-                                            "Connection already exists for {}, discarding duplicate from {}",
-                                            remote, address
-                                        );
-                                        // Close the duplicate connection to free resources
-                                        connection.close(0u32.into(), b"duplicate connection");
-                                        return;
+                                    // Check if another task already inserted a live
+                                    // connection. A closed entry in the grace window
+                                    // must not block replacement with the new one.
+                                    if let Some(existing) = connections.get(&remote) {
+                                        if existing.value().close_reason().is_none() {
+                                            debug!(
+                                                "Connection already exists for {}, discarding duplicate from {}",
+                                                remote, address
+                                            );
+                                            drop(existing);
+                                            // Close the duplicate connection to free resources
+                                            connection.close(0u32.into(), b"duplicate connection");
+                                            return;
+                                        }
+                                        drop(existing);
                                     }
 
                                     info!("Successfully connected to {} for {}", address, remote);
@@ -5429,20 +5440,15 @@ impl NatTraversalEndpoint {
                         relay_candidates.len()
                     );
 
-                    let mut connection = None;
-                    let Some(&first_candidate) = relay_candidates.first() else {
-                        warn!("No relay candidates available for symmetric NAT setup");
-                        relay_setup_attempted.store(false, std::sync::atomic::Ordering::Relaxed);
-                        return;
-                    };
-                    let mut bootstrap = first_candidate; // default, overwritten on success
-
+                    // Pick the first relay candidate with a live active
+                    // connection. The outer caller already guards against an
+                    // empty `relay_candidates` list.
+                    let mut selected: Option<(SocketAddr, _)> = None;
                     for candidate in &relay_candidates {
                         match connections.get(candidate) {
                             Some(conn) if conn.close_reason().is_none() => {
                                 info!("Relay candidate {} — active connection, trying", candidate);
-                                bootstrap = *candidate;
-                                connection = Some(conn.clone());
+                                selected = Some((*candidate, conn.clone()));
                                 break;
                             }
                             Some(_) => {
@@ -5457,8 +5463,8 @@ impl NatTraversalEndpoint {
                         }
                     }
 
-                    let connection = match connection {
-                        Some(c) => c,
+                    let (bootstrap, connection) = match selected {
+                        Some(pair) => pair,
                         None => {
                             warn!(
                                 "No active connection to any relay candidate ({} tried), will retry",
@@ -5832,6 +5838,12 @@ impl NatTraversalEndpoint {
         if let Some(entry) = coord_conn {
             let conn = entry.value();
 
+            // A connection kept in the DashMap during the 5-second grace
+            // period in `poll_closed_connections` after close cannot transmit
+            // frames. Treat it as stale so we fall through to establishing a
+            // fresh coordinator connection below.
+            let is_closed = conn.close_reason().is_some();
+
             // Verify this is the SAME connection the endpoint is driving.
             // The DashMap may hold a stale connection while the endpoint has
             // a newer one to the same address. Frames encoded on the stale
@@ -5844,27 +5856,35 @@ impl NatTraversalEndpoint {
                 None
             };
 
-            let is_stale = match endpoint_handle {
-                Some(ep_handle) if ep_handle != dashmap_handle => {
-                    warn!(
-                        "Coordinator connection {} is STALE: DashMap handle={} but endpoint handle={}. Removing stale entry.",
-                        normalized_coordinator, dashmap_handle, ep_handle
-                    );
-                    true
-                }
-                None => {
-                    warn!(
-                        "Coordinator connection {} is ORPHAN: DashMap handle={} but endpoint has no connection. Removing.",
-                        normalized_coordinator, dashmap_handle
-                    );
-                    true
-                }
-                Some(ep_handle) => {
-                    info!(
-                        "Coordinator connection {} verified: handle={} matches endpoint",
-                        normalized_coordinator, ep_handle
-                    );
-                    false
+            let is_stale = if is_closed {
+                warn!(
+                    "Coordinator connection {} is CLOSED but still in DashMap grace window. Removing.",
+                    normalized_coordinator
+                );
+                true
+            } else {
+                match endpoint_handle {
+                    Some(ep_handle) if ep_handle != dashmap_handle => {
+                        warn!(
+                            "Coordinator connection {} is STALE: DashMap handle={} but endpoint handle={}. Removing stale entry.",
+                            normalized_coordinator, dashmap_handle, ep_handle
+                        );
+                        true
+                    }
+                    None => {
+                        warn!(
+                            "Coordinator connection {} is ORPHAN: DashMap handle={} but endpoint has no connection. Removing.",
+                            normalized_coordinator, dashmap_handle
+                        );
+                        true
+                    }
+                    Some(ep_handle) => {
+                        info!(
+                            "Coordinator connection {} verified: handle={} matches endpoint",
+                            normalized_coordinator, ep_handle
+                        );
+                        false
+                    }
                 }
             };
 
@@ -5927,15 +5947,21 @@ impl NatTraversalEndpoint {
                             Ok(Ok(connection)) => {
                                 info!("Connected to coordinator {}", coordinator);
 
-                                // Check if another task already established a coordinator connection
-                                if connections.contains_key(&coordinator) {
-                                    debug!(
-                                        "Coordinator connection already exists for {}, discarding duplicate",
-                                        coordinator
-                                    );
-                                    // Close the duplicate connection to free resources
-                                    connection.close(0u32.into(), b"duplicate coordinator");
-                                    return;
+                                // Check if another task already established a live
+                                // coordinator connection. A closed entry in the
+                                // grace window must not block replacement.
+                                if let Some(existing) = connections.get(&coordinator) {
+                                    if existing.value().close_reason().is_none() {
+                                        debug!(
+                                            "Coordinator connection already exists for {}, discarding duplicate",
+                                            coordinator
+                                        );
+                                        drop(existing);
+                                        // Close the duplicate connection to free resources
+                                        connection.close(0u32.into(), b"duplicate coordinator");
+                                        return;
+                                    }
+                                    drop(existing);
                                 }
 
                                 // Store the connection keyed by SocketAddr
@@ -6233,7 +6259,7 @@ impl NatTraversalEndpoint {
             if session.phase == TraversalPhase::Punching {
                 if let Some(first_candidate) = session.candidates.first() {
                     let candidate_addr = first_candidate.address;
-                    info!("Simulating successful punch for testing: {addr} at {candidate_addr}",);
+                    info!("Simulating successful punch for testing: {addr} at {candidate_addr}");
                     return Some(candidate_addr);
                 }
             }
@@ -6260,11 +6286,17 @@ impl NatTraversalEndpoint {
         debug!("Validating path to {} at {}", target_addr, address);
 
         // Check if we have a connection to validate
-        // DashMap provides lock-free .get()
+        // DashMap provides lock-free .get(). Skip entries still in the map
+        // but already closed — `poll_closed_connections` retains them for a
+        // 5-second grace period and they must not validate a candidate.
         if let Some(entry) = self.connections.get(&target_addr) {
             let conn = entry.value();
-            // Connection exists, check if it's to the expected address
-            if conn.remote_address() == address {
+            if conn.close_reason().is_some() {
+                debug!(
+                    "Connection entry for {} is closed, ignoring for path validation",
+                    target_addr
+                );
+            } else if conn.remote_address() == address {
                 info!(
                     "Path validation successful for {} at {}",
                     target_addr, address
@@ -6291,7 +6323,7 @@ impl NatTraversalEndpoint {
             }
         }
 
-        // No connection found, validation failed
+        // No live connection found, validation failed
         Err(NatTraversalError::ValidationFailed(format!(
             "No connection found for {target_addr} at {address}"
         )))
