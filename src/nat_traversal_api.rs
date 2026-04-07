@@ -6199,12 +6199,20 @@ impl NatTraversalEndpoint {
     /// Check if any hole punch succeeded
     fn check_punch_results(&self, addr: &SocketAddr) -> Option<SocketAddr> {
         // Check if we have an established connection to this address
-        // DashMap provides lock-free .get()
+        // DashMap provides lock-free .get(). Skip entries that are still in
+        // the map but already closed — `poll_closed_connections` keeps them
+        // for a 5-second grace period and they must not count as success.
         if let Some(entry) = self.connections.get(addr) {
-            // We have a connection! Return its address
-            let remote = entry.value().remote_address();
-            info!("Found successful connection to {} at {}", addr, remote);
-            return Some(remote);
+            let conn = entry.value();
+            if conn.close_reason().is_none() {
+                let remote = conn.remote_address();
+                info!("Found successful connection to {} at {}", addr, remote);
+                return Some(remote);
+            }
+            debug!(
+                "Connection entry for {} is closed, ignoring for punch results",
+                addr
+            );
         }
 
         // No connection found, check if we have any validated candidates
@@ -6289,14 +6297,21 @@ impl NatTraversalEndpoint {
         )))
     }
 
-    /// Check if a connection already exists for the given address.
+    /// Check if a live connection already exists for the given address.
     ///
     /// This is used to skip unnecessary NAT traversal when a direct connection
     /// has already been established. Checking this at multiple points prevents
     /// wasted resources on hole punching attempts.
+    ///
+    /// Returns `false` for entries whose `close_reason()` is `Some`, because
+    /// `poll_closed_connections` keeps closed entries in the map for a short
+    /// grace period (see `poll_closed_connections`). Treating those as live
+    /// would silently skip NAT traversal for a connection that is already dead.
     #[inline]
     fn has_existing_connection(&self, addr: &SocketAddr) -> bool {
-        self.connections.contains_key(addr)
+        self.connections
+            .get(addr)
+            .is_some_and(|conn| conn.close_reason().is_none())
     }
 
     /// Check if path validation succeeded
