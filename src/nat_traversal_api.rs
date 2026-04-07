@@ -641,12 +641,16 @@ pub struct BootstrapNode {
 }
 
 impl BootstrapNode {
-    /// Create a new bootstrap node
+    /// Create a new bootstrap node.
+    ///
+    /// Defaults `can_coordinate` to `false`. Callers must explicitly set it
+    /// to `true` via [`NatTraversalEndpoint::set_can_coordinate`] once they
+    /// have evidence the peer is directly reachable.
     pub fn new(address: SocketAddr) -> Self {
         Self {
             address,
             last_seen: std::time::Instant::now(),
-            can_coordinate: true,
+            can_coordinate: false,
             rtt: None,
             coordination_count: 0,
         }
@@ -2594,7 +2598,7 @@ impl NatTraversalEndpoint {
             bootstrap_nodes.push(BootstrapNode {
                 address,
                 last_seen: std::time::Instant::now(),
-                can_coordinate: true,
+                can_coordinate: false,
                 rtt: None,
                 coordination_count: 0,
             });
@@ -3979,22 +3983,22 @@ impl NatTraversalEndpoint {
             self.connections.len()
         );
 
-        // Register connected peer as a potential coordinator for NAT traversal.
-        // In the symmetric P2P architecture (v0.13.0+), any connected node can
-        // coordinate hole-punching for us.
+        // Register connected peer as a potential bootstrap node for NAT traversal.
+        // Coordination capability is NOT assumed here -- callers must explicitly
+        // mark the node via `set_can_coordinate()` once they have evidence the
+        // peer is directly reachable (e.g., we successfully connected outbound).
         {
             let mut nodes = self.bootstrap_nodes.write();
             if !nodes.iter().any(|n| n.address == addr) {
                 nodes.push(BootstrapNode {
                     address: addr,
                     last_seen: std::time::Instant::now(),
-                    can_coordinate: true,
+                    can_coordinate: false,
                     rtt: None,
                     coordination_count: 0,
                 });
                 info!(
-                    "add_connection: registered {} as NAT traversal coordinator ({} total)",
-                    addr,
+                    "add_connection: registered {addr} as bootstrap node ({} total, can_coordinate=false)",
                     nodes.len()
                 );
             }
@@ -4005,6 +4009,20 @@ impl NatTraversalEndpoint {
         self.incoming_notify.notify_waiters();
 
         Ok(())
+    }
+
+    /// Mark (or unmark) a bootstrap node as capable of coordinating NAT traversal.
+    ///
+    /// Call this after evidence that the peer is directly reachable -- e.g.,
+    /// after a successful outbound connection. Nodes connected via relay or
+    /// hole-punch should NOT be marked as coordinators since they may be
+    /// behind restrictive NAT themselves.
+    pub fn set_can_coordinate(&self, addr: &SocketAddr, can_coordinate: bool) {
+        let mut nodes = self.bootstrap_nodes.write();
+        if let Some(node) = nodes.iter_mut().find(|n| &n.address == addr) {
+            node.can_coordinate = can_coordinate;
+            info!("set_can_coordinate: {addr} -> can_coordinate={can_coordinate}");
+        }
     }
 
     /// Spawn the NAT traversal handler loop for an existing connection referenced by the endpoint.
@@ -5791,16 +5809,64 @@ impl NatTraversalEndpoint {
         }
     }
 
-    /// Select a coordinator from available bootstrap nodes
+    /// Select a coordinator from available bootstrap nodes.
+    ///
+    /// Filters to nodes that can actually coordinate (directly reachable, not
+    /// behind restrictive NAT) and weights selection by RTT (lower is better)
+    /// and `coordination_count` (lower is better) for load balancing.
     fn select_coordinator(&self) -> Option<SocketAddr> {
         // parking_lot::RwLock doesn't poison - always succeeds
         let nodes = self.bootstrap_nodes.read();
-        // Simple round-robin or random selection
-        if !nodes.is_empty() {
-            let idx = rand::random::<usize>() % nodes.len();
-            return Some(nodes[idx].address);
+
+        // Only consider nodes that have been verified as coordinators
+        let eligible: Vec<&BootstrapNode> = nodes.iter().filter(|n| n.can_coordinate).collect();
+
+        if eligible.is_empty() {
+            return None;
         }
-        None
+
+        // Compute a quality score for each eligible node.
+        // Higher score = better candidate. We use inverse RTT and inverse
+        // coordination_count so that lower values produce higher scores.
+        let scores: Vec<f64> = eligible
+            .iter()
+            .map(|node| {
+                // RTT component: prefer lower RTT. Use 500ms as the default
+                // when RTT is unknown (conservative but not disqualifying).
+                let rtt_ms = node
+                    .rtt
+                    .map(|d| d.as_millis() as f64)
+                    .unwrap_or(500.0)
+                    .max(1.0); // avoid division by zero
+                let rtt_score = 1000.0 / rtt_ms;
+
+                // Load-balancing component: prefer less-loaded coordinators.
+                // Add 1 to avoid division by zero for fresh nodes.
+                let load_score = 1.0 / (node.coordination_count as f64 + 1.0);
+
+                // Combined score: RTT matters more (weight 3) than load (weight 1)
+                rtt_score * 3.0 + load_score
+            })
+            .collect();
+
+        let total_score: f64 = scores.iter().sum();
+        if total_score <= 0.0 {
+            // Fallback: pick the first eligible node
+            return eligible.first().map(|n| n.address);
+        }
+
+        // Weighted random selection: pick a node proportional to its score
+        let roll = rand::random::<f64>() * total_score;
+        let mut cumulative = 0.0;
+        for (node, score) in eligible.iter().zip(scores.iter()) {
+            cumulative += score;
+            if roll < cumulative {
+                return Some(node.address);
+            }
+        }
+
+        // Floating-point edge case: return the last eligible node
+        eligible.last().map(|n| n.address)
     }
 
     /// Send coordination request to bootstrap node
