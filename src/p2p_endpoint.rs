@@ -1895,8 +1895,9 @@ impl P2pEndpoint {
                 }
 
                 ConnectionStage::Connected { via } => {
-                    // This shouldn't happen in the loop, but handle it
-                    unreachable!("Connected stage reached in loop: {:?}", via);
+                    return Err(EndpointError::Connection(format!(
+                        "unexpected Connected stage reached in loop: {via:?}"
+                    )));
                 }
             }
         }
