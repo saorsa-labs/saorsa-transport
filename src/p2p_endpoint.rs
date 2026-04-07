@@ -92,17 +92,22 @@ const STALE_REAPER_INTERVAL: Duration = Duration::from_secs(10);
 const POST_HOLEPUNCH_DIRECT_RETRY_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Per-attempt hole-punch timeout used when rotating through a list of
-/// preferred coordinators. Kept short so a busy or unreachable coordinator
-/// is abandoned quickly and the next one in the list is tried; the *last*
-/// coordinator in the rotation falls back to the strategy's full
+/// preferred coordinators. Kept reasonably short so a busy or unreachable
+/// coordinator is abandoned and the next one in the list is tried; the
+/// *last* coordinator in the rotation falls back to the strategy's full
 /// hole-punch timeout to give it time to actually complete the punch.
 ///
-/// Tuned for the Tier 2 + Tier 4 (lite) coordinator-rotation flow: 1.5s
-/// is comfortably above one round-trip on most internet links but well
-/// below the strategy default (~8s), so the worst-case wait for K
-/// preferred coordinators is roughly `(K-1) * 1.5s + 8s` instead of
-/// `K * 8s`.
-const PER_COORDINATOR_QUICK_HOLEPUNCH_TIMEOUT: Duration = Duration::from_millis(1500);
+/// **Sized to outlast one full PUNCH_ME_NOW round trip on cross-region
+/// links.** With 1.5s, rotation routinely fired while the previous
+/// round's relayed return connection was still in flight, producing
+/// multiple parallel hole-punch attempts and the "duplicate connection"
+/// dedup storm under symmetric NAT. 4s gives a comfortably high margin
+/// over the worst-case relay→target→back round trip on cross-region
+/// links and dramatically reduces the racing-attempt window. Worst-case
+/// wait for K preferred coordinators is now roughly
+/// `(K-1) * 4s + holepunch_timeout` instead of `K * holepunch_timeout`,
+/// which is still well below `K * 8s`.
+const PER_COORDINATOR_QUICK_HOLEPUNCH_TIMEOUT: Duration = Duration::from_secs(4);
 
 use crate::SHUTDOWN_DRAIN_TIMEOUT;
 
@@ -1814,20 +1819,26 @@ impl P2pEndpoint {
                     let attempt_result =
                         timeout(attempt_timeout, self.try_hole_punch(target, coordinator)).await;
 
-                    // Common post-attempt step: try a quick direct connect.
-                    // The NAT binding may have been created by the target's
-                    // outgoing packets even though our try_hole_punch didn't
-                    // detect the connection.
-                    let post_direct = async {
-                        if let Ok(Ok(peer_conn)) =
-                            timeout(POST_HOLEPUNCH_DIRECT_RETRY_TIMEOUT, self.connect(target)).await
-                        {
-                            info!("✓ Post-hole-punch direct connect succeeded to {}", target);
-                            Some(peer_conn)
-                        } else {
-                            None
-                        }
-                    };
+                    // Per-rotation `post_direct` probe REMOVED.
+                    //
+                    // Previously this loop fired a `self.connect(target)`
+                    // probe after every failed hole-punch round to opportunistically
+                    // catch a NAT binding the target's reply might have created.
+                    // That probe issued a parallel A→B QUIC dial which raced
+                    // the relayed B→A return from the same round. Under
+                    // symmetric NAT each round's return arrived on a fresh
+                    // source port, so the `connected_peers` SocketAddr-keyed
+                    // dedup did not collapse them and several connections
+                    // accumulated for the same logical peer. Each ended up
+                    // closed as `b"duplicate"` once the first was promoted —
+                    // and any of those closes that happened to be the one
+                    // saorsa-core's lifecycle monitor was tracking killed the
+                    // identity exchange.
+                    //
+                    // Direct probing now happens **once** at the end of the
+                    // rotation chain (see the post-loop attempt below), which
+                    // preserves the NAT-binding optimisation without producing
+                    // a per-round race.
 
                     match attempt_result {
                         Ok(Ok(conn)) => {
@@ -1835,12 +1846,6 @@ impl P2pEndpoint {
                             return Ok((conn, ConnectionMethod::HolePunched { coordinator }));
                         }
                         Ok(Err(e)) => {
-                            if let Some(peer_conn) = post_direct.await {
-                                return Ok((
-                                    peer_conn,
-                                    ConnectionMethod::HolePunched { coordinator },
-                                ));
-                            }
                             strategy.record_holepunch_error(round, e.to_string());
                             // Bounds-safe rotation: bail out of rotation and
                             // fall back to relay if for any reason the index
@@ -1872,18 +1877,26 @@ impl P2pEndpoint {
                                     round
                                 );
                                 strategy.increment_round();
+                            } else if let Some(peer_conn) =
+                                self.try_post_rotation_direct(target).await
+                            {
+                                // Final post-rotation probe: maybe the
+                                // accumulated NAT bindings from the rotation
+                                // chain finally let a direct dial through.
+                                info!(
+                                    "✓ Post-rotation direct connect succeeded to {} after rotation chain",
+                                    target
+                                );
+                                return Ok((
+                                    peer_conn,
+                                    ConnectionMethod::HolePunched { coordinator },
+                                ));
                             } else {
                                 debug!("Hole-punch failed after {} rounds", round);
                                 strategy.transition_to_relay(e.to_string());
                             }
                         }
                         Err(_) => {
-                            if let Some(peer_conn) = post_direct.await {
-                                return Ok((
-                                    peer_conn,
-                                    ConnectionMethod::HolePunched { coordinator },
-                                ));
-                            }
                             strategy.record_holepunch_error(round, "Timeout".to_string());
                             let next_coord = if is_rotating && !is_final_rotation_attempt {
                                 coordinator_candidates
@@ -1910,6 +1923,17 @@ impl P2pEndpoint {
                                     round
                                 );
                                 strategy.increment_round();
+                            } else if let Some(peer_conn) =
+                                self.try_post_rotation_direct(target).await
+                            {
+                                info!(
+                                    "✓ Post-rotation direct connect succeeded to {} after timeout rotation chain",
+                                    target
+                                );
+                                return Ok((
+                                    peer_conn,
+                                    ConnectionMethod::HolePunched { coordinator },
+                                ));
                             } else {
                                 debug!("Hole-punch timed out after {} rounds", round);
                                 strategy.transition_to_relay("Timeout");
@@ -2070,6 +2094,41 @@ impl P2pEndpoint {
     }
 
     /// Internal helper for hole-punch attempt
+    /// Single direct-dial attempt at the end of a coordinator rotation.
+    ///
+    /// Replaces the per-round `post_direct` probe that used to fire after
+    /// every failed hole-punch attempt. The per-round probe was the source
+    /// of the "duplicate connection" close storm: each round opened a
+    /// parallel A→B QUIC dial alongside the relayed B→A return, and under
+    /// symmetric NAT each return arrived on a fresh source port that
+    /// SocketAddr-keyed dedup did not collapse.
+    ///
+    /// Calling this exactly once after the rotation chain has been
+    /// exhausted preserves the original optimisation — the cumulative NAT
+    /// bindings created by the rotation may finally let a direct dial
+    /// through — without producing a per-round race. Returns `Some` only
+    /// if the dial completes within
+    /// [`POST_HOLEPUNCH_DIRECT_RETRY_TIMEOUT`].
+    async fn try_post_rotation_direct(&self, target: SocketAddr) -> Option<PeerConnection> {
+        match timeout(POST_HOLEPUNCH_DIRECT_RETRY_TIMEOUT, self.connect(target)).await {
+            Ok(Ok(peer_conn)) => Some(peer_conn),
+            Ok(Err(e)) => {
+                debug!(
+                    "try_post_rotation_direct: connect to {} failed: {}",
+                    target, e
+                );
+                None
+            }
+            Err(_) => {
+                debug!(
+                    "try_post_rotation_direct: connect to {} timed out after {:?}",
+                    target, POST_HOLEPUNCH_DIRECT_RETRY_TIMEOUT
+                );
+                None
+            }
+        }
+    }
+
     async fn try_hole_punch(
         &self,
         target: SocketAddr,
@@ -2342,6 +2401,34 @@ impl P2pEndpoint {
         peers.values().any(|p| p.remote_addr == transport_addr)
     }
 
+    /// Find an existing live connection from the same TLS public key.
+    ///
+    /// Used to dedup symmetric-NAT rebinds at accept time. When a peer's
+    /// rotation chain produces several return connections on different
+    /// source ports, the SocketAddr-keyed `connected_peers` map cannot
+    /// collapse them; this helper closes the gap by scanning for any
+    /// existing entry whose `public_key` matches and whose underlying
+    /// QUIC connection is still alive.
+    ///
+    /// Returns the [`SocketAddr`] of the surviving connection on a hit,
+    /// `None` otherwise. O(N) over connected peers; acceptable since
+    /// accept rate is bounded by the network and the typical N is in
+    /// the hundreds.
+    async fn find_live_connection_by_public_key(&self, public_key: &[u8]) -> Option<SocketAddr> {
+        let peers = self.connected_peers.read().await;
+        for (addr, peer_conn) in peers.iter() {
+            if peer_conn
+                .public_key
+                .as_deref()
+                .is_some_and(|existing| existing == public_key)
+                && self.inner.is_connected(addr)
+            {
+                return Some(*addr);
+            }
+        }
+        None
+    }
+
     /// Accept incoming connections
     ///
     /// Returns `None` if the endpoint is shutting down or the accept fails.
@@ -2361,6 +2448,32 @@ impl P2pEndpoint {
             Ok((remote_addr, connection)) => {
                 // Extract public key from TLS handshake
                 let remote_public_key = extract_public_key_bytes_from_connection(&connection);
+
+                // Peer-identity dedup: under symmetric NAT a single
+                // logical peer can produce several QUIC connections in
+                // close succession (one per coordinator round in the
+                // dialer's rotation chain), each arriving on a fresh
+                // source port. The SocketAddr-keyed dedup in
+                // `spawn_accept_loop` and `attempt_hole_punch` cannot
+                // collapse them because their keys differ. Without this
+                // peer-id check those duplicates accumulate in
+                // `connected_peers`, race for the same logical channel
+                // up at saorsa-core, and produce the "duplicate
+                // connection" close storm that previously broke identity
+                // exchange. Catching duplicates by TLS public key
+                // *before* registering them keeps the first surviving
+                // connection authoritative and silently drops the rest.
+                if let Some(ref new_key) = remote_public_key
+                    && let Some(existing_addr) =
+                        self.find_live_connection_by_public_key(new_key).await
+                {
+                    info!(
+                        "accept: duplicate connection from already-connected peer (existing addr {}, new addr {}) — closing new",
+                        existing_addr, remote_addr
+                    );
+                    connection.close(0u32.into(), b"duplicate-peer-id");
+                    return None;
+                }
 
                 // They initiated the connection to us = Server side
                 if let Err(e) = self.inner.spawn_connection_handler(
