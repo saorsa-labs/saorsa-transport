@@ -2569,6 +2569,35 @@ impl P2pEndpoint {
         stats.total_bootstrap_nodes += 1;
     }
 
+    /// Establish a proactive MASQUE relay session with `relay_addr` and rebind
+    /// the local Quinn endpoint onto the resulting tunnel.
+    ///
+    /// This is the caller-driven entry point for ADR-014-style relay acquisition
+    /// in saorsa-core. It delegates to [`NatTraversalEndpoint::setup_proactive_relay`],
+    /// which establishes the MASQUE `CONNECT-UDP` session, calls
+    /// `endpoint.rebind_abstract()` to route all local QUIC traffic through the
+    /// MASQUE tunnel, and advertises the relay's public-side allocated address
+    /// to all currently connected peers.
+    ///
+    /// On success, the returned `SocketAddr` is the relay-allocated public
+    /// address the caller should publish as its contact address in the DHT
+    /// self-record. A `RelayEstablished` event is also emitted on the event
+    /// broadcaster so downstream listeners (e.g., saorsa-core's DHT bridge)
+    /// can propagate the address without needing the return value.
+    ///
+    /// Errors from `setup_proactive_relay` (including
+    /// [`NatTraversalError::RelayAtCapacity`]) are propagated through the
+    /// [`EndpointError::NatTraversal`] conversion, so callers can match on the
+    /// inner variant to distinguish "walk to next candidate" from other
+    /// failure modes.
+    pub async fn setup_proactive_relay(
+        &self,
+        relay_addr: SocketAddr,
+    ) -> Result<SocketAddr, EndpointError> {
+        let allocated = self.inner.setup_proactive_relay(relay_addr).await?;
+        Ok(allocated)
+    }
+
     /// Get list of connected peers
     pub async fn connected_peers(&self) -> Vec<PeerConnection> {
         self.connected_peers
