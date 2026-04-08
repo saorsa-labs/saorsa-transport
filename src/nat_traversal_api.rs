@@ -19,6 +19,21 @@ use crate::transport::TransportRegistry;
 
 use crate::SHUTDOWN_DRAIN_TIMEOUT;
 
+/// Maximum number of distinct relay clients a single public peer will serve.
+///
+/// Per ADR-014 in saorsa-core: popular public peers must not become involuntary
+/// infrastructure for the whole network. The cap bounds relay load while still
+/// giving private peers enough choice to find an accepting relayer within their
+/// XOR close-group walk.
+const MAX_RELAY_CLIENTS_PER_PUBLIC_PEER: usize = 2;
+
+/// HTTP-like status code returned by a MASQUE relay when it refuses a new
+/// CONNECT-UDP Bind request because its relay client slots are full.
+///
+/// Callers receiving this status should walk to the next candidate relayer
+/// rather than retrying against the same one. See [`NatTraversalError::RelayAtCapacity`].
+const MASQUE_RELAY_FULL_STATUS: u16 = 503;
+
 /// Creates a bind address that allows the OS to select a random available port
 ///
 /// This provides protocol obfuscation by preventing port fingerprinting, which improves
@@ -1064,6 +1079,12 @@ pub enum NatTraversalError {
     TraversalFailed(String),
     /// Peer not connected
     PeerNotConnected,
+    /// Relay server rejected the request because it is at its client capacity
+    /// (HTTP-like status 503). Callers should try the next candidate relay.
+    RelayAtCapacity {
+        /// Human-readable reason supplied by the relay
+        reason: String,
+    },
 }
 
 impl Default for NatTraversalConfig {
@@ -1331,10 +1352,12 @@ impl NatTraversalEndpoint {
         };
 
         // Symmetric P2P: Create MASQUE relay server so this node can provide relay services
-        // Per ADR-004: All nodes are equal and participate in relaying with resource budgets
+        // Per ADR-004: All nodes are equal and participate in relaying with resource budgets.
+        // Per ADR-014 (saorsa-core): the per-node cap is bounded so popular public peers do
+        // not become involuntary infrastructure for the whole network.
         let relay_server = {
             let relay_config = MasqueRelayConfig {
-                max_sessions: 100, // Reasonable limit for resource budget
+                max_sessions: MAX_RELAY_CLIENTS_PER_PUBLIC_PEER,
                 require_authentication: true,
                 ..MasqueRelayConfig::default()
             };
@@ -1755,10 +1778,12 @@ impl NatTraversalEndpoint {
         };
 
         // Symmetric P2P: Create MASQUE relay server so this node can provide relay services
-        // Per ADR-004: All nodes are equal and participate in relaying with resource budgets
+        // Per ADR-004: All nodes are equal and participate in relaying with resource budgets.
+        // Per ADR-014 (saorsa-core): the per-node cap is bounded so popular public peers do
+        // not become involuntary infrastructure for the whole network.
         let relay_server = {
             let relay_config = MasqueRelayConfig {
-                max_sessions: 100, // Reasonable limit for resource budget
+                max_sessions: MAX_RELAY_CLIENTS_PER_PUBLIC_PEER,
                 require_authentication: true,
                 ..MasqueRelayConfig::default()
             };
@@ -3430,6 +3455,12 @@ impl NatTraversalEndpoint {
 
         if !response.is_success() {
             let reason = response.reason.unwrap_or_else(|| "unknown".to_string());
+            // Distinguish "at capacity" (client should walk to next candidate) from
+            // other failure modes. See ADR-014 in saorsa-core for the 2-client cap
+            // design.
+            if response.status == MASQUE_RELAY_FULL_STATUS {
+                return Err(NatTraversalError::RelayAtCapacity { reason });
+            }
             return Err(NatTraversalError::ConnectionFailed(format!(
                 "Relay rejected request: {} (status {})",
                 reason, response.status
@@ -6695,6 +6726,9 @@ impl fmt::Display for NatTraversalError {
             Self::ConnectionFailed(msg) => write!(f, "connection failed: {msg}"),
             Self::TraversalFailed(msg) => write!(f, "traversal failed: {msg}"),
             Self::PeerNotConnected => write!(f, "peer not connected"),
+            Self::RelayAtCapacity { reason } => {
+                write!(f, "relay at client capacity: {reason}")
+            }
         }
     }
 }
