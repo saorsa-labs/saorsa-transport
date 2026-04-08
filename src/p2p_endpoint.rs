@@ -74,6 +74,7 @@ pub use crate::nat_traversal_api::TraversalPhase;
 use crate::nat_traversal_api::{NatTraversalEndpoint, NatTraversalError, NatTraversalEvent};
 use crate::reachability::{ReachabilityScope, TraversalMethod, socket_addr_scope};
 use crate::transport::{ProtocolEngine, TransportAddr, TransportRegistry};
+use crate::shared::normalize_socket_addr;
 use crate::unified_config::P2pConfig;
 use rustls;
 
@@ -1307,6 +1308,7 @@ impl P2pEndpoint {
     /// Keyed by target address so concurrent dials to different peers each
     /// get their own peer ID without racing on shared state.
     pub async fn set_hole_punch_target_peer_id(&self, target: SocketAddr, peer_id: [u8; 32]) {
+        let target = normalize_socket_addr(target);
         self.hole_punch_target_peer_ids.insert(target, peer_id);
     }
 
@@ -1344,6 +1346,7 @@ impl P2pEndpoint {
         target: SocketAddr,
         coordinators: Vec<SocketAddr>,
     ) {
+        let target = normalize_socket_addr(target);
         if coordinators.is_empty() {
             self.hole_punch_preferred_coordinators.remove(&target);
         } else {
@@ -1516,7 +1519,11 @@ impl P2pEndpoint {
         // loop falls back to the existing single-coordinator retry behaviour.
         let mut preferred_coordinator_count: usize = 0;
         if let Some(target_addr) = target {
-            if let Some(preferred) = self.hole_punch_preferred_coordinators.get(&target_addr) {
+            let normalized_target_addr = normalize_socket_addr(target_addr);
+            if let Some(preferred) = self
+                .hole_punch_preferred_coordinators
+                .get(&normalized_target_addr)
+            {
                 let preferred_list: Vec<SocketAddr> = preferred.clone();
                 drop(preferred); // Release the DashMap entry guard before mutating coordinator_candidates.
                 Self::merge_preferred_coordinators(&mut coordinator_candidates, &preferred_list);
@@ -2107,7 +2114,19 @@ impl P2pEndpoint {
         // Initiate NAT traversal — sends PUNCH_ME_NOW to coordinator.
         // Look up the target peer ID from the per-target map. This avoids
         // races when multiple concurrent connections share the same P2pEndpoint.
-        let target_peer_id = self.hole_punch_target_peer_ids.get(&target).map(|v| *v);
+        // Normalize the key to handle IPv4-mapped IPv6 addresses (::ffff:x.x.x.x)
+        // that may differ from the IPv4 key used by saorsa-core when storing.
+        let normalized_target = normalize_socket_addr(target);
+        if normalized_target != target {
+            info!(
+                "try_hole_punch: normalized target {} -> {} for peer ID lookup",
+                target, normalized_target
+            );
+        }
+        let target_peer_id = self
+            .hole_punch_target_peer_ids
+            .get(&normalized_target)
+            .map(|v| *v);
         if let Some(ref pid) = target_peer_id {
             info!(
                 "try_hole_punch: calling initiate_nat_traversal({}, {}) with peer ID {} (dashmap key={})",
