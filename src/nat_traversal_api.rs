@@ -252,6 +252,10 @@ pub struct NatTraversalEndpoint {
 
     /// NAT traversal configuration
     config: NatTraversalConfig,
+    /// BLAKE3 hash of our local SPKI public key, used for deterministic
+    /// simultaneous-connect tie-breaking. Both sides keep the connection
+    /// initiated by the peer with the lexicographically lower peer ID.
+    local_peer_id: [u8; 32],
     /// Known bootstrap/coordinator nodes
     /// Uses parking_lot::RwLock for faster, non-poisoning reads
     bootstrap_nodes: Arc<ParkingRwLock<Vec<BootstrapNode>>>,
@@ -1464,9 +1468,18 @@ impl NatTraversalEndpoint {
         // Channel for background handshake completion (persistent across accept calls)
         let (hs_tx, hs_rx) = mpsc::channel(32);
 
+        // Compute local peer ID = BLAKE3(public_key_spki) for
+        // deterministic simultaneous-connect tie-breaking.
+        let local_peer_id: [u8; 32] = config
+            .identity_key
+            .as_ref()
+            .map(|(pub_key, _)| *blake3::hash(pub_key.0.as_ref()).as_bytes())
+            .unwrap_or([0u8; 32]);
+
         let endpoint = Self {
             inner_endpoint: Some(inner_endpoint.clone()),
             config: config.clone(),
+            local_peer_id,
             bootstrap_nodes,
             active_sessions: Arc::new(dashmap::DashMap::new()),
             discovery_manager,
@@ -1673,6 +1686,13 @@ impl NatTraversalEndpoint {
 
         let local_session_id = DiscoverySessionId::Local;
         let relay_setup_attempted_clone = endpoint.relay_setup_attempted.clone();
+        let known_peers_for_poll: std::collections::HashSet<SocketAddr> =
+            endpoint.config.known_peers.iter().copied().collect();
+        let local_port_for_poll: u16 = endpoint
+            .config
+            .bind_addr
+            .map(|a| a.port())
+            .unwrap_or(0);
         tokio::spawn(async move {
             Self::poll_discovery(
                 discovery_manager_clone,
@@ -1682,6 +1702,8 @@ impl NatTraversalEndpoint {
                 event_callback_for_poll,
                 local_session_id,
                 relay_setup_attempted_clone,
+                known_peers_for_poll,
+                local_port_for_poll,
             )
             .await;
         });
@@ -1888,9 +1910,18 @@ impl NatTraversalEndpoint {
         // Channel for background handshake completion (persistent across accept calls)
         let (hs_tx, hs_rx) = mpsc::channel(32);
 
+        // Compute local peer ID = BLAKE3(public_key_spki) for
+        // deterministic simultaneous-connect tie-breaking.
+        let local_peer_id: [u8; 32] = config
+            .identity_key
+            .as_ref()
+            .map(|(pub_key, _)| *blake3::hash(pub_key.0.as_ref()).as_bytes())
+            .unwrap_or([0u8; 32]);
+
         let endpoint = Self {
             inner_endpoint: Some(inner_endpoint.clone()),
             config: config.clone(),
+            local_peer_id,
             bootstrap_nodes,
             active_sessions: Arc::new(dashmap::DashMap::new()),
             discovery_manager,
@@ -2097,6 +2128,13 @@ impl NatTraversalEndpoint {
 
         let local_session_id = DiscoverySessionId::Local;
         let relay_setup_attempted_clone = endpoint.relay_setup_attempted.clone();
+        let known_peers_for_poll: std::collections::HashSet<SocketAddr> =
+            endpoint.config.known_peers.iter().copied().collect();
+        let local_port_for_poll: u16 = endpoint
+            .config
+            .bind_addr
+            .map(|a| a.port())
+            .unwrap_or(0);
         tokio::spawn(async move {
             Self::poll_discovery(
                 discovery_manager_clone,
@@ -2106,6 +2144,8 @@ impl NatTraversalEndpoint {
                 event_callback_for_poll,
                 local_session_id,
                 relay_setup_attempted_clone,
+                known_peers_for_poll,
+                local_port_for_poll,
             )
             .await;
         });
@@ -3165,6 +3205,8 @@ impl NatTraversalEndpoint {
         event_callback: Option<Arc<dyn Fn(NatTraversalEvent) + Send + Sync>>,
         local_session_id: DiscoverySessionId,
         relay_setup_attempted: Arc<std::sync::atomic::AtomicBool>,
+        _known_peers: std::collections::HashSet<SocketAddr>,
+        local_listen_port: u16,
     ) {
         use tokio::time::{Duration, interval};
 
@@ -3195,6 +3237,30 @@ impl NatTraversalEndpoint {
                     observed
                 );
                 if let Some(observed_addr) = observed {
+                    // Port filter: if we know our listen port (non-zero),
+                    // only accept observations that report the same port.
+                    // MASQUE relay sessions allocate ephemeral ports on the
+                    // relay server (same IP, different port). These relay
+                    // ports are NOT our listen address and must not be
+                    // published in the DHT or used for symmetric-NAT
+                    // detection. This single check replaces the previous
+                    // IP-baseline approach and catches all relay-port
+                    // pollution regardless of whether the relay runs on a
+                    // known peer, a regular peer, or our own node.
+                    if local_listen_port != 0
+                        && observed_addr.port() != local_listen_port
+                    {
+                        tracing::debug!(
+                            "poll_discovery_task: SKIPPING observation {} from {} \
+                             (port {} != listen port {})",
+                            observed_addr,
+                            remote_addr,
+                            observed_addr.port(),
+                            local_listen_port,
+                        );
+                        continue;
+                    }
+
                     // Emit event if this is the first time this remote reported this address
                     if emitted_discovery.insert((remote_addr, observed_addr)) {
                         info!(
@@ -3757,6 +3823,7 @@ impl NatTraversalEndpoint {
         let event_tx_opt = self.event_tx.clone();
         let shutdown = self.shutdown.clone();
         let incoming_notify = self.incoming_notify.clone();
+        let local_peer_id = self.local_peer_id;
 
         tokio::spawn(async move {
             loop {
@@ -3814,15 +3881,20 @@ impl NatTraversalEndpoint {
                     let remote_address = connection.remote_address();
                     info!("Accepted connection from {} (unified path)", remote_address);
 
-                    // If an existing live connection to this address exists,
-                    // replace it with the newer one. The remote peer just
-                    // completed a fresh TLS handshake on this connection, so
-                    // this is the one they are actively using. Closing the
-                    // newer connection (the old behavior) kills the remote's
-                    // active connection and breaks identity exchange.
+                    // Simultaneous-connect dedup with deterministic
+                    // tie-breaking. When two nodes connect to each other at
+                    // the same time, both end up with two QUIC connections.
+                    // We resolve this deterministically: the node with the
+                    // lexicographically *lower* peer ID keeps its outbound
+                    // connection (the one it initiated). Because both sides
+                    // apply the same rule, they converge on keeping exactly
+                    // one connection without any signalling.
                     //
-                    // This is consistent with `add_connection` which also
-                    // always overwrites with the newer connection.
+                    // For an *accepted* (inbound) connection, "we are the
+                    // higher ID" means the remote initiated it and we
+                    // should keep it (close ours). "We are the lower ID"
+                    // means we should keep our outbound instead, so we
+                    // close this incoming one.
                     let normalized_remote = crate::shared::normalize_socket_addr(remote_address);
                     let has_live = |addr: &std::net::SocketAddr| -> bool {
                         connections2
@@ -3830,16 +3902,40 @@ impl NatTraversalEndpoint {
                             .is_some_and(|e| e.value().close_reason().is_none())
                     };
                     if has_live(&remote_address) || has_live(&normalized_remote) {
+                        // Extract the remote peer's public key to compute
+                        // their peer ID for tie-breaking.
+                        let remote_peer_id: Option<[u8; 32]> =
+                            Self::extract_public_key_from_connection(&connection)
+                                .map(|spki| *blake3::hash(&spki).as_bytes());
+
+                        if let Some(remote_id) = remote_peer_id {
+                            // Deterministic rule: the peer with the lower
+                            // ID keeps its *outbound* connection. This is
+                            // an inbound connection, so:
+                            //   - If local < remote: we keep our outbound
+                            //     → close this inbound, keep existing.
+                            //   - If local > remote: remote keeps their
+                            //     outbound (this conn) → close existing.
+                            //   - If equal (self-connect): close incoming.
+                            if local_peer_id <= remote_id {
+                                info!(
+                                    "accept_loop: {} simultaneous-connect tie-break: \
+                                     keeping existing outbound (local_id < remote_id)",
+                                    remote_address
+                                );
+                                connection.close(0u32.into(), b"simultaneous-open-tiebreak");
+                                return;
+                            }
+                        }
+
+                        // Remote has lower ID, so they keep their outbound
+                        // (this connection). Close our existing outbound
+                        // with a grace period for in-flight operations.
                         info!(
-                            "accept_loop: {} replacing existing connection with newer (deferred close in 5s)",
+                            "accept_loop: {} simultaneous-connect tie-break: \
+                             replacing existing with inbound (remote_id < local_id)",
                             remote_address
                         );
-                        // Close the old connection after a grace period so
-                        // in-flight DHT operations can complete. Closing
-                        // immediately causes the remote to tear down all
-                        // state (including pending queries). The 5s delay
-                        // allows responses to arrive before the connection
-                        // is torn down.
                         let old_conn = if let Some(old) = connections2.get(&remote_address) {
                             Some(old.value().clone())
                         } else {
@@ -4169,16 +4265,40 @@ impl NatTraversalEndpoint {
         Ok(None)
     }
 
-    /// Detect symmetric NAT by checking port diversity across peer connections.
+    /// Detect symmetric NAT by checking port diversity across **known-peer**
+    /// (bootstrap) connections only.
     ///
-    /// Returns `true` if at least 2 different external ports are observed from
-    /// different peers, indicating that the NAT assigns a different port per
-    /// destination (symmetric NAT behaviour).
+    /// Returns `true` if at least 2 different external ports are observed
+    /// from known peers, indicating that the NAT assigns a different port
+    /// per destination (symmetric NAT behaviour).
+    ///
+    /// Only known-peer connections are consulted because:
+    /// 1. They are public, long-lived, and use our primary QUIC socket.
+    /// 2. Relay connections (MASQUE) allocate a *separate* port on the
+    ///    relay server, which is not evidence of symmetric NAT on our
+    ///    local gateway. Including relay ports would false-positive on
+    ///    every public node that happens to set up a relay fallback.
+    /// 3. Ephemeral peer connections may transit different NAT paths
+    ///    (multi-homed hosts, VPNs) that are not representative.
     pub fn is_symmetric_nat(&self) -> bool {
+        let known_peer_addrs: std::collections::HashSet<_> =
+            self.config.known_peers.iter().copied().collect();
+
+        if known_peer_addrs.is_empty() {
+            // Without known peers we have no reliable baseline — be
+            // conservative and assume we are NOT behind symmetric NAT.
+            return false;
+        }
+
         let mut observed_ports = std::collections::HashSet::new();
 
         for entry in self.connections.iter() {
-            if let Some(addr) = entry.value().observed_address() {
+            let conn = entry.value();
+            // Only consider connections to known (bootstrap) peers.
+            if !known_peer_addrs.contains(&conn.remote_address()) {
+                continue;
+            }
+            if let Some(addr) = conn.observed_address() {
                 observed_ports.insert(addr.port());
             }
         }
@@ -4186,7 +4306,7 @@ impl NatTraversalEndpoint {
         let is_symmetric = observed_ports.len() >= 2;
         if is_symmetric {
             info!(
-                "Symmetric NAT detected: {} different external ports observed ({:?})",
+                "Symmetric NAT detected: {} different external ports observed from known peers ({:?})",
                 observed_ports.len(),
                 observed_ports
             );

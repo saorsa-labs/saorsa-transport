@@ -593,11 +593,27 @@ async fn do_cleanup_connection(
     addr: &SocketAddr,
     reason: DisconnectReason,
 ) -> bool {
-    // Step 1: Remove from connected_peers (canonical lock #1)
-    let removed = connected_peers.write().await.remove(addr);
+    // Step 1: Check if the NAT traversal layer still has a *live*
+    // connection at this address. When a simultaneous-connect
+    // tie-break or hole-punch race replaces the old connection with
+    // a newer one, the old reader task exits and triggers cleanup.
+    // If the newer connection is already live in the DashMap,
+    // removing the address would kill the replacement — causing
+    // "Peer not found" errors on subsequent sends. Only proceed
+    // with full cleanup when no live connection remains.
+    if let Ok(None) = inner.remove_connection(addr) {
+        // remove_connection returned Ok(None) — a live connection
+        // exists at this address; the dead reader's cleanup must
+        // not disturb it.
+        debug!(
+            "do_cleanup_connection: {} still has a live replacement connection, skipping cleanup",
+            addr
+        );
+        return false;
+    }
 
-    // Step 2: Remove from NAT traversal layer (lock-free DashMap)
-    let _ = inner.remove_connection(addr);
+    // Step 2: Remove from connected_peers (canonical lock #1)
+    let removed = connected_peers.write().await.remove(addr);
 
     // Step 3: Remove and abort reader task (canonical lock #2)
     let abort_handle = reader_handles.write().await.remove(addr);
@@ -1366,8 +1382,22 @@ impl P2pEndpoint {
         target: SocketAddr,
         coordinator: SocketAddr,
     ) {
-        self.set_hole_punch_preferred_coordinators(target, vec![coordinator])
-            .await;
+        let target = normalize_socket_addr(target);
+        // Append to the existing list instead of overwriting.
+        // During an iterative DHT lookup, multiple peers may refer us
+        // to the same target. Each referrer is a potential coordinator.
+        // Accumulating them gives the hole-punch rotation loop several
+        // options, so a coordinator that lacks a connection to the
+        // target can be skipped quickly (1.5s) in favour of one that
+        // does.
+        self.hole_punch_preferred_coordinators
+            .entry(target)
+            .and_modify(|v| {
+                if !v.contains(&coordinator) {
+                    v.push(coordinator);
+                }
+            })
+            .or_insert_with(|| vec![coordinator]);
     }
 
     /// Connect with automatic fallback: Direct → HolePunch → Relay.
@@ -2248,12 +2278,25 @@ impl P2pEndpoint {
             target, relay_addr
         );
 
-        // Step 1: Establish relay session (control plane handshake)
-        let (public_addr, relay_socket) = self
-            .inner
-            .establish_relay_session(relay_addr)
-            .await
-            .map_err(EndpointError::NatTraversal)?;
+        // Step 1: Establish relay session (control plane handshake).
+        // Hard 5-second timeout: the CONNECT-UDP handshake should
+        // complete in well under 1 second on any healthy relay. If
+        // the relay is unreachable or overloaded, fail fast so the
+        // strategy can try the next relay or give up.
+        let (public_addr, relay_socket) = match timeout(
+            Duration::from_secs(5),
+            self.inner.establish_relay_session(relay_addr),
+        )
+        .await
+        {
+            Ok(result) => result.map_err(EndpointError::NatTraversal)?,
+            Err(_) => {
+                return Err(EndpointError::Connection(format!(
+                    "MASQUE relay session establishment timed out (5s) for {}",
+                    relay_addr
+                )));
+            }
+        };
 
         info!(
             "MASQUE relay session established via {} (public addr: {:?})",
