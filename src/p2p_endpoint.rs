@@ -2569,6 +2569,16 @@ impl P2pEndpoint {
         stats.total_bootstrap_nodes += 1;
     }
 
+    /// Enable or disable relay serving on this node's MASQUE relay server.
+    ///
+    /// Delegates to [`NatTraversalEndpoint::set_relay_serving_enabled`].
+    /// Called by the ADR-014 reachability classifier: public nodes leave it
+    /// enabled, private nodes disable it so they reject incoming relay
+    /// reservation requests.
+    pub fn set_relay_serving_enabled(&self, enabled: bool) {
+        self.inner.set_relay_serving_enabled(enabled);
+    }
+
     /// Establish a proactive MASQUE relay session with `relay_addr` and rebind
     /// the local Quinn endpoint onto the resulting tunnel.
     ///

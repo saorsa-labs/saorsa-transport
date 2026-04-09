@@ -35,7 +35,7 @@ use bytes::Bytes;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
@@ -197,6 +197,16 @@ pub struct MasqueRelayServer {
     started_at: Instant,
     /// Bridged connection count (IPv4↔IPv6)
     bridged_connections: AtomicU64,
+    /// Whether this node is willing to serve as a relay for private peers.
+    ///
+    /// Set to `false` by the ADR-014 reachability classifier when the node
+    /// determines it is itself private (not publicly reachable). Private
+    /// nodes reject incoming relay reservation requests since they cannot
+    /// forward traffic from the public internet.
+    ///
+    /// Defaults to `true` so nodes are relay-capable unless the classifier
+    /// explicitly disables it.
+    relay_serving_enabled: AtomicBool,
 }
 
 impl MasqueRelayServer {
@@ -206,6 +216,7 @@ impl MasqueRelayServer {
             config,
             public_address,
             secondary_address: None,
+            relay_serving_enabled: AtomicBool::new(true),
             sessions: RwLock::new(HashMap::new()),
             client_to_session: RwLock::new(HashMap::new()),
             next_session_id: AtomicU64::new(1),
@@ -252,6 +263,7 @@ impl MasqueRelayServer {
             config,
             public_address: primary,
             secondary_address: Some(secondary),
+            relay_serving_enabled: AtomicBool::new(true),
             sessions: RwLock::new(HashMap::new()),
             client_to_session: RwLock::new(HashMap::new()),
             next_session_id: AtomicU64::new(1),
@@ -259,6 +271,25 @@ impl MasqueRelayServer {
             started_at: Instant::now(),
             bridged_connections: AtomicU64::new(0),
         }
+    }
+
+    /// Enable or disable relay serving.
+    ///
+    /// Called by the ADR-014 reachability classifier: public nodes leave this
+    /// enabled (the default), private nodes disable it so they reject incoming
+    /// relay reservation requests.
+    pub fn set_relay_serving_enabled(&self, enabled: bool) {
+        self.relay_serving_enabled.store(enabled, Ordering::Release);
+        if enabled {
+            tracing::info!("Relay serving enabled — accepting relay reservation requests");
+        } else {
+            tracing::info!("Relay serving disabled — rejecting relay reservation requests");
+        }
+    }
+
+    /// Whether this node is willing to serve as a relay.
+    pub fn is_relay_serving_enabled(&self) -> bool {
+        self.relay_serving_enabled.load(Ordering::Acquire)
     }
 
     /// Check if this server supports dual-stack (IPv4 and IPv6)
@@ -370,6 +401,16 @@ impl MasqueRelayServer {
         request: &ConnectUdpRequest,
         client_addr: SocketAddr,
     ) -> RelayResult<ConnectUdpResponse> {
+        // ADR-014: private nodes must not serve as relays because they
+        // cannot forward traffic from the public internet. The classifier
+        // toggles this flag after determining the node's reachability.
+        if !self.is_relay_serving_enabled() {
+            return Ok(ConnectUdpResponse::error(
+                503,
+                "Node is not serving as relay (classified as private)".to_string(),
+            ));
+        }
+
         // Check session limit
         let current_sessions = self.stats.current_active_sessions();
         if current_sessions >= self.config.max_sessions as u64 {

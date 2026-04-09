@@ -3299,6 +3299,17 @@ impl NatTraversalEndpoint {
         self.relay_manager.clone()
     }
 
+    /// Enable or disable relay serving on this node's MASQUE relay server.
+    ///
+    /// Called by the ADR-014 reachability classifier: public nodes leave it
+    /// enabled, private nodes disable it so incoming relay reservation
+    /// requests are rejected with a 503.
+    pub fn set_relay_serving_enabled(&self, enabled: bool) {
+        if let Some(ref server) = self.relay_server {
+            server.set_relay_serving_enabled(enabled);
+        }
+    }
+
     /// Get the relay public address, if a proactive relay has been established.
     pub fn relay_public_addr(&self) -> Option<SocketAddr> {
         self.relay_public_addr.lock().ok().and_then(|g| *g)
