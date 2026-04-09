@@ -2259,6 +2259,20 @@ impl P2pEndpoint {
                 _ = self.inner.connection_notify().notified() => {
                     debug!("try_hole_punch: connection_notify fired for {}", target);
                 }
+                _ = self.inner.nack_notify().notified() => {
+                    // Check if the NACK is for our target
+                    if let Some(ref pid) = target_peer_id {
+                        if self.inner.consume_nack(pid) {
+                            info!(
+                                "try_hole_punch: NACK received from coordinator for target {} — aborting immediately",
+                                target
+                            );
+                            return Err(EndpointError::Connection(
+                                format!("Coordinator NACK: target {} not found", target),
+                            ));
+                        }
+                    }
+                }
                 _ = self.shutdown.cancelled() => {
                     return Err(EndpointError::ShuttingDown);
                 }

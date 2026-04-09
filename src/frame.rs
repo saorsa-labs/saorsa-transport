@@ -173,6 +173,7 @@ frame_types! {
     TRY_CONNECT_TO_IPV6 = 0x3d7e96,
     TRY_CONNECT_TO_RESPONSE_IPV4 = 0x3d7e97,
     TRY_CONNECT_TO_RESPONSE_IPV6 = 0x3d7e98,
+    PUNCH_ME_NOW_NACK = 0x3d7e99,
     // DATAGRAM
 }
 
@@ -211,6 +212,7 @@ pub(crate) enum Frame {
     ObservedAddress(ObservedAddress),
     TryConnectTo(TryConnectTo),
     TryConnectToResponse(TryConnectToResponse),
+    PunchMeNowNack(PunchMeNowNack),
 }
 
 impl Frame {
@@ -273,6 +275,7 @@ impl Frame {
                 SocketAddr::V4(_) => FrameType::TRY_CONNECT_TO_RESPONSE_IPV4,
                 SocketAddr::V6(_) => FrameType::TRY_CONNECT_TO_RESPONSE_IPV6,
             },
+            PunchMeNowNack(_) => FrameType::PUNCH_ME_NOW_NACK,
         }
     }
 
@@ -900,6 +903,9 @@ impl Iter {
             FrameType::TRY_CONNECT_TO_RESPONSE_IPV6 => {
                 Frame::TryConnectToResponse(TryConnectToResponse::decode(&mut self.bytes, true)?)
             }
+            FrameType::PUNCH_ME_NOW_NACK => {
+                Frame::PunchMeNowNack(PunchMeNowNack::decode(&mut self.bytes)?)
+            }
             _ => {
                 if let Some(s) = ty.stream() {
                     Frame::Stream(Stream {
@@ -1186,7 +1192,8 @@ impl AckFrequency {
 
 // Re-export unified NAT traversal frames
 pub(crate) use nat_traversal_unified::{
-    AddAddress, PunchMeNow, RemoveAddress, TryConnectError, TryConnectTo, TryConnectToResponse,
+    AddAddress, PunchMeNow, PunchMeNowNack, RemoveAddress, TryConnectError, TryConnectTo,
+    TryConnectToResponse,
 };
 
 /// Address Discovery frame for informing peers of their observed address

@@ -344,6 +344,11 @@ pub struct NatTraversalEndpoint {
     /// receives them. Persistent across calls so no connections are lost.
     handshake_tx: mpsc::Sender<Result<(SocketAddr, InnerConnection), String>>,
     handshake_rx: TokioMutex<mpsc::Receiver<Result<(SocketAddr, InnerConnection), String>>>,
+    /// PUNCH_ME_NOW NACKs received from coordinators, keyed by target_peer_id.
+    /// Written by the high-level endpoint poll loop, read by try_hole_punch.
+    nack_set: Arc<dashmap::DashSet<[u8; 32]>>,
+    /// Notification for new NACK arrivals — wakes try_hole_punch poll loops.
+    nack_notify: Arc<tokio::sync::Notify>,
     /// Tracks when each connection was first observed as closed.
     /// Used to enforce a grace period before removing dead connections.
     closed_at: dashmap::DashMap<SocketAddr, std::time::Instant>,
@@ -1465,6 +1470,10 @@ impl NatTraversalEndpoint {
         let (peer_addr_tx, peer_addr_rx) = mpsc::unbounded_channel();
         inner_endpoint.set_peer_address_update_tx(peer_addr_tx);
 
+        // Channel for PUNCH_ME_NOW NACK forwarding
+        let (nack_tx, nack_rx) = mpsc::unbounded_channel();
+        inner_endpoint.set_nack_tx(nack_tx);
+
         // Channel for background handshake completion (persistent across accept calls)
         let (hs_tx, hs_rx) = mpsc::channel(32);
 
@@ -1513,6 +1522,8 @@ impl NatTraversalEndpoint {
             hole_punch_rx: TokioMutex::new(hole_punch_rx),
             handshake_tx: hs_tx,
             handshake_rx: TokioMutex::new(hs_rx),
+            nack_set: Arc::new(dashmap::DashSet::new()),
+            nack_notify: Arc::new(tokio::sync::Notify::new()),
             closed_at: dashmap::DashMap::new(),
             upnp_service: parking_lot::Mutex::new(Some(upnp_service)),
         };
@@ -1677,6 +1688,30 @@ impl NatTraversalEndpoint {
         // P2pEndpoint — that's done by the caller of accept_connection_direct.
         endpoint.spawn_accept_loop();
         info!("Accept loop spawned (unified path, parallel handshakes)");
+
+        // Start NACK forwarder: drains NACK channel from high-level endpoint
+        // and records into DashSet for try_hole_punch to consume.
+        {
+            let nack_set = endpoint.nack_set.clone();
+            let nack_notify = endpoint.nack_notify.clone();
+            let shutdown = endpoint.shutdown.clone();
+            tokio::spawn(async move {
+                let mut nack_rx = nack_rx;
+                while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                    match nack_rx.recv().await {
+                        Some(target_peer_id) => {
+                            tracing::info!(
+                                "NACK received for target {}, notifying hole-punch loops",
+                                hex::encode(&target_peer_id[..8])
+                            );
+                            nack_set.insert(target_peer_id);
+                            nack_notify.notify_waiters();
+                        }
+                        None => break, // Channel closed
+                    }
+                }
+            });
+        }
 
         // Start background discovery polling task
         let discovery_manager_clone = endpoint.discovery_manager.clone();
@@ -1907,6 +1942,10 @@ impl NatTraversalEndpoint {
         let (peer_addr_tx, peer_addr_rx) = mpsc::unbounded_channel();
         inner_endpoint.set_peer_address_update_tx(peer_addr_tx);
 
+        // Channel for PUNCH_ME_NOW NACK forwarding
+        let (nack_tx, nack_rx) = mpsc::unbounded_channel();
+        inner_endpoint.set_nack_tx(nack_tx);
+
         // Channel for background handshake completion (persistent across accept calls)
         let (hs_tx, hs_rx) = mpsc::channel(32);
 
@@ -1955,6 +1994,8 @@ impl NatTraversalEndpoint {
             hole_punch_rx: TokioMutex::new(hole_punch_rx),
             handshake_tx: hs_tx,
             handshake_rx: TokioMutex::new(hs_rx),
+            nack_set: Arc::new(dashmap::DashSet::new()),
+            nack_notify: Arc::new(tokio::sync::Notify::new()),
             closed_at: dashmap::DashMap::new(),
             upnp_service: parking_lot::Mutex::new(Some(upnp_service)),
         };
@@ -2120,6 +2161,30 @@ impl NatTraversalEndpoint {
         endpoint.spawn_accept_loop();
         info!("Accept loop spawned (unified path, parallel handshakes)");
 
+        // Start NACK forwarder: drains NACK channel from high-level endpoint
+        // and records into DashSet for try_hole_punch to consume.
+        {
+            let nack_set = endpoint.nack_set.clone();
+            let nack_notify = endpoint.nack_notify.clone();
+            let shutdown = endpoint.shutdown.clone();
+            tokio::spawn(async move {
+                let mut nack_rx = nack_rx;
+                while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                    match nack_rx.recv().await {
+                        Some(target_peer_id) => {
+                            tracing::info!(
+                                "NACK received for target {}, notifying hole-punch loops",
+                                hex::encode(&target_peer_id[..8])
+                            );
+                            nack_set.insert(target_peer_id);
+                            nack_notify.notify_waiters();
+                        }
+                        None => break, // Channel closed
+                    }
+                }
+            });
+        }
+
         // Start background discovery polling task
         let discovery_manager_clone = endpoint.discovery_manager.clone();
         let shutdown_clone = endpoint.shutdown.clone();
@@ -2179,6 +2244,24 @@ impl NatTraversalEndpoint {
         if let Some(ep) = &self.inner_endpoint {
             ep.register_connection_peer_id(addr, peer_id);
         }
+    }
+
+    /// Record a PUNCH_ME_NOW NACK for a target peer ID.
+    /// Called by the high-level endpoint when it drains NACKs from the low-level.
+    pub fn record_nack(&self, target_peer_id: [u8; 32]) {
+        self.nack_set.insert(target_peer_id);
+        self.nack_notify.notify_waiters();
+    }
+
+    /// Check and consume a NACK for a specific target peer ID.
+    /// Returns true if a NACK was pending for this target (and removes it).
+    pub fn consume_nack(&self, target_peer_id: &[u8; 32]) -> bool {
+        self.nack_set.remove(target_peer_id).is_some()
+    }
+
+    /// Get a reference to the NACK notification handle.
+    pub fn nack_notify(&self) -> &tokio::sync::Notify {
+        &self.nack_notify
     }
 
     /// Get the event callback

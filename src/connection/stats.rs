@@ -112,6 +112,7 @@ impl FrameStats {
             Frame::ObservedAddress(_) => self.observed_address += 1,
             Frame::TryConnectTo(_) => self.try_connect_to += 1,
             Frame::TryConnectToResponse(_) => self.try_connect_to_response += 1,
+            Frame::PunchMeNowNack(_) => {} // Counted via relay stats, not per-frame
         }
     }
 }
