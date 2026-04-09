@@ -32,6 +32,7 @@
 //! ```
 
 use bytes::Bytes;
+use parking_lot::RwLock as ParkingRwLock;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
@@ -177,12 +178,16 @@ pub enum DatagramResult {
 /// The relay server can be created with dual-stack support using [`Self::new_dual_stack`],
 /// which allows bridging traffic between IPv4 and IPv6 networks. This enables
 /// nodes that only have one IP version to communicate with nodes on the other version.
-#[derive(Debug)]
 pub struct MasqueRelayServer {
     /// Server configuration
     config: MasqueRelayConfig,
-    /// Primary public address advertised to clients
-    public_address: SocketAddr,
+    /// Primary public address advertised to clients.
+    ///
+    /// Interior-mutable: initialized with the bind address at construction,
+    /// then updated to the real external IP when `OBSERVED_ADDRESS` frames
+    /// arrive. Uses `parking_lot::RwLock` (not tokio) because all access is
+    /// synchronous.
+    public_address: ParkingRwLock<SocketAddr>,
     /// Secondary public address (other IP version for dual-stack)
     secondary_address: Option<SocketAddr>,
     /// Active sessions by session ID
@@ -209,12 +214,22 @@ pub struct MasqueRelayServer {
     relay_serving_enabled: AtomicBool,
 }
 
+impl std::fmt::Debug for MasqueRelayServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MasqueRelayServer")
+            .field("public_address", &*self.public_address.read())
+            .field("secondary_address", &self.secondary_address)
+            .field("started_at", &self.started_at)
+            .finish_non_exhaustive()
+    }
+}
+
 impl MasqueRelayServer {
     /// Create a new MASQUE relay server with a single IP version
     pub fn new(config: MasqueRelayConfig, public_address: SocketAddr) -> Self {
         Self {
             config,
-            public_address,
+            public_address: ParkingRwLock::new(public_address),
             secondary_address: None,
             relay_serving_enabled: AtomicBool::new(true),
             sessions: RwLock::new(HashMap::new()),
@@ -261,7 +276,7 @@ impl MasqueRelayServer {
 
         Self {
             config,
-            public_address: primary,
+            public_address: ParkingRwLock::new(primary),
             secondary_address: Some(secondary),
             relay_serving_enabled: AtomicBool::new(true),
             sessions: RwLock::new(HashMap::new()),
@@ -295,8 +310,8 @@ impl MasqueRelayServer {
     /// Check if this server supports dual-stack (IPv4 and IPv6)
     pub fn supports_dual_stack(&self) -> bool {
         if let Some(secondary) = self.secondary_address {
-            // Ensure we have both IPv4 and IPv6
-            self.public_address.is_ipv4() != secondary.is_ipv4()
+            let primary = *self.public_address.read();
+            primary.is_ipv4() != secondary.is_ipv4()
         } else {
             false
         }
@@ -324,15 +339,16 @@ impl MasqueRelayServer {
     ///
     /// Returns the IPv4 address for IPv4 targets, IPv6 for IPv6 targets.
     pub fn address_for_target(&self, target: &SocketAddr) -> SocketAddr {
+        let primary = *self.public_address.read();
         if let Some(secondary) = self.secondary_address {
             let target_v4 = target.is_ipv4();
-            if self.public_address.is_ipv4() == target_v4 {
-                self.public_address
+            if primary.is_ipv4() == target_v4 {
+                primary
             } else {
                 secondary
             }
         } else {
-            self.public_address
+            primary
         }
     }
 
@@ -363,22 +379,31 @@ impl MasqueRelayServer {
 
     /// Get public address
     pub fn public_address(&self) -> SocketAddr {
-        self.public_address
+        *self.public_address.read()
     }
 
     /// Update the public address when the actual external address is discovered.
     ///
     /// The relay server is created with the bind address (e.g., `[::]:10000`),
-    /// but after OBSERVED_ADDRESS frames arrive, the real external IP is known.
+    /// but after `OBSERVED_ADDRESS` frames arrive, the real external IP is known.
+    /// This setter should be called at that point so subsequent relay session
+    /// allocations advertise the correct public IP.
+    ///
+    /// Only the IP is updated — the port is left unchanged because the relay
+    /// server's listener port is fixed at bind time.
+    ///
+    /// Existing sessions keep their original advertised address (the session
+    /// response is sent at creation time); only new sessions benefit from the
+    /// updated address.
     pub fn set_public_address(&self, addr: SocketAddr) {
-        // Note: This only affects new sessions. Existing sessions keep their
-        // original advertised address.
-        // We use interior mutability via a separate atomic or by accepting
-        // that the field isn't mutable through &self.
-        // For now, log the update — the actual address propagation happens
-        // via the client's relay session response.
+        let old = {
+            let mut guard = self.public_address.write();
+            let old = *guard;
+            *guard = addr;
+            old
+        };
         tracing::info!(
-            old = %self.public_address,
+            old = %old,
             new = %addr,
             "Relay server public address updated"
         );
@@ -447,18 +472,32 @@ impl MasqueRelayServer {
             ));
         }
 
-        // Determine the public IP to advertise based on client IP version
+        // Determine the public IP to advertise based on client IP version.
+        // Snapshot the public_address once under the lock for consistency.
+        let primary = *self.public_address.read();
         let public_ip = if client_addr.is_ipv4() {
-            if self.public_address.is_ipv4() {
-                self.public_address.ip()
+            if primary.is_ipv4() {
+                primary.ip()
             } else {
-                self.secondary_address.unwrap_or(self.public_address).ip()
+                self.secondary_address.unwrap_or(primary).ip()
             }
-        } else if self.public_address.is_ipv6() {
-            self.public_address.ip()
+        } else if primary.is_ipv6() {
+            primary.ip()
         } else {
-            self.secondary_address.unwrap_or(self.public_address).ip()
+            self.secondary_address.unwrap_or(primary).ip()
         };
+
+        // Safety net: if the public IP is still the wildcard bind address
+        // (0.0.0.0 or [::]), the OBSERVED_ADDRESS discovery hasn't completed
+        // yet and we cannot advertise a routable address. Reject so the
+        // client walks to the next candidate rather than publishing 0.0.0.0
+        // in the DHT.
+        if public_ip.is_unspecified() {
+            return Ok(ConnectUdpResponse::error(
+                503,
+                "Relay server external address not yet discovered".to_string(),
+            ));
+        }
 
         // Bind a real UDP socket for this session's data plane.
         // Bind to INADDR_ANY / IN6ADDR_ANY with OS-assigned port, then advertise

@@ -1608,6 +1608,7 @@ impl NatTraversalEndpoint {
 
         let local_session_id = DiscoverySessionId::Local;
         let relay_setup_attempted_clone = endpoint.relay_setup_attempted.clone();
+        let relay_server_clone = endpoint.relay_server.clone();
         tokio::spawn(async move {
             Self::poll_discovery(
                 discovery_manager_clone,
@@ -1617,6 +1618,7 @@ impl NatTraversalEndpoint {
                 event_callback_for_poll,
                 local_session_id,
                 relay_setup_attempted_clone,
+                relay_server_clone,
             )
             .await;
         });
@@ -2034,6 +2036,7 @@ impl NatTraversalEndpoint {
 
         let local_session_id = DiscoverySessionId::Local;
         let relay_setup_attempted_clone = endpoint.relay_setup_attempted.clone();
+        let relay_server_clone = endpoint.relay_server.clone();
         tokio::spawn(async move {
             Self::poll_discovery(
                 discovery_manager_clone,
@@ -2043,6 +2046,7 @@ impl NatTraversalEndpoint {
                 event_callback_for_poll,
                 local_session_id,
                 relay_setup_attempted_clone,
+                relay_server_clone,
             )
             .await;
         });
@@ -3087,6 +3091,7 @@ impl NatTraversalEndpoint {
         event_callback: Option<Arc<dyn Fn(NatTraversalEvent) + Send + Sync>>,
         local_session_id: DiscoverySessionId,
         relay_setup_attempted: Arc<std::sync::atomic::AtomicBool>,
+        relay_server: Option<Arc<MasqueRelayServer>>,
     ) {
         use tokio::time::{Duration, interval};
 
@@ -3135,6 +3140,18 @@ impl NatTraversalEndpoint {
                                 "poll_discovery_task: invoking event_callback for ExternalAddressDiscovered"
                             );
                             callback(event);
+                        }
+
+                        // ADR-014: update the MASQUE relay server's public
+                        // address so subsequent relay session allocations
+                        // advertise the real external IP instead of the
+                        // wildcard bind address.
+                        if let Some(ref server) = relay_server {
+                            let current = server.public_address();
+                            if current.ip().is_unspecified() {
+                                let updated = SocketAddr::new(observed_addr.ip(), current.port());
+                                server.set_public_address(updated);
+                            }
                         }
 
                         // Track this address for ADD_ADDRESS advertisement
