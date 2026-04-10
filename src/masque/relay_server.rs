@@ -1043,8 +1043,18 @@ impl MasqueRelayServer {
                         break;
                     }
                     let frame_len = u32::from_be_bytes(len_buf) as usize;
-                    if frame_len > 65536 {
-                        tracing::warn!(session_id, frame_len, "Oversized stream frame, dropping");
+
+                    // Safety cap: reject obviously corrupt length prefixes that
+                    // would allocate huge buffers.  Legitimate QUIC packets are
+                    // ≤65535 bytes; anything above 512KB is certainly a framing
+                    // error or corruption — close the session.
+                    const MAX_RELAY_FRAME: usize = 512 * 1024;
+                    if frame_len > MAX_RELAY_FRAME {
+                        tracing::warn!(
+                            session_id,
+                            frame_len,
+                            "Corrupt stream frame length, closing session"
+                        );
                         break;
                     }
 

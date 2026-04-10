@@ -125,8 +125,9 @@ impl MasqueRelaySocket {
                     break;
                 }
                 let frame_len = u32::from_be_bytes(len_buf) as usize;
-                if frame_len > 65536 {
-                    tracing::warn!(frame_len, "MasqueRelaySocket: oversized frame");
+                // Safety cap — same as relay_server::MAX_RELAY_FRAME.
+                if frame_len > 512 * 1024 {
+                    tracing::warn!(frame_len, "MasqueRelaySocket: corrupt frame length");
                     break;
                 }
 
@@ -202,15 +203,31 @@ impl AsyncUdpSocket for MasqueRelaySocket {
             return self.original_socket.try_send(transmit);
         }
 
+        // When Quinn uses GSO (Generic Segmentation Offload), transmit.contents
+        // contains multiple concatenated QUIC packets of `segment_size` bytes.
+        // Each segment must be sent as its own tunnel frame — the relay server
+        // has a per-frame size limit and cannot handle the entire batch as one.
+        if let Some(segment_size) = transmit.segment_size {
+            for chunk in transmit.contents.chunks(segment_size) {
+                let datagram = UncompressedDatagram::new(
+                    VarInt::from_u32(0),
+                    transmit.destination,
+                    Bytes::copy_from_slice(chunk),
+                );
+                self.send_tx.send(datagram.encode()).map_err(|_| {
+                    io::Error::new(io::ErrorKind::ConnectionAborted, "relay stream closed")
+                })?;
+            }
+            return Ok(());
+        }
+
         let datagram = UncompressedDatagram::new(
             VarInt::from_u32(0),
             transmit.destination,
             Bytes::copy_from_slice(transmit.contents),
         );
-        let encoded = datagram.encode();
-
         self.send_tx
-            .send(encoded)
+            .send(datagram.encode())
             .map_err(|_| io::Error::new(io::ErrorKind::ConnectionAborted, "relay stream closed"))
     }
 
