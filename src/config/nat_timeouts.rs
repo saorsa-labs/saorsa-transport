@@ -132,20 +132,10 @@ impl Default for RelayTimeouts {
 }
 
 /// Default time to wait for the peer to acknowledge stream data after a send.
-///
-/// This covers the full round trip: write → peer reads → peer finishes →
-/// acknowledgment propagates back.  For relay traffic the round trip goes
-/// through the MASQUE tunnel (write → relay server → UDP → peer → ACK
-/// back through the tunnel), which adds multiple async hops.  500ms was
-/// too aggressive and caused cascading connection failures under load.
-///
-/// Must be shorter than the caller's `connection_timeout` (25s default in
-/// saorsa-core) so the transport layer surfaces the error first.
-const DEFAULT_SEND_ACK_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_SEND_ACK_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// Fast-network send ACK timeout — suitable for low-latency direct
-/// connections where relay overhead is not a concern.
-const FAST_SEND_ACK_TIMEOUT: Duration = Duration::from_secs(2);
+/// Fast-network send ACK timeout (halved from default, matching the fast profile pattern).
+const FAST_SEND_ACK_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// Master timeout configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
