@@ -241,33 +241,49 @@ impl AsyncUdpSocket for MasqueRelaySocket {
             return Poll::Ready(Ok(0));
         }
 
-        // Priority 1: relay-server traffic on the original socket.
+        let capacity = bufs.len().min(meta.len());
+        let mut filled = 0;
+
+        // Source 1: original socket (relay-server ACKs + direct peer traffic).
         //
-        // The relay connection's own QUIC ACKs and keepalives arrive here.
-        // They MUST be processed promptly — if ACKs are delayed past the
-        // stream timeout (505ms) the relay connection dies and takes the
-        // entire tunnel with it.  Checking this before the tunnel queue
-        // prevents starvation under heavy relay traffic.
-        match self.original_socket.poll_recv(cx, bufs, meta) {
-            Poll::Ready(result) => return Poll::Ready(result),
+        // Relay-server ACKs are critical — delaying them past the QUIC stream
+        // timeout (505ms) kills the tunnel.  Direct peer traffic also arrives
+        // here from nodes that connected before the endpoint rebind.
+        //
+        // We hand the REMAINING buffer slots to the original socket so it can
+        // batch-fill as many as it has ready, then fill the rest from the
+        // tunnel queue.  This ensures neither source starves the other.
+        match self.original_socket.poll_recv(
+            cx,
+            &mut bufs[filled..capacity],
+            &mut meta[filled..capacity],
+        ) {
+            Poll::Ready(Ok(n)) => filled += n,
+            Poll::Ready(Err(e)) => {
+                if filled > 0 {
+                    return Poll::Ready(Ok(filled));
+                }
+                return Poll::Ready(Err(e));
+            }
             Poll::Pending => {}
         }
 
-        // Priority 2: packets that arrived through the relay tunnel.
+        // Source 2: tunnel queue (packets relayed from external peers).
         if let Ok(mut queue) = self.recv_queue.lock() {
-            if let Some((payload, source)) = queue.pop_front() {
-                // Drop oversized payloads rather than truncating — a truncated
-                // QUIC packet fails MAC verification and stalls the connection.
-                if payload.len() > bufs[0].len() {
+            while filled < capacity {
+                let Some((payload, source)) = queue.pop_front() else {
+                    break;
+                };
+                if payload.len() > bufs[filled].len() {
                     tracing::warn!(
                         payload_len = payload.len(),
-                        buf_len = bufs[0].len(),
+                        buf_len = bufs[filled].len(),
                         "MasqueRelaySocket: payload exceeds receive buffer; dropping packet"
                     );
-                    return Poll::Ready(Ok(0));
+                    continue;
                 }
                 let len = payload.len();
-                bufs[0][..len].copy_from_slice(&payload);
+                bufs[filled][..len].copy_from_slice(&payload);
 
                 let mut recv_meta = RecvMeta::default();
                 recv_meta.len = len;
@@ -275,15 +291,18 @@ impl AsyncUdpSocket for MasqueRelaySocket {
                 recv_meta.addr = source;
                 recv_meta.ecn = None;
                 recv_meta.dst_ip = None;
-                meta[0] = recv_meta;
+                meta[filled] = recv_meta;
 
-                return Poll::Ready(Ok(1));
+                filled += 1;
             }
         }
 
+        if filled > 0 {
+            return Poll::Ready(Ok(filled));
+        }
+
         // Neither source has data — register waker for the tunnel queue.
-        // (The original socket already registered the waker in its
-        // poll_recv above, so we'll be woken for either source.)
+        // (The original socket already registered its waker above.)
         if let Ok(mut waker) = self.recv_waker.lock() {
             *waker = Some(cx.waker().clone());
         }
