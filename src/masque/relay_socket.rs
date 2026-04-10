@@ -200,8 +200,18 @@ impl AsyncUdpSocket for MasqueRelaySocket {
         // data carrying the tunnel) must go directly on the original socket;
         // routing them through the tunnel would create a circular dependency.
         if transmit.destination == self.relay_server_addr {
+            tracing::debug!(
+                dest = %transmit.destination,
+                len = transmit.contents.len(),
+                "RELAY_BYPASS: send via original socket (relay server)"
+            );
             return self.original_socket.try_send(transmit);
         }
+        tracing::trace!(
+            dest = %transmit.destination,
+            len = transmit.contents.len(),
+            "RELAY_TUNNEL: send via tunnel"
+        );
 
         // When Quinn uses GSO (Generic Segmentation Offload), transmit.contents
         // contains multiple concatenated QUIC packets of `segment_size` bytes.
@@ -258,8 +268,18 @@ impl AsyncUdpSocket for MasqueRelaySocket {
             &mut bufs[filled..capacity],
             &mut meta[filled..capacity],
         ) {
-            Poll::Ready(Ok(n)) => filled += n,
+            Poll::Ready(Ok(n)) => {
+                for i in filled..filled + n {
+                    tracing::debug!(
+                        source = %meta[i].addr,
+                        len = meta[i].len,
+                        "RELAY_BYPASS: recv from original socket"
+                    );
+                }
+                filled += n;
+            }
             Poll::Ready(Err(e)) => {
+                tracing::debug!(error = %e, "RELAY_BYPASS: original socket recv error");
                 if filled > 0 {
                     return Poll::Ready(Ok(filled));
                 }
@@ -292,6 +312,12 @@ impl AsyncUdpSocket for MasqueRelaySocket {
                 recv_meta.ecn = None;
                 recv_meta.dst_ip = None;
                 meta[filled] = recv_meta;
+
+                tracing::debug!(
+                    source = %source,
+                    len,
+                    "RELAY_TUNNEL: recv from tunnel queue"
+                );
 
                 filled += 1;
             }

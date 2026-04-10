@@ -410,6 +410,12 @@ impl Endpoint {
         inner.ipv6 = addr.is_ipv6();
 
         // Update connection socket references
+        let num_connections = inner.recv_state.connections.senders.len();
+        tracing::info!(
+            new_addr = %addr,
+            connections = num_connections,
+            "RELAY_REBIND: rebinding endpoint, notifying all connections"
+        );
         for sender in inner.recv_state.connections.senders.values() {
             // Ignoring errors from dropped connections
             let _ = sender.send(ConnectionEvent::Rebind(inner.socket.clone()));
