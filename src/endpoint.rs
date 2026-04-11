@@ -116,6 +116,9 @@ pub struct Endpoint {
     /// Pending peer address updates from ADD_ADDRESS frames.
     /// Each entry is (peer_connection_addr, new_advertised_addr).
     pending_peer_address_updates: Vec<(SocketAddr, SocketAddr)>,
+    /// Pending PUNCH_ME_NOW NACKs received from coordinators.
+    /// Drained by the high-level layer to notify try_hole_punch poll loops.
+    pending_nacks: Vec<[u8; 32]>,
 }
 
 /// Deterministic 32-byte wire ID from a SocketAddr, used to correlate
@@ -162,6 +165,7 @@ impl Endpoint {
             pending_relay_events: Vec::new(),
             pending_hole_punch_addrs: Vec::new(),
             pending_peer_address_updates: Vec::new(),
+            pending_nacks: Vec::new(),
         }
     }
 
@@ -242,6 +246,13 @@ impl Endpoint {
         &mut self,
     ) -> impl Iterator<Item = (SocketAddr, SocketAddr)> + '_ {
         self.pending_peer_address_updates.drain(..)
+    }
+
+    /// Drain pending PUNCH_ME_NOW NACKs from coordinators.
+    /// Returns target_peer_id values for which the coordinator could not find
+    /// a connection. The high-level layer should notify waiting hole-punch loops.
+    pub fn drain_nacks(&mut self) -> impl Iterator<Item = [u8; 32]> + '_ {
+        self.pending_nacks.drain(..)
     }
 
     /// Set the peer ID for an existing connection
@@ -381,18 +392,24 @@ impl Endpoint {
                         );
                     }
                 } else {
-                    let known_peers: Vec<String> = self
-                        .connections
-                        .iter()
-                        .filter_map(|(_, meta)| {
-                            meta.peer_id.as_ref().map(|pid| hex::encode(&pid.0[..8]))
-                        })
-                        .collect();
                     tracing::warn!(
-                        "No connection found for PUNCH_ME_NOW relay target peer_id={}, checked {} connections. Known peers: [{}]",
+                        "No connection found for PUNCH_ME_NOW relay target peer_id={}, checked {} connections — sending NACK",
                         hex::encode(&target_peer_id[..8]),
                         self.connections.len(),
-                        known_peers.join(", ")
+                    );
+                    // Send NACK back to the requester so it can immediately
+                    // rotate to another coordinator instead of waiting for timeout.
+                    let nack = crate::frame::PunchMeNowNack {
+                        round: punch_me_now.round,
+                        target_peer_id,
+                    };
+                    self.pending_relay_events.push((
+                        ch,
+                        ConnectionEvent(ConnectionEventInner::QueuePunchMeNowNack(nack)),
+                    ));
+                    tracing::info!(
+                        "Sent PUNCH_ME_NOW_NACK for target {} back to requester",
+                        hex::encode(&target_peer_id[..8])
                     );
                 }
             }
@@ -464,6 +481,15 @@ impl Endpoint {
                 // TODO: In the async wrapper (high_level/mod.rs), implement the actual
                 // connection attempt and send back the TryConnectToResponse.
                 // For now, this event is acknowledged but not acted upon at the endpoint level.
+            }
+            EndpointEventInner::PunchMeNowNacked { target_peer_id } => {
+                // Store NACK for the high-level layer to drain and propagate
+                // to try_hole_punch poll loops.
+                self.pending_nacks.push(target_peer_id);
+                tracing::info!(
+                    "NACK received for target {}, queued for high-level layer",
+                    hex::encode(&target_peer_id[..8])
+                );
             }
             Drained => {
                 if let Some(conn) = self.connections.try_remove(ch.0) {

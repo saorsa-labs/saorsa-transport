@@ -65,6 +65,18 @@ pub struct TransportConfig {
 
     /// Allow loopback addresses as valid NAT traversal candidates
     pub(crate) allow_loopback: bool,
+
+    /// Shared, node-wide hole-punch coordinator back-pressure table
+    /// (Tier 4 lite). When this is `Some`, every connection that lands
+    /// at this node and acts as a coordinator gates incoming
+    /// `PUNCH_ME_NOW` relay frames against the shared table — the cap
+    /// is enforced *across* connections, not per-connection. When `None`
+    /// (low-level test fixtures, internal Quinn-style use), back-pressure
+    /// is disabled and the coordinator behaves as in pre-Tier-4 builds.
+    ///
+    /// Owned and instantiated by `P2pEndpoint::new`; injected into
+    /// `TransportConfig` before the config is frozen behind `Arc`.
+    pub(crate) relay_slot_table: Option<Arc<crate::relay_slot_table::RelaySlotTable>>,
 }
 
 impl TransportConfig {
@@ -470,6 +482,19 @@ impl TransportConfig {
         self.allow_loopback = allow;
         self
     }
+
+    /// Inject the node-wide hole-punch coordinator back-pressure table
+    /// (Tier 4 lite). Called from `P2pEndpoint::new` so that every QUIC
+    /// connection spawned from this transport config shares one table.
+    /// `None` disables back-pressure (used by Quinn-style low-level
+    /// fixtures that do not run a coordinator).
+    pub fn relay_slot_table(
+        &mut self,
+        table: Option<Arc<crate::relay_slot_table::RelaySlotTable>>,
+    ) -> &mut Self {
+        self.relay_slot_table = table;
+        self
+    }
 }
 
 impl Default for TransportConfig {
@@ -523,6 +548,12 @@ impl Default for TransportConfig {
                 ml_dsa_65: false,
             }),
             allow_loopback: false,
+            // No back-pressure table by default — `P2pEndpoint::new`
+            // injects one before connections are spawned. Quinn-style
+            // fixtures that bypass `P2pEndpoint` opt out of coordinator
+            // back-pressure entirely, which matches the pre-Tier-4
+            // behaviour they were originally written against.
+            relay_slot_table: None,
         }
     }
 }
@@ -559,6 +590,7 @@ impl fmt::Debug for TransportConfig {
             address_discovery_config,
             pqc_algorithms,
             allow_loopback,
+            relay_slot_table,
         } = self;
         fmt.debug_struct("TransportConfig")
             .field("max_concurrent_bidi_streams", max_concurrent_bidi_streams)
@@ -591,6 +623,7 @@ impl fmt::Debug for TransportConfig {
             .field("address_discovery_config", address_discovery_config)
             .field("pqc_algorithms", pqc_algorithms)
             .field("allow_loopback", allow_loopback)
+            .field("relay_slot_table", relay_slot_table)
             .finish_non_exhaustive()
     }
 }

@@ -313,6 +313,13 @@ impl Endpoint {
         }
     }
 
+    /// Set the channel for forwarding PUNCH_ME_NOW NACKs to the NatTraversalEndpoint.
+    pub fn set_nack_tx(&self, tx: mpsc::UnboundedSender<[u8; 32]>) {
+        if let Ok(mut state) = self.inner.0.state.lock() {
+            state.nack_tx = Some(tx);
+        }
+    }
+
     /// Connect to a remote endpoint
     ///
     /// `server_name` must be covered by the certificate presented by the server. This prevents a
@@ -699,6 +706,8 @@ pub(crate) struct State {
     /// for full connection tracking instead of fire-and-forget.
     hole_punch_tx: Option<mpsc::UnboundedSender<SocketAddr>>,
     peer_address_update_tx: Option<mpsc::UnboundedSender<(SocketAddr, SocketAddr)>>,
+    /// Channel for forwarding PUNCH_ME_NOW NACKs to the NatTraversalEndpoint
+    nack_tx: Option<mpsc::UnboundedSender<[u8; 32]>>,
 }
 
 #[derive(Debug)]
@@ -840,6 +849,15 @@ impl State {
             did_work = true;
             if let Some(ref tx) = self.peer_address_update_tx {
                 let _ = tx.send((peer_addr, advertised_addr));
+            }
+        }
+
+        // Drain PUNCH_ME_NOW NACKs from coordinators and forward to NatTraversalEndpoint
+        let nacks: Vec<[u8; 32]> = self.inner.drain_nacks().collect();
+        for target_peer_id in nacks {
+            did_work = true;
+            if let Some(ref tx) = self.nack_tx {
+                let _ = tx.send(target_peer_id);
             }
         }
 
@@ -1003,6 +1021,7 @@ impl EndpointRef {
                 default_client_config: None,
                 hole_punch_tx: None,
                 peer_address_update_tx: None,
+                nack_tx: None,
             }),
         }))
     }

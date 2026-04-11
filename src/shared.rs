@@ -28,6 +28,8 @@ pub(crate) enum ConnectionEventInner {
     QueueAddAddress(crate::frame::AddAddress),
     /// Queue a PUNCH_ME_NOW frame for transmission
     QueuePunchMeNow(crate::frame::PunchMeNow),
+    /// Queue a PUNCH_ME_NOW_NACK frame for transmission (coordinator → requester)
+    QueuePunchMeNowNack(crate::frame::PunchMeNowNack),
 }
 
 /// Variant of [`ConnectionEventInner`].
@@ -104,6 +106,12 @@ pub(crate) enum EndpointEventInner {
         timeout_ms: u16,
         requester_connection: SocketAddr,
         requested_at: crate::Instant,
+    },
+    /// A coordinator could not relay PUNCH_ME_NOW — target peer not found
+    /// among its connections. The requesting node should try another coordinator.
+    PunchMeNowNacked {
+        /// The target peer ID that the coordinator could not find
+        target_peer_id: [u8; 32],
     },
 }
 

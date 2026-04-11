@@ -180,8 +180,8 @@ impl Default for StrategyConfig {
         Self {
             ipv4_timeout: Duration::from_secs(3),
             ipv6_timeout: Duration::from_secs(3),
-            holepunch_timeout: Duration::from_secs(8),
-            relay_timeout: Duration::from_secs(10),
+            holepunch_timeout: Duration::from_secs(3),
+            relay_timeout: Duration::from_secs(5),
             max_holepunch_rounds: 2,
             ipv6_enabled: true,
             relay_enabled: true,

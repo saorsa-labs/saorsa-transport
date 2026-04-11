@@ -15,6 +15,7 @@
 use std::{fmt, net::SocketAddr, sync::Arc, time::Duration};
 
 use crate::constrained::{ConstrainedEngine, EngineConfig, EngineEvent};
+use crate::reachability::TraversalMethod;
 use crate::transport::TransportRegistry;
 
 use crate::SHUTDOWN_DRAIN_TIMEOUT;
@@ -251,6 +252,10 @@ pub struct NatTraversalEndpoint {
 
     /// NAT traversal configuration
     config: NatTraversalConfig,
+    /// BLAKE3 hash of our local SPKI public key, used for deterministic
+    /// simultaneous-connect tie-breaking. Both sides keep the connection
+    /// initiated by the peer with the lexicographically lower peer ID.
+    local_peer_id: [u8; 32],
     /// Known bootstrap/coordinator nodes
     /// Uses parking_lot::RwLock for faster, non-poisoning reads
     bootstrap_nodes: Arc<ParkingRwLock<Vec<BootstrapNode>>>,
@@ -339,6 +344,11 @@ pub struct NatTraversalEndpoint {
     /// receives them. Persistent across calls so no connections are lost.
     handshake_tx: mpsc::Sender<Result<(SocketAddr, InnerConnection), String>>,
     handshake_rx: TokioMutex<mpsc::Receiver<Result<(SocketAddr, InnerConnection), String>>>,
+    /// PUNCH_ME_NOW NACKs received from coordinators, keyed by target_peer_id.
+    /// Written by the high-level endpoint poll loop, read by try_hole_punch.
+    nack_set: Arc<dashmap::DashSet<[u8; 32]>>,
+    /// Notification for new NACK arrivals — wakes try_hole_punch poll loops.
+    nack_notify: Arc<tokio::sync::Notify>,
     /// Tracks when each connection was first observed as closed.
     /// Used to enforce a grace period before removing dead connections.
     closed_at: dashmap::DashMap<SocketAddr, std::time::Instant>,
@@ -478,7 +488,7 @@ pub struct NatTraversalConfig {
     /// Internally tunes the QUIC per-stream receive window so that a single
     /// message of this size can be transmitted without flow-control rejection.
     ///
-    /// Default: [`P2pConfig::DEFAULT_MAX_MESSAGE_SIZE`] (1 MiB).
+    /// Default: [`crate::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE`] (1 MiB).
     #[serde(default = "default_max_message_size")]
     pub max_message_size: usize,
 
@@ -491,6 +501,52 @@ pub struct NatTraversalConfig {
     /// Default: `false`
     #[serde(default)]
     pub allow_loopback: bool,
+
+    /// Cap on simultaneous in-flight hole-punch coordinator sessions
+    /// **across the entire node** (Tier 4 lite back-pressure).
+    ///
+    /// When the shared `RelaySlotTable` is full, additional `PUNCH_ME_NOW`
+    /// relay frames are *silently refused*: the coordinator drops them
+    /// without notifying the initiator, and the initiator's per-attempt
+    /// timeout (Tier 2 rotation) advances to the next preferred
+    /// coordinator in its list.
+    ///
+    /// A "session" is one `(initiator_addr, target_peer_id)` pair. The
+    /// same pair re-sending across rounds re-arms one slot rather than
+    /// allocating new ones. Slots are released either by the explicit
+    /// connection-close path (when the initiator's connection drops, the
+    /// `BootstrapCoordinator::Drop` releases every slot it owned) or by
+    /// the [`Self::coordinator_relay_slot_idle_timeout`] safety net for
+    /// peers that vanish without an orderly close.
+    ///
+    /// Defaults to [`NatTraversalConfig::DEFAULT_COORDINATOR_MAX_ACTIVE_RELAYS`]
+    /// (32). Sized to keep a coordinator's worst-case in-flight
+    /// coordination work bounded under a cold-start storm of peers all
+    /// converging on the same bootstrap, while still leaving headroom
+    /// for steady-state per-peer traffic.
+    #[serde(default = "default_coordinator_max_active_relays")]
+    pub coordinator_max_active_relays: usize,
+
+    /// Idle-release timeout for an in-flight coordinator relay session.
+    ///
+    /// A slot lasts from the first `PUNCH_ME_NOW` arrival until either
+    /// (a) the connection that owns it closes — in which case
+    /// `BootstrapCoordinator::Drop` releases all of that connection's
+    /// slots immediately, or (b) no new round arrives for the same
+    /// `(initiator_addr, target_peer_id)` pair within this idle window —
+    /// the *safety net* for peers that crash, get NAT-rebound, or stop
+    /// rotating without an orderly close. The coordinator cannot
+    /// directly observe whether the punch ultimately succeeded (the
+    /// punch traffic flows initiator↔target, bypassing the coordinator),
+    /// so the idle timeout is the only signal available for "vanished"
+    /// sessions.
+    ///
+    /// Defaults to [`NatTraversalConfig::DEFAULT_COORDINATOR_RELAY_SLOT_IDLE_TIMEOUT`]
+    /// (5 seconds): comfortably above the worst-case successful punch
+    /// latency on high-RTT links, short enough to keep capacity from
+    /// being held by ghost sessions.
+    #[serde(default = "default_coordinator_relay_slot_idle_timeout")]
+    pub coordinator_relay_slot_idle_timeout: Duration,
 
     /// Best-effort UPnP IGD port mapping configuration.
     ///
@@ -507,6 +563,25 @@ pub struct NatTraversalConfig {
 
 fn default_max_message_size() -> usize {
     crate::unified_config::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE
+}
+
+fn default_coordinator_max_active_relays() -> usize {
+    NatTraversalConfig::DEFAULT_COORDINATOR_MAX_ACTIVE_RELAYS
+}
+
+fn default_coordinator_relay_slot_idle_timeout() -> Duration {
+    NatTraversalConfig::DEFAULT_COORDINATOR_RELAY_SLOT_IDLE_TIMEOUT
+}
+
+impl NatTraversalConfig {
+    /// Default cap on simultaneous coordinator relay sessions.
+    /// See [`Self::coordinator_max_active_relays`] for rationale.
+    pub const DEFAULT_COORDINATOR_MAX_ACTIVE_RELAYS: usize = 32;
+
+    /// Default idle-release timeout for in-flight coordinator relay
+    /// sessions. See [`Self::coordinator_relay_slot_idle_timeout`] for
+    /// rationale.
+    pub const DEFAULT_COORDINATOR_RELAY_SLOT_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 }
 
 /// Convert `max_message_size` to a QUIC `VarInt` for stream/send window configuration.
@@ -575,12 +650,16 @@ pub struct BootstrapNode {
 }
 
 impl BootstrapNode {
-    /// Create a new bootstrap node
+    /// Create a new bootstrap node.
+    ///
+    /// Defaults `can_coordinate` to `false`. Callers must explicitly set it
+    /// to `true` via [`NatTraversalEndpoint::set_can_coordinate`] once they
+    /// have evidence the peer is directly reachable.
     pub fn new(address: SocketAddr) -> Self {
         Self {
             address,
             last_seen: std::time::Instant::now(),
-            can_coordinate: true,
+            can_coordinate: false,
             rtt: None,
             coordination_count: 0,
         }
@@ -977,6 +1056,8 @@ pub enum NatTraversalEvent {
         remote_address: SocketAddr,
         /// Who initiated the connection (Client = we connected, Server = they connected)
         side: Side,
+        /// Whether the connection was direct, hole-punched, or relayed.
+        traversal_method: TraversalMethod,
         /// ML-DSA-65 public key extracted from the TLS identity, if available
         public_key: Option<Vec<u8>>,
     },
@@ -1088,6 +1169,8 @@ impl Default for NatTraversalConfig {
             transport_registry: None, // Use direct UDP binding by default
             max_message_size: crate::unified_config::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
             allow_loopback: false,
+            coordinator_max_active_relays: Self::DEFAULT_COORDINATOR_MAX_ACTIVE_RELAYS,
+            coordinator_relay_slot_idle_timeout: Self::DEFAULT_COORDINATOR_RELAY_SLOT_IDLE_TIMEOUT,
             upnp: crate::upnp::UpnpConfig::default(),
         }
     }
@@ -1137,6 +1220,20 @@ impl ConfigValidator for NatTraversalConfig {
                 "max_concurrent_attempts cannot exceed max_candidates".to_string(),
             ));
         }
+
+        // Validate coordinator back-pressure limits (Tier 4 lite).
+        validate_range(
+            self.coordinator_max_active_relays,
+            1,
+            1024,
+            "coordinator_max_active_relays",
+        )?;
+        validate_duration(
+            self.coordinator_relay_slot_idle_timeout,
+            Duration::from_millis(100),
+            Duration::from_secs(60),
+            "coordinator_relay_slot_idle_timeout",
+        )?;
 
         Ok(())
     }
@@ -1340,11 +1437,11 @@ impl NatTraversalEndpoint {
             };
             // Use the local address as the public address (will be updated when external address is discovered)
             let server = MasqueRelayServer::new(relay_config, local_addr);
-            info!(
-                "Created MASQUE relay server on {} (symmetric P2P node)",
-                local_addr
-            );
-            Some(Arc::new(server))
+            info!("Created MASQUE relay server on {local_addr} (symmetric P2P node)");
+            let server = Arc::new(server);
+            // Spawn periodic cleanup so expired sessions are reaped automatically
+            let _cleanup_handle = MasqueRelayServer::spawn_cleanup_task(&server);
+            Some(server)
         };
 
         // Clone the callback for background tasks before moving into endpoint
@@ -1373,12 +1470,25 @@ impl NatTraversalEndpoint {
         let (peer_addr_tx, peer_addr_rx) = mpsc::unbounded_channel();
         inner_endpoint.set_peer_address_update_tx(peer_addr_tx);
 
+        // Channel for PUNCH_ME_NOW NACK forwarding
+        let (nack_tx, nack_rx) = mpsc::unbounded_channel();
+        inner_endpoint.set_nack_tx(nack_tx);
+
         // Channel for background handshake completion (persistent across accept calls)
         let (hs_tx, hs_rx) = mpsc::channel(32);
+
+        // Compute local peer ID = BLAKE3(public_key_spki) for
+        // deterministic simultaneous-connect tie-breaking.
+        let local_peer_id: [u8; 32] = config
+            .identity_key
+            .as_ref()
+            .map(|(pub_key, _)| *blake3::hash(pub_key.0.as_ref()).as_bytes())
+            .unwrap_or([0u8; 32]);
 
         let endpoint = Self {
             inner_endpoint: Some(inner_endpoint.clone()),
             config: config.clone(),
+            local_peer_id,
             bootstrap_nodes,
             active_sessions: Arc::new(dashmap::DashMap::new()),
             discovery_manager,
@@ -1412,6 +1522,8 @@ impl NatTraversalEndpoint {
             hole_punch_rx: TokioMutex::new(hole_punch_rx),
             handshake_tx: hs_tx,
             handshake_rx: TokioMutex::new(hs_rx),
+            nack_set: Arc::new(dashmap::DashSet::new()),
+            nack_notify: Arc::new(tokio::sync::Notify::new()),
             closed_at: dashmap::DashMap::new(),
             upnp_service: parking_lot::Mutex::new(Some(upnp_service)),
         };
@@ -1577,6 +1689,30 @@ impl NatTraversalEndpoint {
         endpoint.spawn_accept_loop();
         info!("Accept loop spawned (unified path, parallel handshakes)");
 
+        // Start NACK forwarder: drains NACK channel from high-level endpoint
+        // and records into DashSet for try_hole_punch to consume.
+        {
+            let nack_set = endpoint.nack_set.clone();
+            let nack_notify = endpoint.nack_notify.clone();
+            let shutdown = endpoint.shutdown.clone();
+            tokio::spawn(async move {
+                let mut nack_rx = nack_rx;
+                while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                    match nack_rx.recv().await {
+                        Some(target_peer_id) => {
+                            tracing::info!(
+                                "NACK received for target {}, notifying hole-punch loops",
+                                hex::encode(&target_peer_id[..8])
+                            );
+                            nack_set.insert(target_peer_id);
+                            nack_notify.notify_waiters();
+                        }
+                        None => break, // Channel closed
+                    }
+                }
+            });
+        }
+
         // Start background discovery polling task
         let discovery_manager_clone = endpoint.discovery_manager.clone();
         let shutdown_clone = endpoint.shutdown.clone();
@@ -1585,6 +1721,13 @@ impl NatTraversalEndpoint {
 
         let local_session_id = DiscoverySessionId::Local;
         let relay_setup_attempted_clone = endpoint.relay_setup_attempted.clone();
+        let known_peers_for_poll: std::collections::HashSet<SocketAddr> =
+            endpoint.config.known_peers.iter().copied().collect();
+        let local_port_for_poll: u16 = endpoint
+            .config
+            .bind_addr
+            .map(|a| a.port())
+            .unwrap_or(0);
         tokio::spawn(async move {
             Self::poll_discovery(
                 discovery_manager_clone,
@@ -1594,6 +1737,8 @@ impl NatTraversalEndpoint {
                 event_callback_for_poll,
                 local_session_id,
                 relay_setup_attempted_clone,
+                known_peers_for_poll,
+                local_port_for_poll,
             )
             .await;
         });
@@ -1764,11 +1909,11 @@ impl NatTraversalEndpoint {
             };
             // Use the local address as the public address (will be updated when external address is discovered)
             let server = MasqueRelayServer::new(relay_config, local_addr);
-            info!(
-                "Created MASQUE relay server on {} (symmetric P2P node)",
-                local_addr
-            );
-            Some(Arc::new(server))
+            info!("Created MASQUE relay server on {local_addr} (symmetric P2P node)");
+            let server = Arc::new(server);
+            // Spawn periodic cleanup so expired sessions are reaped automatically
+            let _cleanup_handle = MasqueRelayServer::spawn_cleanup_task(&server);
+            Some(server)
         };
 
         // Clone the callback for background tasks before moving into endpoint
@@ -1797,12 +1942,25 @@ impl NatTraversalEndpoint {
         let (peer_addr_tx, peer_addr_rx) = mpsc::unbounded_channel();
         inner_endpoint.set_peer_address_update_tx(peer_addr_tx);
 
+        // Channel for PUNCH_ME_NOW NACK forwarding
+        let (nack_tx, nack_rx) = mpsc::unbounded_channel();
+        inner_endpoint.set_nack_tx(nack_tx);
+
         // Channel for background handshake completion (persistent across accept calls)
         let (hs_tx, hs_rx) = mpsc::channel(32);
+
+        // Compute local peer ID = BLAKE3(public_key_spki) for
+        // deterministic simultaneous-connect tie-breaking.
+        let local_peer_id: [u8; 32] = config
+            .identity_key
+            .as_ref()
+            .map(|(pub_key, _)| *blake3::hash(pub_key.0.as_ref()).as_bytes())
+            .unwrap_or([0u8; 32]);
 
         let endpoint = Self {
             inner_endpoint: Some(inner_endpoint.clone()),
             config: config.clone(),
+            local_peer_id,
             bootstrap_nodes,
             active_sessions: Arc::new(dashmap::DashMap::new()),
             discovery_manager,
@@ -1836,6 +1994,8 @@ impl NatTraversalEndpoint {
             hole_punch_rx: TokioMutex::new(hole_punch_rx),
             handshake_tx: hs_tx,
             handshake_rx: TokioMutex::new(hs_rx),
+            nack_set: Arc::new(dashmap::DashSet::new()),
+            nack_notify: Arc::new(tokio::sync::Notify::new()),
             closed_at: dashmap::DashMap::new(),
             upnp_service: parking_lot::Mutex::new(Some(upnp_service)),
         };
@@ -2001,6 +2161,30 @@ impl NatTraversalEndpoint {
         endpoint.spawn_accept_loop();
         info!("Accept loop spawned (unified path, parallel handshakes)");
 
+        // Start NACK forwarder: drains NACK channel from high-level endpoint
+        // and records into DashSet for try_hole_punch to consume.
+        {
+            let nack_set = endpoint.nack_set.clone();
+            let nack_notify = endpoint.nack_notify.clone();
+            let shutdown = endpoint.shutdown.clone();
+            tokio::spawn(async move {
+                let mut nack_rx = nack_rx;
+                while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                    match nack_rx.recv().await {
+                        Some(target_peer_id) => {
+                            tracing::info!(
+                                "NACK received for target {}, notifying hole-punch loops",
+                                hex::encode(&target_peer_id[..8])
+                            );
+                            nack_set.insert(target_peer_id);
+                            nack_notify.notify_waiters();
+                        }
+                        None => break, // Channel closed
+                    }
+                }
+            });
+        }
+
         // Start background discovery polling task
         let discovery_manager_clone = endpoint.discovery_manager.clone();
         let shutdown_clone = endpoint.shutdown.clone();
@@ -2009,6 +2193,13 @@ impl NatTraversalEndpoint {
 
         let local_session_id = DiscoverySessionId::Local;
         let relay_setup_attempted_clone = endpoint.relay_setup_attempted.clone();
+        let known_peers_for_poll: std::collections::HashSet<SocketAddr> =
+            endpoint.config.known_peers.iter().copied().collect();
+        let local_port_for_poll: u16 = endpoint
+            .config
+            .bind_addr
+            .map(|a| a.port())
+            .unwrap_or(0);
         tokio::spawn(async move {
             Self::poll_discovery(
                 discovery_manager_clone,
@@ -2018,6 +2209,8 @@ impl NatTraversalEndpoint {
                 event_callback_for_poll,
                 local_session_id,
                 relay_setup_attempted_clone,
+                known_peers_for_poll,
+                local_port_for_poll,
             )
             .await;
         });
@@ -2051,6 +2244,24 @@ impl NatTraversalEndpoint {
         if let Some(ep) = &self.inner_endpoint {
             ep.register_connection_peer_id(addr, peer_id);
         }
+    }
+
+    /// Record a PUNCH_ME_NOW NACK for a target peer ID.
+    /// Called by the high-level endpoint when it drains NACKs from the low-level.
+    pub fn record_nack(&self, target_peer_id: [u8; 32]) {
+        self.nack_set.insert(target_peer_id);
+        self.nack_notify.notify_waiters();
+    }
+
+    /// Check and consume a NACK for a specific target peer ID.
+    /// Returns true if a NACK was pending for this target (and removes it).
+    pub fn consume_nack(&self, target_peer_id: &[u8; 32]) -> bool {
+        self.nack_set.remove(target_peer_id).is_some()
+    }
+
+    /// Get a reference to the NACK notification handle.
+    pub fn nack_notify(&self) -> &tokio::sync::Notify {
+        &self.nack_notify
     }
 
     /// Get the event callback
@@ -2510,7 +2721,7 @@ impl NatTraversalEndpoint {
             bootstrap_nodes.push(BootstrapNode {
                 address,
                 last_seen: std::time::Instant::now(),
-                can_coordinate: true,
+                can_coordinate: false,
                 rtt: None,
                 coordination_count: 0,
             });
@@ -2549,6 +2760,18 @@ impl NatTraversalEndpoint {
         NatTraversalError,
     > {
         use std::sync::Arc;
+
+        // Tier 4 (lite) coordinator back-pressure: every connection
+        // spawned by this endpoint shares ONE node-wide
+        // `RelaySlotTable`. Both the server-side `TransportConfig` and
+        // the client-side `TransportConfig` get a clone of the same
+        // `Arc`, so a relay arriving on a server-accepted connection
+        // and a relay arriving on a client-initiated connection both
+        // count against the same cap.
+        let relay_slot_table = Arc::new(crate::relay_slot_table::RelaySlotTable::new(
+            config.coordinator_max_active_relays,
+            config.coordinator_relay_slot_idle_timeout,
+        ));
 
         // v0.13.0+: All nodes are symmetric P2P nodes - always create server config
         let server_config = {
@@ -2613,6 +2836,7 @@ impl NatTraversalEndpoint {
             };
             transport_config.nat_traversal_config(Some(nat_config));
             transport_config.allow_loopback(config.allow_loopback);
+            transport_config.relay_slot_table(Some(Arc::clone(&relay_slot_table)));
 
             server_config.transport_config(Arc::new(transport_config));
 
@@ -2684,6 +2908,7 @@ impl NatTraversalEndpoint {
             };
             transport_config.nat_traversal_config(Some(nat_config));
             transport_config.allow_loopback(config.allow_loopback);
+            transport_config.relay_slot_table(Some(Arc::clone(&relay_slot_table)));
 
             client_config.transport_config(Arc::new(transport_config));
 
@@ -2881,6 +3106,7 @@ impl NatTraversalEndpoint {
                                         event_tx.send(NatTraversalEvent::ConnectionEstablished {
                                             remote_address,
                                             side: Side::Server,
+                                            traversal_method: TraversalMethod::Direct,
                                             public_key,
                                         });
                                     incoming_notify.notify_one();
@@ -3062,6 +3288,8 @@ impl NatTraversalEndpoint {
         event_callback: Option<Arc<dyn Fn(NatTraversalEvent) + Send + Sync>>,
         local_session_id: DiscoverySessionId,
         relay_setup_attempted: Arc<std::sync::atomic::AtomicBool>,
+        _known_peers: std::collections::HashSet<SocketAddr>,
+        local_listen_port: u16,
     ) {
         use tokio::time::{Duration, interval};
 
@@ -3092,6 +3320,30 @@ impl NatTraversalEndpoint {
                     observed
                 );
                 if let Some(observed_addr) = observed {
+                    // Port filter: if we know our listen port (non-zero),
+                    // only accept observations that report the same port.
+                    // MASQUE relay sessions allocate ephemeral ports on the
+                    // relay server (same IP, different port). These relay
+                    // ports are NOT our listen address and must not be
+                    // published in the DHT or used for symmetric-NAT
+                    // detection. This single check replaces the previous
+                    // IP-baseline approach and catches all relay-port
+                    // pollution regardless of whether the relay runs on a
+                    // known peer, a regular peer, or our own node.
+                    if local_listen_port != 0
+                        && observed_addr.port() != local_listen_port
+                    {
+                        tracing::debug!(
+                            "poll_discovery_task: SKIPPING observation {} from {} \
+                             (port {} != listen port {})",
+                            observed_addr,
+                            remote_addr,
+                            observed_addr.port(),
+                            local_listen_port,
+                        );
+                        continue;
+                    }
+
                     // Emit event if this is the first time this remote reported this address
                     if emitted_discovery.insert((remote_addr, observed_addr)) {
                         info!(
@@ -3251,6 +3503,7 @@ impl NatTraversalEndpoint {
             let _ = event_tx.send(NatTraversalEvent::ConnectionEstablished {
                 remote_address: remote_addr,
                 side: Side::Client,
+                traversal_method: TraversalMethod::Direct,
                 public_key,
             });
             self.incoming_notify.notify_one();
@@ -3350,16 +3603,29 @@ impl NatTraversalEndpoint {
         ),
         NatTraversalError,
     > {
-        // Check if we already have an active session to this relay
+        // Check if we already have an active session to this relay.
+        // If so, open a new bidi stream on the existing connection and perform
+        // a fresh CONNECT-UDP handshake so the caller gets a usable socket.
         // DashMap provides lock-free .get() that returns Option<Ref<K, V>>
         if let Some(session) = self.relay_sessions.get(&relay_addr) {
             if session.is_active() {
-                debug!("Reusing existing relay session to {}", relay_addr);
-                return Ok((session.public_address, None));
+                debug!("Reusing existing relay session to {relay_addr}");
+                let connection = session.connection.clone();
+                let existing_public_address = session.public_address;
+                // Drop the DashMap ref before awaiting to avoid holding it across await
+                drop(session);
+
+                return self
+                    .open_relay_stream_and_handshake(
+                        connection,
+                        relay_addr,
+                        existing_public_address,
+                    )
+                    .await;
             }
         }
 
-        info!("Establishing relay session to {}", relay_addr);
+        info!("Establishing relay session to {relay_addr}");
 
         // Prefer reusing an existing peer connection to the relay.
         // The relay server's handle_relay_requests is spawned for each ACCEPTED
@@ -3367,7 +3633,7 @@ impl NatTraversalEndpoint {
         // already listening for bidi streams.
         let connection = if let Some(existing) = self.connections.get(&relay_addr) {
             if existing.close_reason().is_none() {
-                info!("Reusing existing peer connection to relay {}", relay_addr);
+                info!("Reusing existing peer connection to relay {relay_addr}");
                 existing.clone()
             } else {
                 // Existing connection is dead — fall back to creating a new one
@@ -3379,73 +3645,9 @@ impl NatTraversalEndpoint {
             self.connect_new_to_relay(relay_addr).await?
         };
 
-        // Open a bidirectional stream for the CONNECT-UDP handshake
-        let (mut send_stream, mut recv_stream) = connection.open_bi().await.map_err(|e| {
-            NatTraversalError::ConnectionFailed(format!("Failed to open relay stream: {}", e))
-        })?;
-
-        // Send CONNECT-UDP Bind request with length prefix (stream stays open for data)
-        let request = ConnectUdpRequest::bind_any();
-        let request_bytes = request.encode();
-
-        debug!("Sending CONNECT-UDP Bind request to relay: {:?}", request);
-
-        // Length-prefixed framing: [4-byte BE length][payload]
-        let req_len = request_bytes.len() as u32;
-        send_stream
-            .write_all(&req_len.to_be_bytes())
-            .await
-            .map_err(|e| {
-                NatTraversalError::ConnectionFailed(format!("Failed to send request length: {}", e))
-            })?;
-        send_stream.write_all(&request_bytes).await.map_err(|e| {
-            NatTraversalError::ConnectionFailed(format!("Failed to send relay request: {}", e))
-        })?;
-        // Do NOT call finish() — stream stays open for data forwarding
-
-        // Read length-prefixed response
-        let mut resp_len_buf = [0u8; 4];
-        recv_stream
-            .read_exact(&mut resp_len_buf)
-            .await
-            .map_err(|e| {
-                NatTraversalError::ConnectionFailed(format!(
-                    "Failed to read relay response length: {}",
-                    e
-                ))
-            })?;
-        let resp_len = u32::from_be_bytes(resp_len_buf) as usize;
-        let mut response_bytes = vec![0u8; resp_len];
-        recv_stream
-            .read_exact(&mut response_bytes)
-            .await
-            .map_err(|e| {
-                NatTraversalError::ConnectionFailed(format!("Failed to read relay response: {}", e))
-            })?;
-
-        let response = ConnectUdpResponse::decode(&mut bytes::Bytes::from(response_bytes))
-            .map_err(|e| {
-                NatTraversalError::ProtocolError(format!("Invalid relay response: {}", e))
-            })?;
-
-        if !response.is_success() {
-            let reason = response.reason.unwrap_or_else(|| "unknown".to_string());
-            return Err(NatTraversalError::ConnectionFailed(format!(
-                "Relay rejected request: {} (status {})",
-                reason, response.status
-            )));
-        }
-
-        let public_address = response.proxy_public_address;
-
-        info!(
-            "Relay session established with public address: {:?}",
-            public_address
-        );
-
-        // Create the MasqueRelaySocket from the open streams
-        let relay_socket = public_address
-            .map(|addr| crate::masque::MasqueRelaySocket::new(send_stream, recv_stream, addr));
+        let (public_address, relay_socket) = self
+            .open_relay_stream_and_handshake(connection.clone(), relay_addr, None)
+            .await?;
 
         // Store the session
         let session = RelaySession {
@@ -3457,6 +3659,94 @@ impl NatTraversalEndpoint {
 
         // DashMap provides lock-free .insert()
         self.relay_sessions.insert(relay_addr, session);
+
+        Ok((public_address, relay_socket))
+    }
+
+    /// Open a new bidi stream on `connection`, perform the CONNECT-UDP
+    /// handshake, and return the public address together with a relay socket.
+    ///
+    /// When `existing_public_address` is `Some`, it is used as a fallback if
+    /// the relay response does not include a proxy address (session-reuse
+    /// path). When `None`, the address comes solely from the response
+    /// (new-session path).
+    async fn open_relay_stream_and_handshake(
+        &self,
+        connection: InnerConnection,
+        relay_addr: SocketAddr,
+        existing_public_address: Option<SocketAddr>,
+    ) -> Result<
+        (
+            Option<SocketAddr>,
+            Option<Arc<crate::masque::MasqueRelaySocket>>,
+        ),
+        NatTraversalError,
+    > {
+        // Open a bidirectional stream for the CONNECT-UDP handshake
+        let (mut send_stream, mut recv_stream) = connection.open_bi().await.map_err(|e| {
+            NatTraversalError::ConnectionFailed(format!("Failed to open relay stream: {e}"))
+        })?;
+
+        // Send CONNECT-UDP Bind request with length prefix (stream stays open for data)
+        let request = ConnectUdpRequest::bind_any();
+        let request_bytes = request.encode();
+
+        debug!("Sending CONNECT-UDP Bind request to relay: {request:?}");
+
+        // Length-prefixed framing: [4-byte BE length][payload]
+        let req_len = request_bytes.len() as u32;
+        send_stream
+            .write_all(&req_len.to_be_bytes())
+            .await
+            .map_err(|e| {
+                NatTraversalError::ConnectionFailed(format!("Failed to send request length: {e}"))
+            })?;
+        send_stream.write_all(&request_bytes).await.map_err(|e| {
+            NatTraversalError::ConnectionFailed(format!("Failed to send relay request: {e}"))
+        })?;
+        // Do NOT call finish() -- stream stays open for data forwarding
+
+        // Read length-prefixed response
+        let mut resp_len_buf = [0u8; 4];
+        recv_stream
+            .read_exact(&mut resp_len_buf)
+            .await
+            .map_err(|e| {
+                NatTraversalError::ConnectionFailed(format!(
+                    "Failed to read relay response length: {e}"
+                ))
+            })?;
+        let resp_len = u32::from_be_bytes(resp_len_buf) as usize;
+        let mut response_bytes = vec![0u8; resp_len];
+        recv_stream
+            .read_exact(&mut response_bytes)
+            .await
+            .map_err(|e| {
+                NatTraversalError::ConnectionFailed(format!("Failed to read relay response: {e}"))
+            })?;
+
+        let response = ConnectUdpResponse::decode(&mut bytes::Bytes::from(response_bytes))
+            .map_err(|e| {
+                NatTraversalError::ProtocolError(format!("Invalid relay response: {e}"))
+            })?;
+
+        if !response.is_success() {
+            let reason = response.reason.unwrap_or_else(|| "unknown".to_string());
+            return Err(NatTraversalError::ConnectionFailed(format!(
+                "Relay rejected request: {reason} (status {})",
+                response.status
+            )));
+        }
+
+        // Use the address from the response, falling back to the stored one
+        // when reusing an existing session.
+        let public_address = response.proxy_public_address.or(existing_public_address);
+
+        info!("Relay session established with public address: {public_address:?}");
+
+        // Create the MasqueRelaySocket from the open streams
+        let relay_socket = public_address
+            .map(|addr| crate::masque::MasqueRelaySocket::new(send_stream, recv_stream, addr));
 
         // Notify the relay manager
         if let Some(ref manager) = self.relay_manager {
@@ -3616,6 +3906,7 @@ impl NatTraversalEndpoint {
         let event_tx_opt = self.event_tx.clone();
         let shutdown = self.shutdown.clone();
         let incoming_notify = self.incoming_notify.clone();
+        let local_peer_id = self.local_peer_id;
 
         tokio::spawn(async move {
             loop {
@@ -3673,12 +3964,20 @@ impl NatTraversalEndpoint {
                     let remote_address = connection.remote_address();
                     info!("Accepted connection from {} (unified path)", remote_address);
 
-                    // Only insert if no existing LIVE connection to this address.
-                    // Unconditionally overwriting would replace a working connection
-                    // with a duplicate that may die shortly, leaving the DashMap
-                    // pointing at a dead connection while the original's reader
-                    // task still runs.
-                    // Check both raw and normalized forms (IPv4-mapped IPv6).
+                    // Simultaneous-connect dedup with deterministic
+                    // tie-breaking. When two nodes connect to each other at
+                    // the same time, both end up with two QUIC connections.
+                    // We resolve this deterministically: the node with the
+                    // lexicographically *lower* peer ID keeps its outbound
+                    // connection (the one it initiated). Because both sides
+                    // apply the same rule, they converge on keeping exactly
+                    // one connection without any signalling.
+                    //
+                    // For an *accepted* (inbound) connection, "we are the
+                    // higher ID" means the remote initiated it and we
+                    // should keep it (close ours). "We are the lower ID"
+                    // means we should keep our outbound instead, so we
+                    // close this incoming one.
                     let normalized_remote = crate::shared::normalize_socket_addr(remote_address);
                     let has_live = |addr: &std::net::SocketAddr| -> bool {
                         connections2
@@ -3686,20 +3985,62 @@ impl NatTraversalEndpoint {
                             .is_some_and(|e| e.value().close_reason().is_none())
                     };
                     if has_live(&remote_address) || has_live(&normalized_remote) {
+                        // Extract the remote peer's public key to compute
+                        // their peer ID for tie-breaking.
+                        let remote_peer_id: Option<[u8; 32]> =
+                            Self::extract_public_key_from_connection(&connection)
+                                .map(|spki| *blake3::hash(&spki).as_bytes());
+
+                        if let Some(remote_id) = remote_peer_id {
+                            // Deterministic rule: the peer with the lower
+                            // ID keeps its *outbound* connection. This is
+                            // an inbound connection, so:
+                            //   - If local < remote: we keep our outbound
+                            //     → close this inbound, keep existing.
+                            //   - If local > remote: remote keeps their
+                            //     outbound (this conn) → close existing.
+                            //   - If equal (self-connect): close incoming.
+                            if local_peer_id <= remote_id {
+                                info!(
+                                    "accept_loop: {} simultaneous-connect tie-break: \
+                                     keeping existing outbound (local_id < remote_id)",
+                                    remote_address
+                                );
+                                connection.close(0u32.into(), b"simultaneous-open-tiebreak");
+                                return;
+                            }
+                        }
+
+                        // Remote has lower ID, so they keep their outbound
+                        // (this connection). Close our existing outbound
+                        // with a grace period for in-flight operations.
                         info!(
-                            "accept_loop: {} already has a live connection, keeping existing",
+                            "accept_loop: {} simultaneous-connect tie-break: \
+                             replacing existing with inbound (remote_id < local_id)",
                             remote_address
                         );
-                        connection.close(0u32.into(), b"duplicate");
-                        return; // exit this handshake task
+                        let old_conn = if let Some(old) = connections2.get(&remote_address) {
+                            Some(old.value().clone())
+                        } else {
+                            connections2.get(&normalized_remote).map(|old| old.value().clone())
+                        };
+                        if let Some(old) = old_conn {
+                            tokio::spawn(async move {
+                                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                                old.close(0u32.into(), b"superseded");
+                            });
+                        }
+                        // Allow re-emission so the new connection gets a
+                        // reader task and PeerConnected event
+                        emitted2.remove(&remote_address);
+                        emitted2.remove(&normalized_remote);
                     }
                     connections2.insert(remote_address, connection.clone());
 
                     // Only forward to handshake_tx if this is the first time
-                    // we've seen this address. Without this guard, a
-                    // simultaneous-open (both sides connect at the same time)
-                    // sends two entries to handshake_tx, causing duplicate
-                    // reader tasks for the same connection address.
+                    // (or first time since replacement) we've seen this address.
+                    // Without this guard, simultaneous-open sends two entries
+                    // to handshake_tx, causing duplicate reader tasks.
                     if emitted2.insert(remote_address) {
                         if let Some(ref server) = relay_server2 {
                             let conn_clone = connection.clone();
@@ -3832,22 +4173,22 @@ impl NatTraversalEndpoint {
             self.connections.len()
         );
 
-        // Register connected peer as a potential coordinator for NAT traversal.
-        // In the symmetric P2P architecture (v0.13.0+), any connected node can
-        // coordinate hole-punching for us.
+        // Register connected peer as a potential bootstrap node for NAT traversal.
+        // Coordination capability is NOT assumed here -- callers must explicitly
+        // mark the node via `set_can_coordinate()` once they have evidence the
+        // peer is directly reachable (e.g., we successfully connected outbound).
         {
             let mut nodes = self.bootstrap_nodes.write();
             if !nodes.iter().any(|n| n.address == addr) {
                 nodes.push(BootstrapNode {
                     address: addr,
                     last_seen: std::time::Instant::now(),
-                    can_coordinate: true,
+                    can_coordinate: false,
                     rtt: None,
                     coordination_count: 0,
                 });
                 info!(
-                    "add_connection: registered {} as NAT traversal coordinator ({} total)",
-                    addr,
+                    "add_connection: registered {addr} as bootstrap node ({} total, can_coordinate=false)",
                     nodes.len()
                 );
             }
@@ -3860,17 +4201,33 @@ impl NatTraversalEndpoint {
         Ok(())
     }
 
+    /// Mark (or unmark) a bootstrap node as capable of coordinating NAT traversal.
+    ///
+    /// Call this after evidence that the peer is directly reachable -- e.g.,
+    /// after a successful outbound connection. Nodes connected via relay or
+    /// hole-punch should NOT be marked as coordinators since they may be
+    /// behind restrictive NAT themselves.
+    pub fn set_can_coordinate(&self, addr: &SocketAddr, can_coordinate: bool) {
+        let mut nodes = self.bootstrap_nodes.write();
+        if let Some(node) = nodes.iter_mut().find(|n| &n.address == addr) {
+            node.can_coordinate = can_coordinate;
+            info!("set_can_coordinate: {addr} -> can_coordinate={can_coordinate}");
+        }
+    }
+
     /// Spawn the NAT traversal handler loop for an existing connection referenced by the endpoint.
     ///
     /// # Arguments
     /// * `addr` - The remote address of the connection
     /// * `connection` - The established QUIC connection
     /// * `side` - Who initiated the connection (Client = we connected, Server = they connected)
+    /// * `traversal_method` - Whether the path is direct, hole-punched, or relayed
     pub fn spawn_connection_handler(
         &self,
         addr: SocketAddr,
         connection: InnerConnection,
         side: Side,
+        traversal_method: TraversalMethod,
     ) -> Result<(), NatTraversalError> {
         let event_tx = self.event_tx.as_ref().cloned().ok_or_else(|| {
             NatTraversalError::ConfigError("NAT traversal event channel not configured".to_string())
@@ -3887,6 +4244,7 @@ impl NatTraversalEndpoint {
             let _ = event_tx.send(NatTraversalEvent::ConnectionEstablished {
                 remote_address,
                 side,
+                traversal_method,
                 public_key,
             });
             self.incoming_notify.notify_one();
@@ -3990,16 +4348,40 @@ impl NatTraversalEndpoint {
         Ok(None)
     }
 
-    /// Detect symmetric NAT by checking port diversity across peer connections.
+    /// Detect symmetric NAT by checking port diversity across **known-peer**
+    /// (bootstrap) connections only.
     ///
-    /// Returns `true` if at least 2 different external ports are observed from
-    /// different peers, indicating that the NAT assigns a different port per
-    /// destination (symmetric NAT behaviour).
+    /// Returns `true` if at least 2 different external ports are observed
+    /// from known peers, indicating that the NAT assigns a different port
+    /// per destination (symmetric NAT behaviour).
+    ///
+    /// Only known-peer connections are consulted because:
+    /// 1. They are public, long-lived, and use our primary QUIC socket.
+    /// 2. Relay connections (MASQUE) allocate a *separate* port on the
+    ///    relay server, which is not evidence of symmetric NAT on our
+    ///    local gateway. Including relay ports would false-positive on
+    ///    every public node that happens to set up a relay fallback.
+    /// 3. Ephemeral peer connections may transit different NAT paths
+    ///    (multi-homed hosts, VPNs) that are not representative.
     pub fn is_symmetric_nat(&self) -> bool {
+        let known_peer_addrs: std::collections::HashSet<_> =
+            self.config.known_peers.iter().copied().collect();
+
+        if known_peer_addrs.is_empty() {
+            // Without known peers we have no reliable baseline — be
+            // conservative and assume we are NOT behind symmetric NAT.
+            return false;
+        }
+
         let mut observed_ports = std::collections::HashSet::new();
 
         for entry in self.connections.iter() {
-            if let Some(addr) = entry.value().observed_address() {
+            let conn = entry.value();
+            // Only consider connections to known (bootstrap) peers.
+            if !known_peer_addrs.contains(&conn.remote_address()) {
+                continue;
+            }
+            if let Some(addr) = conn.observed_address() {
                 observed_ports.insert(addr.port());
             }
         }
@@ -4007,7 +4389,7 @@ impl NatTraversalEndpoint {
         let is_symmetric = observed_ports.len() >= 2;
         if is_symmetric {
             info!(
-                "Symmetric NAT detected: {} different external ports observed ({:?})",
+                "Symmetric NAT detected: {} different external ports observed from known peers ({:?})",
                 observed_ports.len(),
                 observed_ports
             );
@@ -4822,6 +5204,7 @@ impl NatTraversalEndpoint {
                                         event_tx.send(NatTraversalEvent::ConnectionEstablished {
                                             remote_address: remote,
                                             side: Side::Client,
+                                            traversal_method: TraversalMethod::HolePunch,
                                             public_key,
                                         });
                                     incoming_notify.notify_one();
@@ -5640,16 +6023,64 @@ impl NatTraversalEndpoint {
         }
     }
 
-    /// Select a coordinator from available bootstrap nodes
+    /// Select a coordinator from available bootstrap nodes.
+    ///
+    /// Filters to nodes that can actually coordinate (directly reachable, not
+    /// behind restrictive NAT) and weights selection by RTT (lower is better)
+    /// and `coordination_count` (lower is better) for load balancing.
     fn select_coordinator(&self) -> Option<SocketAddr> {
         // parking_lot::RwLock doesn't poison - always succeeds
         let nodes = self.bootstrap_nodes.read();
-        // Simple round-robin or random selection
-        if !nodes.is_empty() {
-            let idx = rand::random::<usize>() % nodes.len();
-            return Some(nodes[idx].address);
+
+        // Only consider nodes that have been verified as coordinators
+        let eligible: Vec<&BootstrapNode> = nodes.iter().filter(|n| n.can_coordinate).collect();
+
+        if eligible.is_empty() {
+            return None;
         }
-        None
+
+        // Compute a quality score for each eligible node.
+        // Higher score = better candidate. We use inverse RTT and inverse
+        // coordination_count so that lower values produce higher scores.
+        let scores: Vec<f64> = eligible
+            .iter()
+            .map(|node| {
+                // RTT component: prefer lower RTT. Use 500ms as the default
+                // when RTT is unknown (conservative but not disqualifying).
+                let rtt_ms = node
+                    .rtt
+                    .map(|d| d.as_millis() as f64)
+                    .unwrap_or(500.0)
+                    .max(1.0); // avoid division by zero
+                let rtt_score = 1000.0 / rtt_ms;
+
+                // Load-balancing component: prefer less-loaded coordinators.
+                // Add 1 to avoid division by zero for fresh nodes.
+                let load_score = 1.0 / (node.coordination_count as f64 + 1.0);
+
+                // Combined score: RTT matters more (weight 3) than load (weight 1)
+                rtt_score * 3.0 + load_score
+            })
+            .collect();
+
+        let total_score: f64 = scores.iter().sum();
+        if total_score <= 0.0 {
+            // Fallback: pick the first eligible node
+            return eligible.first().map(|n| n.address);
+        }
+
+        // Weighted random selection: pick a node proportional to its score
+        let roll = rand::random::<f64>() * total_score;
+        let mut cumulative = 0.0;
+        for (node, score) in eligible.iter().zip(scores.iter()) {
+            cumulative += score;
+            if roll < cumulative {
+                return Some(node.address);
+            }
+        }
+
+        // Floating-point edge case: return the last eligible node
+        eligible.last().map(|n| n.address)
     }
 
     /// Send coordination request to bootstrap node
@@ -6536,6 +6967,7 @@ impl NatTraversalEndpoint {
             callback(NatTraversalEvent::ConnectionEstablished {
                 remote_address: candidate_address,
                 side: Side::Client,
+                traversal_method: TraversalMethod::HolePunch,
                 public_key,
             });
         }
@@ -6622,26 +7054,6 @@ impl NatTraversalEndpoint {
         } else {
             Err(NatTraversalError::PeerNotConnected)
         }
-    }
-
-    /// Get NAT traversal statistics
-    #[allow(clippy::panic)]
-    pub fn get_nat_stats(
-        &self,
-    ) -> Result<NatTraversalStatistics, Box<dyn std::error::Error + Send + Sync>> {
-        // Return default statistics for now
-        // In a real implementation, this would collect actual stats from the endpoint
-        Ok(NatTraversalStatistics {
-            active_sessions: self.active_sessions.len(),
-            // parking_lot::RwLock doesn't poison - always succeeds
-            total_bootstrap_nodes: self.bootstrap_nodes.read().len(),
-            successful_coordinations: 7,
-            average_coordination_time: self.timeout_config.nat_traversal.retry_interval,
-            total_attempts: 10,
-            successful_connections: 7,
-            direct_connections: 5,
-            relayed_connections: 2,
-        })
     }
 }
 
@@ -6900,6 +7312,91 @@ mod tests {
         let _config = NatTraversalConfig::default();
         // Note: This will fail due to ServerConfig requirement in new() - for illustration only
         // let endpoint = NatTraversalEndpoint::new(config, None).unwrap();
+    }
+
+    #[test]
+    fn test_bootstrap_node_defaults_can_coordinate_false() {
+        let addr: SocketAddr = "1.2.3.4:5000".parse().unwrap();
+        let node = BootstrapNode::new(addr);
+        assert!(
+            !node.can_coordinate,
+            "New bootstrap nodes should default to can_coordinate=false"
+        );
+    }
+
+    /// Verify that `select_coordinator` filters by `can_coordinate` and
+    /// weights by RTT and coordination_count.
+    #[tokio::test]
+    async fn test_select_coordinator_quality_weighted() {
+        let config = NatTraversalConfig {
+            known_peers: Vec::new(),
+            bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+            ..Default::default()
+        };
+
+        let endpoint = NatTraversalEndpoint::new(config, None, None)
+            .await
+            .expect("Endpoint creation should succeed");
+
+        // Initially no coordinators available (no known_peers, no connections)
+        assert!(
+            endpoint.select_coordinator().is_none(),
+            "No coordinators should be available initially"
+        );
+
+        // Add some bootstrap nodes with varying quality
+        {
+            let mut nodes = endpoint.bootstrap_nodes.write();
+            nodes.push(BootstrapNode {
+                address: "1.2.3.4:5000".parse().unwrap(),
+                last_seen: std::time::Instant::now(),
+                can_coordinate: false, // NOT eligible
+                rtt: Some(Duration::from_millis(10)),
+                coordination_count: 0,
+            });
+            nodes.push(BootstrapNode {
+                address: "5.6.7.8:6000".parse().unwrap(),
+                last_seen: std::time::Instant::now(),
+                can_coordinate: true, // eligible - low RTT
+                rtt: Some(Duration::from_millis(20)),
+                coordination_count: 0,
+            });
+            nodes.push(BootstrapNode {
+                address: "9.10.11.12:7000".parse().unwrap(),
+                last_seen: std::time::Instant::now(),
+                can_coordinate: true, // eligible - high RTT
+                rtt: Some(Duration::from_millis(500)),
+                coordination_count: 10,
+            });
+        }
+
+        // select_coordinator must never return the non-coordinator node
+        let non_coord: SocketAddr = "1.2.3.4:5000".parse().unwrap();
+        for _ in 0..100 {
+            let selected = endpoint.select_coordinator();
+            assert!(selected.is_some(), "Should find at least one coordinator");
+            assert_ne!(
+                selected.unwrap(),
+                non_coord,
+                "Should never select a node with can_coordinate=false"
+            );
+        }
+
+        // With many trials, the low-RTT node should be selected more often
+        let mut low_rtt_count = 0u32;
+        let trials = 1000;
+        let low_rtt_addr: SocketAddr = "5.6.7.8:6000".parse().unwrap();
+        for _ in 0..trials {
+            if endpoint.select_coordinator() == Some(low_rtt_addr) {
+                low_rtt_count += 1;
+            }
+        }
+        // The low-RTT node should be selected significantly more often
+        // (at least 60% of the time given the 25x RTT advantage)
+        assert!(
+            low_rtt_count > trials * 60 / 100,
+            "Low-RTT node should be preferred, got {low_rtt_count}/{trials}"
+        );
     }
 
     #[test]
