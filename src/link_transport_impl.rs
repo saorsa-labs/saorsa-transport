@@ -493,8 +493,13 @@ impl P2pLinkTransport {
 
     /// Set the default strategy configuration for all `dial_addr()` connections.
     ///
-    /// Use `StrategyConfig::direct_only()` to disable hole-punching and relay
-    /// fallback when all addresses are known to be publicly reachable.
+    /// Use `StrategyConfig::direct_only()` when the upper layer publishes
+    /// typed addresses and selects the right one before dialing — the
+    /// in-cascade hole-punch and relay-fallback stages are then redundant
+    /// (and contribute up to ~24 s of dead latency before timing out under
+    /// the dialer's outer budget). Reachability discovery shifts to the
+    /// upper layer: dial failures bubble back so the caller can pick a
+    /// different address or trigger a relay rebind.
     pub fn with_default_strategy(mut self, config: StrategyConfig) -> Self {
         self.default_strategy_config = Some(config);
         self
