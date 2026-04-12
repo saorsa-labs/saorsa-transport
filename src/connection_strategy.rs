@@ -50,6 +50,11 @@
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
+/// Timeout for direct connection attempts (both IPv4 and IPv6).
+/// Kept short because successful direct connections typically complete in <500ms;
+/// a longer timeout just delays fallback to hole-punching.
+const DEFAULT_DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// How a connection was established
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionMethod {
@@ -180,8 +185,8 @@ pub struct StrategyConfig {
 impl Default for StrategyConfig {
     fn default() -> Self {
         Self {
-            ipv4_timeout: Duration::from_secs(3),
-            ipv6_timeout: Duration::from_secs(3),
+            ipv4_timeout: DEFAULT_DIRECT_CONNECT_TIMEOUT,
+            ipv6_timeout: DEFAULT_DIRECT_CONNECT_TIMEOUT,
             holepunch_timeout: Duration::from_secs(8),
             relay_timeout: Duration::from_secs(10),
             max_holepunch_rounds: 2,
@@ -510,8 +515,8 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = StrategyConfig::default();
-        assert_eq!(config.ipv4_timeout, Duration::from_secs(3));
-        assert_eq!(config.ipv6_timeout, Duration::from_secs(3));
+        assert_eq!(config.ipv4_timeout, DEFAULT_DIRECT_CONNECT_TIMEOUT);
+        assert_eq!(config.ipv6_timeout, DEFAULT_DIRECT_CONNECT_TIMEOUT);
         assert_eq!(config.holepunch_timeout, Duration::from_secs(8));
         assert_eq!(config.relay_timeout, Duration::from_secs(10));
         assert_eq!(config.max_holepunch_rounds, 2);
@@ -522,12 +527,12 @@ mod tests {
     #[test]
     fn test_config_builder() {
         let config = StrategyConfig::new()
-            .with_ipv4_timeout(Duration::from_secs(3))
-            .with_ipv6_timeout(Duration::from_secs(3))
+            .with_ipv4_timeout(Duration::from_secs(2))
+            .with_ipv6_timeout(Duration::from_secs(2))
             .with_max_holepunch_rounds(5)
             .with_ipv6_enabled(false);
 
-        assert_eq!(config.ipv4_timeout, Duration::from_secs(3));
+        assert_eq!(config.ipv4_timeout, Duration::from_secs(2));
         assert_eq!(config.max_holepunch_rounds, 5);
         assert!(!config.ipv6_enabled);
     }
