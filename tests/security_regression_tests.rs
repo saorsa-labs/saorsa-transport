@@ -38,6 +38,7 @@ fn test_peer_config() -> NatTraversalConfig {
         max_message_size: saorsa_transport::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
         allow_loopback: true,
         upnp: Default::default(),
+        advertise_external_addresses: true,
     }
 }
 
@@ -63,6 +64,7 @@ fn test_server_config() -> NatTraversalConfig {
         max_message_size: saorsa_transport::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
         allow_loopback: true,
         upnp: Default::default(),
+        advertise_external_addresses: true,
     }
 }
 
@@ -111,6 +113,7 @@ async fn test_error_handling_no_panic() {
         max_message_size: saorsa_transport::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
         allow_loopback: true,
         upnp: Default::default(),
+        advertise_external_addresses: true,
     };
 
     let result1 = NatTraversalEndpoint::new(config1, None, None).await;
@@ -140,6 +143,7 @@ async fn test_error_handling_no_panic() {
         max_message_size: saorsa_transport::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
         allow_loopback: true,
         upnp: Default::default(),
+        advertise_external_addresses: true,
     };
 
     let result2 = NatTraversalEndpoint::new(config2, None, None).await;
@@ -232,6 +236,7 @@ async fn test_malformed_config_handling() {
         max_message_size: saorsa_transport::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
         allow_loopback: true,
         upnp: Default::default(),
+        advertise_external_addresses: true,
     };
 
     let result = NatTraversalEndpoint::new(no_peers_config, None, None).await;
@@ -262,6 +267,7 @@ async fn test_malformed_config_handling() {
         max_message_size: saorsa_transport::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
         allow_loopback: true,
         upnp: Default::default(),
+        advertise_external_addresses: true,
     };
 
     let result2 = NatTraversalEndpoint::new(extreme_config, None, None).await;
@@ -299,6 +305,7 @@ async fn test_input_sanitization() {
         max_message_size: saorsa_transport::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
         allow_loopback: true,
         upnp: Default::default(),
+        advertise_external_addresses: true,
     };
 
     // This should either work or fail gracefully, not exhaust memory or panic
@@ -371,6 +378,7 @@ mod specific_regression_tests {
             max_message_size: saorsa_transport::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
             allow_loopback: true,
             upnp: Default::default(),
+            advertise_external_addresses: true,
         };
 
         // Should not panic and should handle random port selection
@@ -423,6 +431,7 @@ mod specific_regression_tests {
             max_message_size: saorsa_transport::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
             allow_loopback: true,
             upnp: Default::default(),
+            advertise_external_addresses: true,
         };
 
         // Should not panic, even if configuration is inconsistent

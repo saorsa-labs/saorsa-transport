@@ -1473,12 +1473,16 @@ impl P2pEndpoint {
                         side: Side::Client,
                     });
 
-                    return Ok((
-                        peer_conn,
-                        ConnectionMethod::HolePunched {
-                            coordinator: target_addr, // approximate
-                        },
-                    ));
+                    // The connection was already established (e.g. by an
+                    // earlier dial or an inbound connection from the peer).
+                    // Report the actual address family instead of the
+                    // misleading HolePunched variant.
+                    let method = if target_addr.is_ipv4() {
+                        ConnectionMethod::DirectIPv4
+                    } else {
+                        ConnectionMethod::DirectIPv6
+                    };
+                    return Ok((peer_conn, method));
                 }
             }
 

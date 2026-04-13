@@ -151,6 +151,19 @@ pub struct NatConfig {
     /// port and surfaces the resulting public address as a high-priority
     /// NAT traversal candidate. Failure is silent and non-fatal.
     pub upnp: crate::upnp::UpnpConfig,
+
+    /// Advertise discovered external addresses to connected peers via
+    /// ADD_ADDRESS frames.
+    ///
+    /// When `true` (default), the endpoint broadcasts its server-reflexive
+    /// address to all connections so they can coordinate hole-punching or
+    /// relay setup.  When `false`, no ADD_ADDRESS frames are sent and
+    /// connected peers are **not** registered as NAT traversal coordinators.
+    ///
+    /// Clients that are outbound-only should set this to `false` — they do
+    /// not need to be reachable by other peers and advertising their address
+    /// causes unnecessary inbound connection attempts.
+    pub advertise_external_addresses: bool,
 }
 
 impl Default for NatConfig {
@@ -165,6 +178,7 @@ impl Default for NatConfig {
             prefer_rfc_nat_traversal: true,
             allow_loopback: false,
             upnp: crate::upnp::UpnpConfig::default(),
+            advertise_external_addresses: true,
         }
     }
 }
@@ -319,6 +333,7 @@ impl P2pConfig {
             max_message_size: self.max_message_size,
             allow_loopback: self.nat.allow_loopback,
             upnp: self.nat.upnp.clone(),
+            advertise_external_addresses: self.nat.advertise_external_addresses,
         }
     }
 

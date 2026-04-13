@@ -366,6 +366,10 @@ pub struct NatTraversalEndpoint {
     /// [`crate::upnp::UpnpMappingService::shutdown`] for graceful
     /// teardown including the gateway-side `DeletePortMapping` request.
     upnp_service: parking_lot::Mutex<Option<crate::upnp::UpnpMappingService>>,
+    /// When `false`, the endpoint will not broadcast ADD_ADDRESS frames to
+    /// connected peers and will not register connected peers as NAT traversal
+    /// coordinators. Outbound-only clients set this to `false`.
+    advertise_external_addresses: bool,
 }
 
 /// Configuration for NAT traversal behavior
@@ -520,6 +524,21 @@ pub struct NatTraversalConfig {
     /// Default: enabled with a one-hour lease.
     #[serde(default)]
     pub upnp: crate::upnp::UpnpConfig,
+
+    /// Advertise discovered external addresses to connected peers.
+    ///
+    /// When `false`, no ADD_ADDRESS frames are sent and connected peers
+    /// are not registered as NAT traversal coordinators. Outbound-only
+    /// clients should set this to `false` to avoid unnecessary inbound
+    /// connection attempts.
+    ///
+    /// Default: `true`
+    #[serde(default = "default_advertise_external_addresses")]
+    pub advertise_external_addresses: bool,
+}
+
+fn default_advertise_external_addresses() -> bool {
+    true
 }
 
 fn default_max_message_size() -> usize {
@@ -1112,6 +1131,7 @@ impl Default for NatTraversalConfig {
             max_message_size: crate::unified_config::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
             allow_loopback: false,
             upnp: crate::upnp::UpnpConfig::default(),
+            advertise_external_addresses: true,
         }
     }
 }
@@ -1441,6 +1461,7 @@ impl NatTraversalEndpoint {
             handshake_rx: TokioMutex::new(hs_rx),
             closed_at: dashmap::DashMap::new(),
             upnp_service: parking_lot::Mutex::new(Some(upnp_service)),
+            advertise_external_addresses: config.advertise_external_addresses,
         };
 
         // Multi-transport listening: Spawn receive tasks for all online transports
@@ -1613,6 +1634,7 @@ impl NatTraversalEndpoint {
         let local_session_id = DiscoverySessionId::Local;
         let relay_setup_attempted_clone = endpoint.relay_setup_attempted.clone();
         let relay_server_clone = endpoint.relay_server.clone();
+        let advertise = endpoint.advertise_external_addresses;
         tokio::spawn(async move {
             Self::poll_discovery(
                 discovery_manager_clone,
@@ -1623,6 +1645,7 @@ impl NatTraversalEndpoint {
                 local_session_id,
                 relay_setup_attempted_clone,
                 relay_server_clone,
+                advertise,
             )
             .await;
         });
@@ -1872,6 +1895,7 @@ impl NatTraversalEndpoint {
             handshake_rx: TokioMutex::new(hs_rx),
             closed_at: dashmap::DashMap::new(),
             upnp_service: parking_lot::Mutex::new(Some(upnp_service)),
+            advertise_external_addresses: config.advertise_external_addresses,
         };
 
         // Multi-transport listening: Spawn receive tasks for all online transports
@@ -2044,6 +2068,7 @@ impl NatTraversalEndpoint {
         let local_session_id = DiscoverySessionId::Local;
         let relay_setup_attempted_clone = endpoint.relay_setup_attempted.clone();
         let relay_server_clone = endpoint.relay_server.clone();
+        let advertise = endpoint.advertise_external_addresses;
         tokio::spawn(async move {
             Self::poll_discovery(
                 discovery_manager_clone,
@@ -2054,6 +2079,7 @@ impl NatTraversalEndpoint {
                 local_session_id,
                 relay_setup_attempted_clone,
                 relay_server_clone,
+                advertise,
             )
             .await;
         });
@@ -3120,6 +3146,7 @@ impl NatTraversalEndpoint {
         local_session_id: DiscoverySessionId,
         relay_setup_attempted: Arc<std::sync::atomic::AtomicBool>,
         relay_server: Option<Arc<MasqueRelayServer>>,
+        advertise_external_addresses: bool,
     ) {
         use tokio::time::{Duration, interval};
 
@@ -3200,7 +3227,10 @@ impl NatTraversalEndpoint {
             // 2. Send ADD_ADDRESS to all peers for newly discovered addresses
             // (Critical for CGNAT - peers need to know our external address to hole-punch back)
             // Skip if relay is active — only the relay address should be advertised.
-            if !relay_setup_attempted.load(std::sync::atomic::Ordering::Relaxed) {
+            // Skip entirely for outbound-only clients that don't need to be reachable.
+            if advertise_external_addresses
+                && !relay_setup_attempted.load(std::sync::atomic::Ordering::Relaxed)
+            {
                 for addr in &new_addresses {
                     broadcast_address_to_peers(&connections, *addr, 100);
                 }
@@ -3228,12 +3258,15 @@ impl NatTraversalEndpoint {
                         });
 
                         // Send ADD_ADDRESS frame to all connected peers so they know
-                        // how to reach us (critical for CGNAT hole punching)
-                        broadcast_address_to_peers(
-                            &connections,
-                            candidate.address,
-                            candidate.priority,
-                        );
+                        // how to reach us (critical for CGNAT hole punching).
+                        // Outbound-only clients skip this to avoid inbound dials.
+                        if advertise_external_addresses {
+                            broadcast_address_to_peers(
+                                &connections,
+                                candidate.address,
+                                candidate.priority,
+                            );
+                        }
                     }
                     DiscoveryEvent::DiscoveryCompleted { .. } => {
                         // Use info! level for successful completion
@@ -3919,8 +3952,9 @@ impl NatTraversalEndpoint {
 
         // Register connected peer as a potential coordinator for NAT traversal.
         // In the symmetric P2P architecture (v0.13.0+), any connected node can
-        // coordinate hole-punching for us.
-        {
+        // coordinate hole-punching for us.  Outbound-only clients skip this
+        // because they never initiate hole-punching.
+        if self.advertise_external_addresses {
             let mut nodes = self.bootstrap_nodes.write();
             if !nodes.iter().any(|n| n.address == addr) {
                 nodes.push(BootstrapNode {

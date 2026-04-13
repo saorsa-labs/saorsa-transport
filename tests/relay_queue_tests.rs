@@ -56,6 +56,7 @@ mod nat_traversal_api_tests {
             max_message_size: saorsa_transport::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
             allow_loopback: false,
             upnp: Default::default(),
+            advertise_external_addresses: true,
         };
 
         assert_eq!(config.known_peers.len(), 1);
@@ -193,6 +194,7 @@ mod functional_tests {
             max_message_size: saorsa_transport::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
             allow_loopback: false,
             upnp: Default::default(),
+            advertise_external_addresses: true,
         };
 
         // May fail due to zero values or other validation
@@ -220,6 +222,7 @@ mod functional_tests {
             max_message_size: saorsa_transport::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
             allow_loopback: false,
             upnp: Default::default(),
+            advertise_external_addresses: true,
         };
 
         let result = NatTraversalEndpoint::new(valid_config, None, None).await;
@@ -413,6 +416,7 @@ mod performance_tests {
                 max_message_size: saorsa_transport::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
                 allow_loopback: false,
                 upnp: Default::default(),
+                advertise_external_addresses: true,
             };
 
             // Use the config to prevent optimization
@@ -484,6 +488,7 @@ mod relay_functionality_tests {
             max_message_size: saorsa_transport::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
             allow_loopback: false,
             upnp: Default::default(),
+            advertise_external_addresses: true,
         };
 
         // This might be accepted or rejected depending on implementation
