@@ -56,6 +56,10 @@ const SERVER_REFLEXIVE_PRIORITY: u32 = 550;
 /// These are real OS-assigned addresses but may be private/link-local.
 const LOCAL_INTERFACE_PRIORITY: u32 = 500;
 
+/// How long to sleep between polls when waiting for the platform
+/// interface scan to complete in [`CandidateDiscoveryManager::discover_local_candidates`].
+const INTERFACE_SCAN_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
 /// Session identifier for the candidate discovery manager.
 ///
 /// Replaces the legacy `PeerId` key. Each discovery session is either for
@@ -819,7 +823,7 @@ impl CandidateDiscoveryManager {
 
         // Poll until scan completes (this should be quick for local interfaces)
         let start = Instant::now();
-        let timeout = Duration::from_secs(2);
+        let timeout = self.config.local_scan_timeout;
 
         loop {
             if start.elapsed() > timeout {
@@ -853,7 +857,7 @@ impl CandidateDiscoveryManager {
             }
 
             // Yield to the runtime instead of blocking the worker thread.
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::sleep(INTERFACE_SCAN_POLL_INTERVAL).await;
         }
     }
 
@@ -1273,7 +1277,7 @@ impl CandidateDiscoveryManager {
                 phase: DiscoveryPhase::Idle,
                 discovered_candidates: Vec::new(),
                 statistics: DiscoveryStatistics::default(),
-                elapsed_time: Duration::from_secs(0),
+                elapsed_time: Duration::ZERO,
             };
         }
 
@@ -2132,7 +2136,10 @@ mod tests {
                 candidate.priority > 100,
                 "QUIC-discovered address should have good priority"
             );
-            assert!(candidate.priority < 300, "Priority should be reasonable");
+            assert!(
+                candidate.priority <= SERVER_REFLEXIVE_PRIORITY,
+                "Priority should be reasonable"
+            );
 
             // Verify it's marked as ServerReflexive type (for compatibility)
             assert!(matches!(
@@ -2153,16 +2160,36 @@ mod tests {
             .start_discovery(session_id, vec![])
             .expect("Failed to start discovery in test");
 
-        // Test different types of addresses
+        // Test different types of addresses.
+        // Base is SERVER_REFLEXIVE_PRIORITY (550).
+        // IPv4 public: 550, private: -10, loopback: -20.
+        // IPv6 base: +10, link-local: -30, unique-local: -10.
+        let base = SERVER_REFLEXIVE_PRIORITY;
         let test_cases = vec![
             // (address, expected_priority_range, description)
-            ("1.2.3.4:5678", (250, 260), "Public IPv4"),
-            ("192.168.1.100:9000", (240, 250), "Private IPv4"),
-            ("[2001:db8::1]:5678", (260, 280), "Global IPv6"),
-            ("[fe80::1]:5678", (220, 240), "Link-local IPv6"),
-            ("[fc00::1]:5678", (240, 260), "Unique local IPv6"),
-            ("10.0.0.1:9000", (240, 250), "Private IPv4 (10.x)"),
-            ("172.16.0.1:9000", (240, 250), "Private IPv4 (172.16.x)"),
+            ("1.2.3.4:5678", (base, base), "Public IPv4"),
+            ("192.168.1.100:9000", (base - 10, base - 10), "Private IPv4"),
+            ("[2001:db8::1]:5678", (base + 10, base + 10), "Global IPv6"),
+            (
+                "[fe80::1]:5678",
+                (base + 10 - 30, base + 10 - 30),
+                "Link-local IPv6",
+            ),
+            (
+                "[fc00::1]:5678",
+                (base + 10 - 10, base + 10 - 10),
+                "Unique local IPv6",
+            ),
+            (
+                "10.0.0.1:9000",
+                (base - 10, base - 10),
+                "Private IPv4 (10.x)",
+            ),
+            (
+                "172.16.0.1:9000",
+                (base - 10, base - 10),
+                "Private IPv4 (172.16.x)",
+            ),
         ];
 
         for (addr_str, (min_priority, max_priority), description) in test_cases {
@@ -2204,8 +2231,8 @@ mod tests {
                 .expect("Failed to parse test address"),
         );
         assert_eq!(
-            base_priority, 255,
-            "Base priority should be 255 for public IPv4"
+            base_priority, SERVER_REFLEXIVE_PRIORITY,
+            "Base priority should match SERVER_REFLEXIVE_PRIORITY for public IPv4"
         );
 
         // Test IPv6 gets higher priority

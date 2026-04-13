@@ -231,11 +231,17 @@ impl Stream for ConcurrentDiscoveryStream {
     }
 }
 
-/// A simple discovery source that yields addresses from a channel
+/// A simple discovery source that yields addresses from a channel.
+///
+/// The receiver is moved into the first stream returned by [`discover()`].
+/// Subsequent calls return an immediately-empty stream. This avoids
+/// holding a mutex across `.await` points, which would serialize
+/// concurrent consumers.
 pub struct ChannelDiscovery {
     name: &'static str,
     sender: mpsc::Sender<DiscoveredAddress>,
-    receiver: Arc<tokio::sync::Mutex<mpsc::Receiver<DiscoveredAddress>>>,
+    /// `Some` until the first `discover()` call takes ownership.
+    receiver: std::sync::Mutex<Option<mpsc::Receiver<DiscoveredAddress>>>,
 }
 
 impl ChannelDiscovery {
@@ -245,7 +251,7 @@ impl ChannelDiscovery {
         Self {
             name,
             sender,
-            receiver: Arc::new(tokio::sync::Mutex::new(receiver)),
+            receiver: std::sync::Mutex::new(Some(receiver)),
         }
     }
 
@@ -268,15 +274,21 @@ impl Discovery for ChannelDiscovery {
         &self,
         _peer_id: &PeerId,
     ) -> Pin<Box<dyn Stream<Item = DiscoveryResult> + Send + 'static>> {
-        let receiver = self.receiver.clone();
+        // Take the receiver so the stream owns it outright — no mutex
+        // held across await points. On a poisoned mutex (prior panic),
+        // recover the inner value — the Option<Receiver> is always valid.
+        let receiver = self
+            .receiver
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
 
-        Box::pin(futures_util::stream::unfold(
-            receiver,
-            |receiver| async move {
-                let mut guard = receiver.lock().await;
-                guard.recv().await.map(|addr| (Ok(addr), receiver.clone()))
-            },
-        ))
+        match receiver {
+            Some(rx) => Box::pin(futures_util::stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|addr| (Ok(addr), rx))
+            })),
+            None => Box::pin(futures_util::stream::empty()),
+        }
     }
 
     fn name(&self) -> &'static str {
