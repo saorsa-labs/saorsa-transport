@@ -1474,8 +1474,12 @@ impl NatTraversalEndpoint {
         let (nack_tx, nack_rx) = mpsc::unbounded_channel();
         inner_endpoint.set_nack_tx(nack_tx);
 
-        // Channel for background handshake completion (persistent across accept calls)
-        let (hs_tx, hs_rx) = mpsc::channel(32);
+        // Channel for background handshake completion (persistent across accept calls).
+        // Capacity 1024: the consumer (accept_connection_direct → P2pEndpoint::accept)
+        // can stall briefly under write-lock contention in saorsa-core's accept loop.
+        // A small buffer (32) caused the pipeline to back up after 15+ hours in a
+        // 1000-node testnet, blocking all new connection handoffs.
+        let (hs_tx, hs_rx) = mpsc::channel(1024);
 
         // Compute local peer ID = BLAKE3(public_key_spki) for
         // deterministic simultaneous-connect tie-breaking.
@@ -1946,8 +1950,12 @@ impl NatTraversalEndpoint {
         let (nack_tx, nack_rx) = mpsc::unbounded_channel();
         inner_endpoint.set_nack_tx(nack_tx);
 
-        // Channel for background handshake completion (persistent across accept calls)
-        let (hs_tx, hs_rx) = mpsc::channel(32);
+        // Channel for background handshake completion (persistent across accept calls).
+        // Capacity 1024: the consumer (accept_connection_direct → P2pEndpoint::accept)
+        // can stall briefly under write-lock contention in saorsa-core's accept loop.
+        // A small buffer (32) caused the pipeline to back up after 15+ hours in a
+        // 1000-node testnet, blocking all new connection handoffs.
+        let (hs_tx, hs_rx) = mpsc::channel(1024);
 
         // Compute local peer ID = BLAKE3(public_key_spki) for
         // deterministic simultaneous-connect tie-breaking.
