@@ -1723,11 +1723,7 @@ impl NatTraversalEndpoint {
         let relay_setup_attempted_clone = endpoint.relay_setup_attempted.clone();
         let known_peers_for_poll: std::collections::HashSet<SocketAddr> =
             endpoint.config.known_peers.iter().copied().collect();
-        let local_port_for_poll: u16 = endpoint
-            .config
-            .bind_addr
-            .map(|a| a.port())
-            .unwrap_or(0);
+        let local_port_for_poll: u16 = endpoint.config.bind_addr.map(|a| a.port()).unwrap_or(0);
         tokio::spawn(async move {
             Self::poll_discovery(
                 discovery_manager_clone,
@@ -2195,11 +2191,7 @@ impl NatTraversalEndpoint {
         let relay_setup_attempted_clone = endpoint.relay_setup_attempted.clone();
         let known_peers_for_poll: std::collections::HashSet<SocketAddr> =
             endpoint.config.known_peers.iter().copied().collect();
-        let local_port_for_poll: u16 = endpoint
-            .config
-            .bind_addr
-            .map(|a| a.port())
-            .unwrap_or(0);
+        let local_port_for_poll: u16 = endpoint.config.bind_addr.map(|a| a.port()).unwrap_or(0);
         tokio::spawn(async move {
             Self::poll_discovery(
                 discovery_manager_clone,
@@ -3330,9 +3322,7 @@ impl NatTraversalEndpoint {
                     // IP-baseline approach and catches all relay-port
                     // pollution regardless of whether the relay runs on a
                     // known peer, a regular peer, or our own node.
-                    if local_listen_port != 0
-                        && observed_addr.port() != local_listen_port
-                    {
+                    if local_listen_port != 0 && observed_addr.port() != local_listen_port {
                         tracing::debug!(
                             "poll_discovery_task: SKIPPING observation {} from {} \
                              (port {} != listen port {})",
@@ -4022,7 +4012,9 @@ impl NatTraversalEndpoint {
                         let old_conn = if let Some(old) = connections2.get(&remote_address) {
                             Some(old.value().clone())
                         } else {
-                            connections2.get(&normalized_remote).map(|old| old.value().clone())
+                            connections2
+                                .get(&normalized_remote)
+                                .map(|old| old.value().clone())
                         };
                         if let Some(old) = old_conn {
                             tokio::spawn(async move {

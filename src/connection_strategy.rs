@@ -486,8 +486,8 @@ mod tests {
         let config = StrategyConfig::default();
         assert_eq!(config.ipv4_timeout, Duration::from_secs(3));
         assert_eq!(config.ipv6_timeout, Duration::from_secs(3));
-        assert_eq!(config.holepunch_timeout, Duration::from_secs(8));
-        assert_eq!(config.relay_timeout, Duration::from_secs(10));
+        assert_eq!(config.holepunch_timeout, Duration::from_secs(3));
+        assert_eq!(config.relay_timeout, Duration::from_secs(5));
         assert_eq!(config.max_holepunch_rounds, 2);
         assert!(config.ipv6_enabled);
         assert!(config.relay_enabled);

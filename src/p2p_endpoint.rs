@@ -73,8 +73,8 @@ use crate::happy_eyeballs::{self, HappyEyeballsConfig};
 pub use crate::nat_traversal_api::TraversalPhase;
 use crate::nat_traversal_api::{NatTraversalEndpoint, NatTraversalError, NatTraversalEvent};
 use crate::reachability::{ReachabilityScope, TraversalMethod, socket_addr_scope};
-use crate::transport::{ProtocolEngine, TransportAddr, TransportRegistry};
 use crate::shared::normalize_socket_addr;
+use crate::transport::{ProtocolEngine, TransportAddr, TransportRegistry};
 use crate::unified_config::P2pConfig;
 use rustls;
 

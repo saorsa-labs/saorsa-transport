@@ -3639,11 +3639,10 @@ impl Connection {
                         nack.round,
                         hex::encode(&nack.target_peer_id[..8])
                     );
-                    self.endpoint_events.push_back(
-                        EndpointEventInner::PunchMeNowNacked {
+                    self.endpoint_events
+                        .push_back(EndpointEventInner::PunchMeNowNacked {
                             target_peer_id: nack.target_peer_id,
-                        },
-                    );
+                        });
                 }
             }
         }
@@ -4215,8 +4214,7 @@ impl Connection {
         }
 
         // NAT traversal frames - PunchMeNowNack
-        while buf.len() + frame::PunchMeNowNack::SIZE_BOUND < max_size
-            && space_id == SpaceId::Data
+        while buf.len() + frame::PunchMeNowNack::SIZE_BOUND < max_size && space_id == SpaceId::Data
         {
             let nack = match space.pending.punch_me_now_nack.pop() {
                 Some(x) => x,
