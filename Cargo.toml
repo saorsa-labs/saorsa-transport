@@ -277,6 +277,10 @@ harness = false
 name = "pqc_memory_pool_bench"
 harness = false
 
+[[bench]]
+name = "udp_throughput"
+harness = false
+
 
 # Test categorization
 [[test]]

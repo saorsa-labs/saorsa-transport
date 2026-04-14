@@ -1618,12 +1618,16 @@ pub enum SendDatagramError {
 /// The maximum amount of datagrams which will be produced in a single `drive_transmit` call
 ///
 /// This limits the amount of CPU resources consumed by datagram generation,
-/// and allows other tasks (like receiving ACKs) to run in between.
+/// and allows other tasks (like receiving ACKs) to run in between. Kept low so
+/// non-GSO platforms (macOS, Windows) yield the runtime promptly between
+/// single-datagram `sendto` syscalls.
 const MAX_TRANSMIT_DATAGRAMS: usize = 20;
 
-/// The maximum amount of datagrams that are sent in a single transmit
+/// Upper bound on GSO segments inside a single `Transmit`.
 ///
-/// This can be lower than the maximum platform capabilities, to avoid excessive
-/// memory allocations when calling `poll_transmit()`. Benchmarks have shown
-/// that numbers around 10 are a good compromise.
-const MAX_TRANSMIT_SEGMENTS: usize = 10;
+/// At runtime this is further clamped to `socket.max_transmit_segments()`, so
+/// platforms without `UDP_SEGMENT` (macOS, Windows) effectively see 1 and pay
+/// no penalty. On Linux with GSO, raising this from 10 → 64 lets `poll_transmit`
+/// fill a full `sendmsg(2)` burst — matching tokio-quiche's
+/// `UDP_MAX_SEGMENT_COUNT` and reducing the syscall rate ~6× at line rate.
+const MAX_TRANSMIT_SEGMENTS: usize = 64;
