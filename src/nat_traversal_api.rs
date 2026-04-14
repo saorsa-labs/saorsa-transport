@@ -4019,28 +4019,55 @@ impl NatTraversalEndpoint {
         Ok(())
     }
 
-    /// Remove a connection by remote address
+    /// Remove a connection by remote address.
+    ///
+    /// If `expected_stable_id` is `Some`, the entry is only removed when the
+    /// current DashMap connection's `stable_id()` matches. This lets the
+    /// reader-exit handler avoid tearing down a newer connection that replaced
+    /// the one whose reader just exited (typical in simultaneous-open races).
+    ///
+    /// If `expected_stable_id` is `None`, the caller is asserting the entry
+    /// should go regardless (disconnect API, stale reaper, send-failure
+    /// cleanup). Any live connection in the slot is explicitly `close()`'d
+    /// before removal so:
+    ///
+    /// - zombie connections (driver stalled, frames never transmitted, but
+    ///   `close_reason=None`) are forced out of the DashMap instead of being
+    ///   left behind as ghosts for `is_connected()` to re-report as alive,
+    /// - the peer is notified via a CONNECTION_CLOSE frame when reachable,
+    /// - any reader tasks holding a clone of the Connection observe the
+    ///   close and exit cleanly.
     pub fn remove_connection(
         &self,
         addr: &SocketAddr,
+        expected_stable_id: Option<usize>,
     ) -> Result<Option<InnerConnection>, NatTraversalError> {
         // Clear emitted event tracking so reconnections can generate new events
         // DashSet provides lock-free .remove()
         self.emitted_established_events.remove(addr);
 
-        // Only remove if the connection is actually dead. Multiple reader
-        // tasks can share the same address (incoming + outgoing hole-punch).
-        // If one reader exits but the connection is still live (the other
-        // reader is using it), don't remove it from the DashMap — the send
-        // path needs it.
         if let Some(entry) = self.connections.get(addr) {
+            if let Some(expected_id) = expected_stable_id {
+                let current_id = entry.value().stable_id();
+                if current_id != expected_id {
+                    info!(
+                        "remove_connection: {} DashMap has a different connection \
+                         (stable_id {} vs expected {}), keeping",
+                        addr, current_id, expected_id
+                    );
+                    drop(entry);
+                    return Ok(None);
+                }
+            }
+
             if entry.value().close_reason().is_none() {
-                info!(
-                    "remove_connection: {} still has a live connection, keeping in DashMap",
-                    addr
-                );
-                drop(entry);
-                return Ok(None);
+                // Force the connection shut so its Quinn resources are
+                // released and any concurrent readers observe the close.
+                // Without this, a stalled-driver zombie would linger as a
+                // phantom entry even after we drop it from the DashMap.
+                entry
+                    .value()
+                    .close(VarInt::from_u32(0), b"saorsa-transport: force-closed");
             }
         }
         Ok(self.connections.remove(addr).map(|(_, v)| v))

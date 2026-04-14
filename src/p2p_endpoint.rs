@@ -119,6 +119,18 @@ pub struct P2pEndpoint {
     /// Connected peers keyed by remote socket address
     connected_peers: Arc<RwLock<HashMap<SocketAddr, PeerConnection>>>,
 
+    /// Sockets we have already broadcast `P2pEvent::PeerConnected` for.
+    ///
+    /// A single underlying QUIC connection can be observed via several paths
+    /// (NAT-traversal callback, accept-side reader, dial short-circuit, send-side
+    /// hole-punch fixup). Without dedup each path fires its own PeerConnected,
+    /// which translates to duplicate `LinkEvent::PeerConnected` →
+    /// `ConnectionEvent::Established` upstream and triggers redundant identity
+    /// announces (one of the root causes of the "Failed to send identity
+    /// announce" warning storm). Cleared when the address is cleaned up so
+    /// real reconnects fire a fresh event.
+    emitted_peer_connected: Arc<dashmap::DashSet<SocketAddr>>,
+
     /// Endpoint statistics
     stats: Arc<RwLock<EndpointStats>>,
 
@@ -198,10 +210,14 @@ pub struct P2pEndpoint {
     /// Channel for reader tasks to notify immediate cleanup on exit.
     ///
     /// When a reader task detects a dead QUIC connection (`accept_uni` error),
-    /// it sends the peer address here.  The reader-exit handler task receives
-    /// it and calls `do_cleanup_connection` immediately — no waiting for the
-    /// periodic stale reaper.
-    reader_exit_tx: mpsc::UnboundedSender<SocketAddr>,
+    /// it sends `(peer_addr, stable_id)` here. The stable_id identifies the
+    /// specific Connection the reader owned; the cleanup handler only evicts
+    /// the DashMap entry if its stable_id matches, so a newer
+    /// simultaneous-open replacement is preserved when an older reader dies.
+    /// The reader-exit handler task receives it and calls
+    /// `do_cleanup_connection` immediately — no waiting for the periodic
+    /// stale reaper.
+    reader_exit_tx: mpsc::UnboundedSender<(SocketAddr, usize)>,
 
     /// In-flight connection attempts, keyed by target address.
     ///
@@ -531,6 +547,41 @@ pub enum EndpointError {
     NoAddress,
 }
 
+/// Broadcast `P2pEvent::PeerConnected` for `addr` exactly once per
+/// disconnect cycle.
+///
+/// `emitted` tracks which addresses we have already broadcast for. The first
+/// call per address inserts and broadcasts; subsequent calls are no-ops until
+/// the address is removed from `emitted` by `do_cleanup_connection` or a peer
+/// disconnect event. This prevents the simultaneous-open dial+accept race
+/// (and the send-side hole-punch fixup) from emitting duplicate events that
+/// would each trigger a redundant identity announce upstream in saorsa-core.
+///
+/// Non-socket transport addresses (BLE, LoRa) are always broadcast — they
+/// don't share the dedup pool keyed by `SocketAddr`.
+fn broadcast_peer_connected_once(
+    emitted: &dashmap::DashSet<SocketAddr>,
+    event_tx: &broadcast::Sender<P2pEvent>,
+    addr: TransportAddr,
+    public_key: Option<Vec<u8>>,
+    side: Side,
+) {
+    if let Some(socket_addr) = addr.as_socket_addr() {
+        if !emitted.insert(socket_addr) {
+            debug!(
+                "broadcast_peer_connected_once: skipping duplicate PeerConnected for {}",
+                socket_addr
+            );
+            return;
+        }
+    }
+    let _ = event_tx.send(P2pEvent::PeerConnected {
+        addr,
+        public_key,
+        side,
+    });
+}
+
 /// Shared cleanup logic for removing a peer from all tracking structures.
 ///
 /// Used by both `P2pEndpoint::cleanup_connection()` and the background reaper
@@ -541,21 +592,48 @@ pub enum EndpointError {
 /// Each lock is acquired and released independently (no nesting) to minimise
 /// hold time and avoid blocking concurrent `send()` / `connect()` calls.
 ///
+/// `expected_stable_id`, if provided, gates the DashMap removal so a
+/// reader-exit triggered cleanup does not evict a newer simultaneous-open
+/// replacement. `None` means force-remove (disconnect API / stale reaper /
+/// send-failure cleanup).
+///
 /// Returns `true` if the peer was actually present in `connected_peers`.
+#[allow(clippy::too_many_arguments)]
 async fn do_cleanup_connection(
     connected_peers: &RwLock<HashMap<SocketAddr, PeerConnection>>,
     inner: &NatTraversalEndpoint,
     reader_handles: &RwLock<HashMap<SocketAddr, tokio::task::AbortHandle>>,
     stats: &RwLock<EndpointStats>,
     event_tx: &broadcast::Sender<P2pEvent>,
+    emitted_peer_connected: &dashmap::DashSet<SocketAddr>,
     addr: &SocketAddr,
     reason: DisconnectReason,
+    expected_stable_id: Option<usize>,
 ) -> bool {
-    // Step 1: Remove from connected_peers (canonical lock #1)
+    // Step 1: Try to remove from the NAT traversal layer first (lock-free
+    // DashMap). When the caller is a reader-exit firing for an older
+    // connection that has since been replaced via simultaneous-open, the
+    // stable_id guard rejects the removal — in that case the current
+    // DashMap entry belongs to a newer connection and the per-addr
+    // tracking (connected_peers, reader_handles) must NOT be torn down.
+    let inner_removed = matches!(
+        inner.remove_connection(addr, expected_stable_id),
+        Ok(Some(_))
+    );
+    if expected_stable_id.is_some() && !inner_removed {
+        debug!(
+            "do_cleanup_connection: {} — DashMap holds a newer connection, \
+             leaving connected_peers/reader_handles intact",
+            addr
+        );
+        return false;
+    }
+
+    // Step 2: Remove from connected_peers (canonical lock #1)
     let removed = connected_peers.write().await.remove(addr);
 
-    // Step 2: Remove from NAT traversal layer (lock-free DashMap)
-    let _ = inner.remove_connection(addr);
+    // Allow a future reconnect to broadcast a fresh PeerConnected event.
+    emitted_peer_connected.remove(addr);
 
     // Step 3: Remove and abort reader task (canonical lock #2)
     let abort_handle = reader_handles.write().await.remove(addr);
@@ -617,10 +695,18 @@ impl P2pEndpoint {
         }));
         let stats_clone = Arc::clone(&stats);
 
+        // Shared dedup tracker for PeerConnected broadcasts. Captured by
+        // the event_callback closure (which has no &self) and also wired
+        // into the P2pEndpoint struct so other broadcast sites share state.
+        let emitted_peer_connected: Arc<dashmap::DashSet<SocketAddr>> =
+            Arc::new(dashmap::DashSet::new());
+        let emitted_peer_connected_cb = Arc::clone(&emitted_peer_connected);
+
         // Create event callback that bridges to broadcast channel
         let event_callback = Box::new(move |event: NatTraversalEvent| {
             let event_tx = event_tx_clone.clone();
             let stats = stats_clone.clone();
+            let emitted = Arc::clone(&emitted_peer_connected_cb);
 
             tokio::spawn(async move {
                 // Update stats based on event
@@ -638,12 +724,14 @@ impl P2pEndpoint {
                         stats_guard.active_connections += 1;
                         stats_guard.successful_connections += 1;
 
-                        // Broadcast event with connection direction
-                        let _ = event_tx.send(P2pEvent::PeerConnected {
-                            addr: TransportAddr::Quic(*remote_address),
-                            public_key: public_key.clone(),
-                            side: *side,
-                        });
+                        // Broadcast event with connection direction (deduped).
+                        broadcast_peer_connected_once(
+                            &emitted,
+                            &event_tx,
+                            TransportAddr::Quic(*remote_address),
+                            public_key.clone(),
+                            *side,
+                        );
                     }
                     NatTraversalEvent::TraversalFailed { remote_address, .. } => {
                         stats_guard.failed_connections += 1;
@@ -758,6 +846,7 @@ impl P2pEndpoint {
             inner: inner_arc,
             // v0.2: auth_manager removed
             connected_peers: Arc::new(RwLock::new(HashMap::new())),
+            emitted_peer_connected,
             stats,
             config,
             event_tx,
@@ -977,11 +1066,13 @@ impl P2pEndpoint {
         }
 
         // Broadcast event (we initiated the connection = Client side)
-        let _ = self.event_tx.send(P2pEvent::PeerConnected {
-            addr: TransportAddr::Quic(addr),
-            public_key: remote_public_key,
-            side: Side::Client,
-        });
+        broadcast_peer_connected_once(
+            &self.emitted_peer_connected,
+            &self.event_tx,
+            TransportAddr::Quic(addr),
+            remote_public_key,
+            Side::Client,
+        );
 
         Ok(peer_conn)
     }
@@ -1073,12 +1164,14 @@ impl P2pEndpoint {
                     stats.successful_connections += 1;
                 }
 
-                // Broadcast event
-                let _ = self.event_tx.send(P2pEvent::PeerConnected {
-                    addr: addr.clone(),
-                    public_key: None,
-                    side: Side::Client,
-                });
+                // Broadcast event (deduped)
+                broadcast_peer_connected_once(
+                    &self.emitted_peer_connected,
+                    &self.event_tx,
+                    addr.clone(),
+                    None,
+                    Side::Client,
+                );
 
                 Ok(peer_conn)
             }
@@ -1466,12 +1559,16 @@ impl P2pEndpoint {
                         .await
                         .insert(target_addr, peer_conn.clone());
 
-                    // Broadcast PeerConnected so the identity exchange is triggered
-                    let _ = self.event_tx.send(P2pEvent::PeerConnected {
-                        addr: TransportAddr::Quic(target_addr),
-                        public_key: peer_conn.public_key.clone(),
-                        side: Side::Client,
-                    });
+                    // Broadcast PeerConnected so the identity exchange is
+                    // triggered. Deduped so the parallel accept path doesn't
+                    // double-announce for the same underlying connection.
+                    broadcast_peer_connected_once(
+                        &self.emitted_peer_connected,
+                        &self.event_tx,
+                        TransportAddr::Quic(target_addr),
+                        peer_conn.public_key.clone(),
+                        Side::Client,
+                    );
 
                     // The connection was already established (e.g. by an
                     // earlier dial or an inbound connection from the peer).
@@ -1750,14 +1847,22 @@ impl P2pEndpoint {
                     "simultaneous open: peer connection not yet available, retry".into(),
                 ));
             }
-            // We have the lower fingerprint: keep our outgoing connection,
-            // remove the old one from accept path.
+            // We have the lower fingerprint: keep our outgoing connection.
+            // The incoming entry currently in the DashMap will be overwritten
+            // by the `add_connection` call below — we deliberately do NOT
+            // explicitly remove or close it here. Force-closing the incoming
+            // would propagate a CONNECTION_CLOSE that races with the peer's
+            // own simultaneous-open resolution and triggers cascading cleanup
+            // that can evict the freshly-added outgoing's per-addr state.
+            // The incoming's reader task will exit naturally once the peer
+            // tears it down on their side; the stable_id guard in
+            // `do_cleanup_connection` keeps that exit from disturbing the
+            // outgoing.
             info!(
                 "finalize_direct_connection: simultaneous open for {} — \
-                 keeping outgoing (replacing incoming)",
+                 keeping outgoing (replacing incoming via add_connection)",
                 addr
             );
-            let _ = self.inner.remove_connection(&addr);
         }
 
         // Store in NAT traversal layer (keyed by remote SocketAddr)
@@ -1795,11 +1900,13 @@ impl P2pEndpoint {
             stats.direct_connections += 1;
         }
 
-        let _ = self.event_tx.send(P2pEvent::PeerConnected {
-            addr: TransportAddr::Quic(addr),
-            public_key: remote_public_key,
-            side: Side::Client,
-        });
+        broadcast_peer_connected_once(
+            &self.emitted_peer_connected,
+            &self.event_tx,
+            TransportAddr::Quic(addr),
+            remote_public_key,
+            Side::Client,
+        );
 
         Ok(peer_conn)
     }
@@ -2154,11 +2261,13 @@ impl P2pEndpoint {
                 }
 
                 // They initiated the connection to us = Server side
-                let _ = self.event_tx.send(P2pEvent::PeerConnected {
-                    addr: TransportAddr::Quic(remote_addr),
-                    public_key: remote_public_key,
-                    side: Side::Server,
-                });
+                broadcast_peer_connected_once(
+                    &self.emitted_peer_connected,
+                    &self.event_tx,
+                    TransportAddr::Quic(remote_addr),
+                    remote_public_key,
+                    Side::Server,
+                );
 
                 Some(peer_conn)
             }
@@ -2179,14 +2288,19 @@ impl P2pEndpoint {
     ///
     /// Safe to call even if the peer is not in all structures (idempotent).
     async fn cleanup_connection(&self, addr: &SocketAddr, reason: DisconnectReason) {
+        // Explicit disconnect: force-remove the DashMap entry regardless of
+        // Quinn's close_reason state. The caller has already decided this
+        // peer should go.
         do_cleanup_connection(
             &*self.connected_peers,
             &*self.inner,
             &*self.reader_handles,
             &*self.stats,
             &self.event_tx,
+            &self.emitted_peer_connected,
             addr,
             reason,
+            None,
         )
         .await;
     }
@@ -2282,11 +2396,13 @@ impl P2pEndpoint {
                         last_activity: Instant::now(),
                     };
                     self.connected_peers.write().await.insert(*addr, peer_conn);
-                    let _ = self.event_tx.send(P2pEvent::PeerConnected {
-                        addr: TransportAddr::Quic(*addr),
-                        public_key: None,
-                        side: Side::Server,
-                    });
+                    broadcast_peer_connected_once(
+                        &self.emitted_peer_connected,
+                        &self.event_tx,
+                        TransportAddr::Quic(*addr),
+                        None,
+                        Side::Server,
+                    );
                     (TransportAddr::Quic(*addr), Some(conn))
                 } else {
                     return Err(EndpointError::PeerNotFound(*addr));
@@ -2813,7 +2929,7 @@ impl P2pEndpoint {
             }
 
             // Notify the reader-exit handler for immediate cleanup.
-            let _ = exit_tx.send(addr);
+            let _ = exit_tx.send((addr, connection.stable_id()));
             addr
         });
 
@@ -2830,11 +2946,13 @@ impl P2pEndpoint {
         let data_tx = self.data_tx.clone();
         let connected_peers = Arc::clone(&self.connected_peers);
         let event_tx = self.event_tx.clone();
+        let emitted_peer_connected = Arc::clone(&self.emitted_peer_connected);
         let constrained_peer_addrs = Arc::clone(&self.constrained_peer_addrs);
         let constrained_connections = Arc::clone(&self.constrained_connections);
         let shutdown = self.shutdown.clone();
 
         /// Register a new constrained peer in all lookup maps and emit a connect event.
+        #[allow(clippy::too_many_arguments)]
         async fn register_constrained_peer(
             connection_id: ConstrainedConnectionId,
             addr: &TransportAddr,
@@ -2843,6 +2961,7 @@ impl P2pEndpoint {
             constrained_peer_addrs: &RwLock<HashMap<ConstrainedConnectionId, TransportAddr>>,
             connected_peers: &RwLock<HashMap<SocketAddr, PeerConnection>>,
             event_tx: &broadcast::Sender<P2pEvent>,
+            emitted_peer_connected: &dashmap::DashSet<SocketAddr>,
         ) {
             let synthetic_addr = addr.to_synthetic_socket_addr();
             constrained_connections
@@ -2863,11 +2982,13 @@ impl P2pEndpoint {
                     last_activity: Instant::now(),
                 },
             );
-            let _ = event_tx.send(P2pEvent::PeerConnected {
-                addr: addr.clone(),
-                public_key: None,
+            broadcast_peer_connected_once(
+                emitted_peer_connected,
+                event_tx,
+                addr.clone(),
+                None,
                 side,
-            });
+            );
         }
 
         tokio::spawn(async move {
@@ -2931,6 +3052,7 @@ impl P2pEndpoint {
                             &constrained_peer_addrs,
                             &connected_peers,
                             &event_tx,
+                            &emitted_peer_connected,
                         )
                         .await;
                     }
@@ -2949,6 +3071,7 @@ impl P2pEndpoint {
                                 &constrained_peer_addrs,
                                 &connected_peers,
                                 &event_tx,
+                                &emitted_peer_connected,
                             )
                             .await;
                         }
@@ -2994,20 +3117,24 @@ impl P2pEndpoint {
     ///
     /// This is the primary, event-driven detection path.  The stale reaper
     /// serves as a periodic safety net behind this.
-    fn spawn_reader_exit_handler(&self, mut reader_exit_rx: mpsc::UnboundedReceiver<SocketAddr>) {
+    fn spawn_reader_exit_handler(
+        &self,
+        mut reader_exit_rx: mpsc::UnboundedReceiver<(SocketAddr, usize)>,
+    ) {
         let connected_peers = Arc::clone(&self.connected_peers);
         let inner = Arc::clone(&self.inner);
         let event_tx = self.event_tx.clone();
         let stats = Arc::clone(&self.stats);
         let reader_handles = Arc::clone(&self.reader_handles);
+        let emitted_peer_connected = Arc::clone(&self.emitted_peer_connected);
         let shutdown = self.shutdown.clone();
 
         tokio::spawn(async move {
             loop {
-                let addr = tokio::select! {
-                    addr = reader_exit_rx.recv() => {
-                        match addr {
-                            Some(a) => a,
+                let (addr, stable_id) = tokio::select! {
+                    msg = reader_exit_rx.recv() => {
+                        match msg {
+                            Some(m) => m,
                             None => return, // channel closed
                         }
                     }
@@ -3017,7 +3144,10 @@ impl P2pEndpoint {
                     }
                 };
 
-                info!("Reader task exited for {}, running immediate cleanup", addr);
+                info!(
+                    "Reader task exited for {} (stable_id {}), running immediate cleanup",
+                    addr, stable_id
+                );
                 let cleanup_start = Instant::now();
                 do_cleanup_connection(
                     &connected_peers,
@@ -3025,8 +3155,10 @@ impl P2pEndpoint {
                     &reader_handles,
                     &stats,
                     &event_tx,
+                    &emitted_peer_connected,
                     &addr,
                     DisconnectReason::Timeout,
+                    Some(stable_id),
                 )
                 .await;
                 let cleanup_elapsed = cleanup_start.elapsed();
@@ -3053,6 +3185,7 @@ impl P2pEndpoint {
         let event_tx = self.event_tx.clone();
         let stats = Arc::clone(&self.stats);
         let reader_handles = Arc::clone(&self.reader_handles);
+        let emitted_peer_connected = Arc::clone(&self.emitted_peer_connected);
         let shutdown = self.shutdown.clone();
 
         tokio::spawn(async move {
@@ -3085,14 +3218,18 @@ impl P2pEndpoint {
                 }
 
                 for addr in &stale_addrs {
+                    // Stale reaper has already determined the connection is
+                    // gone (is_connected returned false), so force-remove.
                     do_cleanup_connection(
                         &connected_peers,
                         &inner,
                         &reader_handles,
                         &stats,
                         &event_tx,
+                        &emitted_peer_connected,
                         addr,
                         DisconnectReason::Timeout,
+                        None,
                     )
                     .await;
                 }
@@ -3199,6 +3336,7 @@ impl P2pEndpoint {
         debug!("FORWARDER_DEBUG: spawn_incoming_connection_forwarder called");
         let connected_peers = Arc::clone(&self.connected_peers);
         let event_tx = self.event_tx.clone();
+        let emitted_peer_connected = Arc::clone(&self.emitted_peer_connected);
         let shutdown = self.shutdown.clone();
         let accepted_rx = self.inner.accepted_addrs_rx();
         let inner = Arc::clone(&self.inner);
@@ -3286,7 +3424,7 @@ impl P2pEndpoint {
                             }
                         }
 
-                        let _ = exit_tx.send(addr);
+                        let _ = exit_tx.send((addr, conn.stable_id()));
                         addr
                     });
 
@@ -3299,11 +3437,13 @@ impl P2pEndpoint {
                 }
 
                 connected_peers.write().await.insert(addr, peer_conn);
-                let _ = event_tx.send(P2pEvent::PeerConnected {
-                    addr: TransportAddr::Quic(addr),
-                    public_key: None,
-                    side: Side::Server,
-                });
+                broadcast_peer_connected_once(
+                    &emitted_peer_connected,
+                    &event_tx,
+                    TransportAddr::Quic(addr),
+                    None,
+                    Side::Server,
+                );
 
                 // Spawn a reader task for the connection so incoming streams
                 // (DHT, chunk protocol) are actually read. Without this, relayed
@@ -3350,7 +3490,7 @@ impl P2pEndpoint {
                                     warn!("Reader task for {} (forwarder): data channel full, dropping {} bytes", addr, data_len);
                                 }
                             }
-                            let _ = exit_tx.send(addr);
+                            let _ = exit_tx.send((addr, conn.stable_id()));
                             addr
                         });
                     }
@@ -3380,6 +3520,7 @@ impl Clone for P2pEndpoint {
             inner: Arc::clone(&self.inner),
             // v0.2: auth_manager removed - TLS handles peer authentication
             connected_peers: Arc::clone(&self.connected_peers),
+            emitted_peer_connected: Arc::clone(&self.emitted_peer_connected),
             stats: Arc::clone(&self.stats),
             config: self.config.clone(),
             event_tx: self.event_tx.clone(),
