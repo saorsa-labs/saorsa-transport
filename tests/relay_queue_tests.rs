@@ -55,6 +55,9 @@ mod nat_traversal_api_tests {
             transport_registry: None,
             max_message_size: saorsa_transport::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
             allow_loopback: false,
+            coordinator_max_active_relays: 32,
+            coordinator_relay_slot_idle_timeout: Duration::from_secs(5),
+            upnp: Default::default(),
         };
 
         assert_eq!(config.known_peers.len(), 1);
@@ -191,6 +194,9 @@ mod functional_tests {
             transport_registry: None,
             max_message_size: saorsa_transport::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
             allow_loopback: false,
+            coordinator_max_active_relays: 32,
+            coordinator_relay_slot_idle_timeout: Duration::from_secs(5),
+            upnp: Default::default(),
         };
 
         // May fail due to zero values or other validation
@@ -217,6 +223,9 @@ mod functional_tests {
             transport_registry: None,
             max_message_size: saorsa_transport::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
             allow_loopback: false,
+            coordinator_max_active_relays: 32,
+            coordinator_relay_slot_idle_timeout: Duration::from_secs(5),
+            upnp: Default::default(),
         };
 
         let result = NatTraversalEndpoint::new(valid_config, None, None).await;
@@ -409,6 +418,9 @@ mod performance_tests {
                 transport_registry: None,
                 max_message_size: saorsa_transport::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
                 allow_loopback: false,
+                coordinator_max_active_relays: 32,
+                coordinator_relay_slot_idle_timeout: Duration::from_secs(5),
+                upnp: Default::default(),
             };
 
             // Use the config to prevent optimization
@@ -479,6 +491,9 @@ mod relay_functionality_tests {
             transport_registry: None,
             max_message_size: saorsa_transport::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
             allow_loopback: false,
+            coordinator_max_active_relays: 32,
+            coordinator_relay_slot_idle_timeout: Duration::from_secs(5),
+            upnp: Default::default(),
         };
 
         // This might be accepted or rejected depending on implementation

@@ -37,6 +37,9 @@ fn test_peer_config() -> NatTraversalConfig {
         transport_registry: None,
         max_message_size: saorsa_transport::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
         allow_loopback: true,
+        coordinator_max_active_relays: 32,
+        coordinator_relay_slot_idle_timeout: Duration::from_secs(5),
+        upnp: Default::default(),
     }
 }
 
@@ -61,6 +64,9 @@ fn test_server_config() -> NatTraversalConfig {
         transport_registry: None,
         max_message_size: saorsa_transport::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
         allow_loopback: true,
+        coordinator_max_active_relays: 32,
+        coordinator_relay_slot_idle_timeout: Duration::from_secs(5),
+        upnp: Default::default(),
     }
 }
 
@@ -108,6 +114,9 @@ async fn test_error_handling_no_panic() {
         transport_registry: None,
         max_message_size: saorsa_transport::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
         allow_loopback: true,
+        coordinator_max_active_relays: 32,
+        coordinator_relay_slot_idle_timeout: Duration::from_secs(5),
+        upnp: Default::default(),
     };
 
     let result1 = NatTraversalEndpoint::new(config1, None, None).await;
@@ -136,6 +145,9 @@ async fn test_error_handling_no_panic() {
         transport_registry: None,
         max_message_size: saorsa_transport::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
         allow_loopback: true,
+        coordinator_max_active_relays: 32,
+        coordinator_relay_slot_idle_timeout: Duration::from_secs(5),
+        upnp: Default::default(),
     };
 
     let result2 = NatTraversalEndpoint::new(config2, None, None).await;
@@ -227,6 +239,9 @@ async fn test_malformed_config_handling() {
         transport_registry: None,
         max_message_size: saorsa_transport::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
         allow_loopback: true,
+        coordinator_max_active_relays: 32,
+        coordinator_relay_slot_idle_timeout: Duration::from_secs(5),
+        upnp: Default::default(),
     };
 
     let result = NatTraversalEndpoint::new(no_peers_config, None, None).await;
@@ -256,6 +271,9 @@ async fn test_malformed_config_handling() {
         transport_registry: None,
         max_message_size: saorsa_transport::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
         allow_loopback: true,
+        coordinator_max_active_relays: 32,
+        coordinator_relay_slot_idle_timeout: Duration::from_secs(5),
+        upnp: Default::default(),
     };
 
     let result2 = NatTraversalEndpoint::new(extreme_config, None, None).await;
@@ -292,6 +310,9 @@ async fn test_input_sanitization() {
         transport_registry: None,
         max_message_size: saorsa_transport::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
         allow_loopback: true,
+        coordinator_max_active_relays: 32,
+        coordinator_relay_slot_idle_timeout: Duration::from_secs(5),
+        upnp: Default::default(),
     };
 
     // This should either work or fail gracefully, not exhaust memory or panic
@@ -363,6 +384,9 @@ mod specific_regression_tests {
             transport_registry: None,
             max_message_size: saorsa_transport::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
             allow_loopback: true,
+            coordinator_max_active_relays: 32,
+            coordinator_relay_slot_idle_timeout: Duration::from_secs(5),
+            upnp: Default::default(),
         };
 
         // Should not panic and should handle random port selection
@@ -414,6 +438,9 @@ mod specific_regression_tests {
             transport_registry: None,
             max_message_size: saorsa_transport::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE,
             allow_loopback: true,
+            coordinator_max_active_relays: 32,
+            coordinator_relay_slot_idle_timeout: Duration::from_secs(5),
+            upnp: Default::default(),
         };
 
         // Should not panic, even if configuration is inconsistent

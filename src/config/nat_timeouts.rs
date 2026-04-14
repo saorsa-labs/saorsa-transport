@@ -132,10 +132,18 @@ impl Default for RelayTimeouts {
 }
 
 /// Default time to wait for the peer to acknowledge stream data after a send.
-const DEFAULT_SEND_ACK_TIMEOUT: Duration = Duration::from_secs(1);
+///
+/// 500 ms was too tight for cross-region and hole-punched connections where
+/// the path includes 3 RTTs (open_uni + data + peer ACK). Cross-continent
+/// RTTs of 200-300 ms meant the identity announce frequently failed silently,
+/// leaving both peers stuck in a 15-second identity exchange timeout.
+///
+/// 5 seconds is generous enough for any real connection path while still
+/// detecting dead connections quickly (well under the 15s identity timeout).
+const DEFAULT_SEND_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Fast-network send ACK timeout.
-const FAST_SEND_ACK_TIMEOUT: Duration = Duration::from_millis(500);
+/// Fast-network send ACK timeout (halved from default, matching the fast profile pattern).
+const FAST_SEND_ACK_TIMEOUT: Duration = Duration::from_millis(2500);
 
 /// Master timeout configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]

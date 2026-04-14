@@ -71,9 +71,9 @@ use crate::constrained::EngineEvent;
 use crate::crypto::raw_public_keys::key_utils::generate_ml_dsa_keypair;
 use crate::happy_eyeballs::{self, HappyEyeballsConfig};
 pub use crate::nat_traversal_api::TraversalPhase;
-use crate::nat_traversal_api::{
-    NatTraversalEndpoint, NatTraversalError, NatTraversalEvent, NatTraversalStatistics,
-};
+use crate::nat_traversal_api::{NatTraversalEndpoint, NatTraversalError, NatTraversalEvent};
+use crate::reachability::{ReachabilityScope, TraversalMethod, socket_addr_scope};
+use crate::shared::normalize_socket_addr;
 use crate::transport::{ProtocolEngine, TransportAddr, TransportRegistry};
 use crate::unified_config::P2pConfig;
 use rustls;
@@ -86,6 +86,24 @@ const EVENT_CHANNEL_CAPACITY: usize = 256;
 /// traffic.  Kept short so the reaper acts as a fast safety net behind the
 /// event-driven reader-exit detection.
 const STALE_REAPER_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Quick direct connection attempt after a failed hole-punch round.
+/// If the target's outgoing packets created a NAT binding, a QUIC handshake
+/// through the pinhole needs only 1-2 RTTs (~600ms at 300ms worst-case RTT).
+const POST_HOLEPUNCH_DIRECT_RETRY_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Per-attempt hole-punch timeout used when rotating through a list of
+/// preferred coordinators. Kept short so a busy or unreachable coordinator
+/// is abandoned quickly and the next one in the list is tried; the *last*
+/// coordinator in the rotation falls back to the strategy's full
+/// hole-punch timeout to give it time to actually complete the punch.
+///
+/// Tuned for the Tier 2 + Tier 4 (lite) coordinator-rotation flow: 1.5s
+/// is comfortably above one round-trip on most internet links but well
+/// below the strategy default (~8s), so the worst-case wait for K
+/// preferred coordinators is roughly `(K-1) * 1.5s + 8s` instead of
+/// `K * 8s`.
+const PER_COORDINATOR_QUICK_HOLEPUNCH_TIMEOUT: Duration = Duration::from_millis(1500);
 
 use crate::SHUTDOWN_DRAIN_TIMEOUT;
 
@@ -147,8 +165,10 @@ pub struct P2pEndpoint {
     /// Connection router for automatic protocol engine selection
     ///
     /// Routes connections through either QUIC (for broadband) or Constrained
-    /// engine (for BLE/LoRa) based on transport capabilities.
-    router: Arc<RwLock<ConnectionRouter>>,
+    /// engine (for BLE/LoRa) based on transport capabilities. The router is
+    /// fully interior-mutable — all methods take `&self` and stat/state
+    /// mutations are lock-free — so no `RwLock` is needed.
+    router: Arc<ConnectionRouter>,
 
     /// Mapping from TransportAddr to ConnectionId for constrained connections
     ///
@@ -163,10 +183,23 @@ pub struct P2pEndpoint {
     /// Registered when ConnectionAccepted/Established fires for constrained transports.
     constrained_peer_addrs: Arc<RwLock<HashMap<ConstrainedConnectionId, TransportAddr>>>,
 
-    /// Target peer ID for the next hole-punch attempt. When set, the
-    /// PUNCH_ME_NOW uses this instead of wire_id_from_addr, allowing the
-    /// coordinator to match by peer identity (works for symmetric NAT).
-    hole_punch_target_peer_id: Arc<tokio::sync::Mutex<Option<[u8; 32]>>>,
+    /// Per-target peer IDs for hole-punch attempts. When set for a target
+    /// address, the PUNCH_ME_NOW uses the peer ID instead of wire_id_from_addr,
+    /// allowing the coordinator to match by peer identity. Keyed by target
+    /// address so concurrent dials don't race on shared state.
+    hole_punch_target_peer_ids: Arc<dashmap::DashMap<SocketAddr, [u8; 32]>>,
+
+    /// Per-target preferred coordinators for hole-punch relay. When the DHT
+    /// lookup discovers a peer via FindNode responses from one or more peers,
+    /// those responding nodes (the "referrers") all have a connection to the
+    /// discovered peer and are good coordinator candidates. Keyed by target
+    /// address, value is an ordered list of referrer socket addresses ranked
+    /// best-first by the caller (e.g. by DHT lookup round, trust score).
+    /// During hole-punching the list is iterated front to back: the first
+    /// candidates get a short per-attempt timeout so we rotate quickly past
+    /// busy or unreachable coordinators; the last candidate gets the full
+    /// hole-punch timeout to give it time to actually complete the punch.
+    hole_punch_preferred_coordinators: Arc<dashmap::DashMap<SocketAddr, Vec<SocketAddr>>>,
 
     /// Channel sender for data received from QUIC reader tasks and constrained poller
     data_tx: mpsc::Sender<(SocketAddr, Vec<u8>)>,
@@ -218,6 +251,12 @@ pub struct PeerConnection {
     /// Remote address (supports all transport types)
     pub remote_addr: TransportAddr,
 
+    /// How this connection was established.
+    pub traversal_method: TraversalMethod,
+
+    /// Who initiated the connection.
+    pub side: Side,
+
     /// Whether peer is authenticated
     pub authenticated: bool,
 
@@ -265,8 +304,20 @@ pub struct EndpointStats {
     /// Successful NAT traversals
     pub nat_traversal_successes: u64,
 
-    /// Direct connections (no NAT traversal needed)
+    /// Direct connections (no coordinator or relay needed)
     pub direct_connections: u64,
+
+    /// Currently active direct inbound connections from peers.
+    pub active_direct_incoming_connections: u64,
+
+    /// Most recent loopback-scoped direct inbound observation.
+    pub last_direct_loopback_at: Option<Instant>,
+
+    /// Most recent LAN-scoped direct inbound observation.
+    pub last_direct_local_at: Option<Instant>,
+
+    /// Most recent globally scoped direct inbound observation.
+    pub last_direct_global_at: Option<Instant>,
 
     /// Relayed connections
     pub relayed_connections: u64,
@@ -293,6 +344,10 @@ impl Default for EndpointStats {
             nat_traversal_attempts: 0,
             nat_traversal_successes: 0,
             direct_connections: 0,
+            active_direct_incoming_connections: 0,
+            last_direct_loopback_at: None,
+            last_direct_local_at: None,
+            last_direct_global_at: None,
             relayed_connections: 0,
             total_bootstrap_nodes: 0,
             connected_bootstrap_nodes: 0,
@@ -316,7 +371,7 @@ impl Default for EndpointStats {
 ///
 /// while let Ok(event) = events.recv().await {
 ///     match event {
-///         P2pEvent::PeerConnected { peer_id, addr, side } => {
+///         P2pEvent::PeerConnected { addr, public_key, side, traversal_method } => {
 ///             // Handle different transport types
 ///             match addr {
 ///                 TransportAddr::Quic(socket_addr) => {
@@ -370,6 +425,8 @@ pub enum P2pEvent {
         public_key: Option<Vec<u8>>,
         /// Who initiated the connection (Client = we connected, Server = they connected)
         side: Side,
+        /// Whether the connection was direct, hole-punched, or relayed.
+        traversal_method: TraversalMethod,
     },
 
     /// A peer has disconnected.
@@ -536,11 +593,27 @@ async fn do_cleanup_connection(
     addr: &SocketAddr,
     reason: DisconnectReason,
 ) -> bool {
-    // Step 1: Remove from connected_peers (canonical lock #1)
-    let removed = connected_peers.write().await.remove(addr);
+    // Step 1: Check if the NAT traversal layer still has a *live*
+    // connection at this address. When a simultaneous-connect
+    // tie-break or hole-punch race replaces the old connection with
+    // a newer one, the old reader task exits and triggers cleanup.
+    // If the newer connection is already live in the DashMap,
+    // removing the address would kill the replacement — causing
+    // "Peer not found" errors on subsequent sends. Only proceed
+    // with full cleanup when no live connection remains.
+    if let Ok(None) = inner.remove_connection(addr) {
+        // remove_connection returned Ok(None) — a live connection
+        // exists at this address; the dead reader's cleanup must
+        // not disturb it.
+        debug!(
+            "do_cleanup_connection: {} still has a live replacement connection, skipping cleanup",
+            addr
+        );
+        return false;
+    }
 
-    // Step 2: Remove from NAT traversal layer (lock-free DashMap)
-    let _ = inner.remove_connection(addr);
+    // Step 2: Remove from connected_peers (canonical lock #1)
+    let removed = connected_peers.write().await.remove(addr);
 
     // Step 3: Remove and abort reader task (canonical lock #2)
     let abort_handle = reader_handles.write().await.remove(addr);
@@ -553,6 +626,10 @@ async fn do_cleanup_connection(
         {
             let mut s = stats.write().await;
             s.active_connections = s.active_connections.saturating_sub(1);
+            if peer_conn.traversal_method.is_direct() && peer_conn.side.is_server() {
+                s.active_direct_incoming_connections =
+                    s.active_direct_incoming_connections.saturating_sub(1);
+            }
         }
 
         let _ = event_tx.send(P2pEvent::PeerDisconnected {
@@ -617,17 +694,45 @@ impl P2pEndpoint {
                     NatTraversalEvent::ConnectionEstablished {
                         remote_address,
                         side,
+                        traversal_method,
                         public_key,
                     } => {
                         stats_guard.nat_traversal_successes += 1;
                         stats_guard.active_connections += 1;
                         stats_guard.successful_connections += 1;
 
+                        match traversal_method {
+                            TraversalMethod::Direct => {
+                                stats_guard.direct_connections += 1;
+                                if side.is_server() {
+                                    stats_guard.active_direct_incoming_connections += 1;
+                                    let now = Instant::now();
+                                    match socket_addr_scope(*remote_address) {
+                                        Some(ReachabilityScope::Loopback) => {
+                                            stats_guard.last_direct_loopback_at = Some(now);
+                                        }
+                                        Some(ReachabilityScope::LocalNetwork) => {
+                                            stats_guard.last_direct_local_at = Some(now);
+                                        }
+                                        Some(ReachabilityScope::Global) => {
+                                            stats_guard.last_direct_global_at = Some(now);
+                                        }
+                                        None => {}
+                                    }
+                                }
+                            }
+                            TraversalMethod::Relay => {
+                                stats_guard.relayed_connections += 1;
+                            }
+                            TraversalMethod::HolePunch | TraversalMethod::PortPrediction => {}
+                        }
+
                         // Broadcast event with connection direction
                         let _ = event_tx.send(P2pEvent::PeerConnected {
                             addr: TransportAddr::Quic(*remote_address),
                             public_key: public_key.clone(),
                             side: *side,
+                            traversal_method: *traversal_method,
                         });
                     }
                     NatTraversalEvent::TraversalFailed { remote_address, .. } => {
@@ -723,14 +828,13 @@ impl P2pEndpoint {
             enable_metrics: true,
             max_connections: 256,
         };
-        let mut router = ConnectionRouter::with_full_config(
+        // `with_full_config` already installs the QUIC endpoint; no
+        // post-construction setter is needed.
+        let router = ConnectionRouter::with_full_config(
             router_config,
             Arc::clone(&transport_registry),
             Arc::clone(&inner_arc),
         );
-
-        // Set QUIC endpoint on the router
-        router.set_quic_endpoint(Arc::clone(&inner_arc));
 
         // Create channel for data received from background reader tasks
         let (data_tx, data_rx) = mpsc::channel(config.data_channel_capacity);
@@ -753,10 +857,11 @@ impl P2pEndpoint {
             pending_data: Arc::new(RwLock::new(BoundedPendingBuffer::default())),
             bootstrap_cache,
             transport_registry,
-            router: Arc::new(RwLock::new(router)),
+            router: Arc::new(router),
             constrained_connections: Arc::new(RwLock::new(HashMap::new())),
             constrained_peer_addrs: Arc::new(RwLock::new(HashMap::new())),
-            hole_punch_target_peer_id: Arc::new(tokio::sync::Mutex::new(None)),
+            hole_punch_target_peer_ids: Arc::new(dashmap::DashMap::new()),
+            hole_punch_preferred_coordinators: Arc::new(dashmap::DashMap::new()),
             data_tx,
             data_rx: Arc::new(tokio::sync::Mutex::new(data_rx)),
             reader_tasks,
@@ -925,9 +1030,13 @@ impl P2pEndpoint {
             .add_connection(addr, connection.clone())
             .map_err(EndpointError::NatTraversal)?;
 
+        // We connected directly to this peer, so it is publicly reachable
+        // and can serve as a NAT traversal coordinator.
+        self.inner.set_can_coordinate(&addr, true);
+
         // Spawn handler (we initiated the connection = Client side)
         self.inner
-            .spawn_connection_handler(addr, connection, Side::Client)
+            .spawn_connection_handler(addr, connection, Side::Client, TraversalMethod::Direct)
             .map_err(EndpointError::NatTraversal)?;
 
         // Create peer connection record
@@ -935,6 +1044,8 @@ impl P2pEndpoint {
         let peer_conn = PeerConnection {
             public_key: remote_public_key.clone(),
             remote_addr: TransportAddr::Quic(addr),
+            traversal_method: TraversalMethod::Direct,
+            side: Side::Client,
             authenticated: true, // TLS handles authentication
             connected_at: Instant::now(),
             last_activity: Instant::now(),
@@ -966,6 +1077,7 @@ impl P2pEndpoint {
             addr: TransportAddr::Quic(addr),
             public_key: remote_public_key,
             side: Side::Client,
+            traversal_method: TraversalMethod::Direct,
         });
 
         Ok(peer_conn)
@@ -1000,9 +1112,20 @@ impl P2pEndpoint {
             return Err(EndpointError::ShuttingDown);
         }
 
-        // Use the router to determine the appropriate engine
-        let mut router = self.router.write().await;
-        let engine = router.select_engine_for_addr(addr);
+        // Use the router to determine the appropriate engine.
+        //
+        // Both `select_engine_for_addr` and `connect` take `&self` on
+        // `ConnectionRouter`, so there is no locking at all on the hot
+        // path. Selection and connect are two separate calls — there is a
+        // theoretical TOCTOU window where the engine picked here could
+        // become unavailable before the connect runs. In practice the
+        // router has no API to revoke or replace an engine once installed
+        // (the QUIC endpoint is set at construction time, the constrained
+        // transport is lazy-initialised and never torn down), so the race
+        // is closed by construction. If that invariant is ever relaxed,
+        // this call site needs to handle an engine-unavailable error from
+        // `connect()` explicitly.
+        let engine = self.router.select_engine_for_addr(addr);
 
         info!("Connecting to {} via {:?} engine", addr, engine);
 
@@ -1015,12 +1138,12 @@ impl P2pEndpoint {
                         addr
                     ))
                 })?;
-                drop(router); // Release lock before async operation
                 self.connect(socket_addr).await
             }
             ProtocolEngine::Constrained => {
-                // For constrained transports, use the router's constrained connection
-                let _routed = router.connect(addr).map_err(|e| {
+                // For constrained transports, use the router's connect
+                // path. No lock needed — `connect` takes `&self`.
+                let _routed = self.router.connect(addr).map_err(|e| {
                     EndpointError::Connection(format!("Constrained connection failed: {}", e))
                 })?;
 
@@ -1030,13 +1153,13 @@ impl P2pEndpoint {
                 let peer_conn = PeerConnection {
                     public_key: None, // Constrained connections don't have TLS auth yet
                     remote_addr: addr.clone(),
+                    traversal_method: TraversalMethod::Direct,
+                    side: Side::Client,
                     authenticated: false,
                     connected_at: Instant::now(),
                     last_activity: Instant::now(),
                 };
 
-                // Store peer keyed by synthetic address
-                drop(router); // Release lock before acquiring connected_peers lock
                 self.connected_peers
                     .write()
                     .await
@@ -1054,6 +1177,7 @@ impl P2pEndpoint {
                     addr: addr.clone(),
                     public_key: None,
                     side: Side::Client,
+                    traversal_method: TraversalMethod::Direct,
                 });
 
                 Ok(peer_conn)
@@ -1063,17 +1187,18 @@ impl P2pEndpoint {
 
     /// Get the connection router for advanced routing control
     ///
-    /// Returns a reference to the connection router which can be used to:
-    /// - Query engine selection for addresses
-    /// - Get routing statistics
-    /// - Configure routing behavior
-    pub async fn router(&self) -> tokio::sync::RwLockReadGuard<'_, ConnectionRouter> {
-        self.router.read().await
+    /// Returns a shared reference to the connection router which can be
+    /// used to query engine selection for addresses, read routing stats,
+    /// or drive connects/accepts directly. All router methods take
+    /// `&self`, so multiple callers can use the returned handle
+    /// concurrently.
+    pub fn router(&self) -> &Arc<ConnectionRouter> {
+        &self.router
     }
 
-    /// Get routing statistics
-    pub async fn routing_stats(&self) -> crate::connection_router::RouterStats {
-        self.router.read().await.stats().clone()
+    /// Get a point-in-time snapshot of router statistics.
+    pub fn routing_stats(&self) -> crate::connection_router::RouterStatsSnapshot {
+        self.router.stats().snapshot()
     }
 
     /// Register a constrained connection for a transport address
@@ -1191,15 +1316,88 @@ impl P2pEndpoint {
     ///     ConnectionMethod::Relayed { relay } => println!("Relayed via {}", relay),
     /// }
     /// ```
-    /// Set the target peer ID for the next hole-punch attempt. When set, the
-    /// PUNCH_ME_NOW frame carries the peer ID instead of a socket-address-derived
-    /// wire ID, allowing the coordinator to find the target connection by
-    /// authenticated identity — essential for symmetric NAT where the address
-    /// differs per peer.
+    /// Set the target peer ID for a hole-punch attempt to a specific address.
+    /// When set, the PUNCH_ME_NOW frame carries the peer ID instead of a
+    /// socket-address-derived wire ID, allowing the coordinator to find the
+    /// target connection by authenticated identity.
     ///
-    /// Cleared after each `connect_with_fallback` call.
-    pub async fn set_hole_punch_target_peer_id(&self, peer_id: Option<[u8; 32]>) {
-        *self.hole_punch_target_peer_id.lock().await = peer_id;
+    /// Keyed by target address so concurrent dials to different peers each
+    /// get their own peer ID without racing on shared state.
+    pub async fn set_hole_punch_target_peer_id(&self, target: SocketAddr, peer_id: [u8; 32]) {
+        let target = normalize_socket_addr(target);
+        self.hole_punch_target_peer_ids.insert(target, peer_id);
+    }
+
+    /// Set an ordered list of preferred coordinators for hole-punching to a
+    /// specific target.
+    ///
+    /// The caller (typically saorsa-core's DHT layer) is expected to rank
+    /// the list best-first using its own quality signals — e.g. DHT lookup
+    /// round, trust score, observed latency. During hole-punching the list
+    /// is iterated front to back: the first `coordinators.len() - 1` get a
+    /// short per-attempt timeout so a busy or unreachable coordinator is
+    /// abandoned quickly; the last coordinator gets the full strategy
+    /// hole-punch timeout to give it time to complete the punch.
+    ///
+    /// Empty `coordinators` removes any preferred coordinators for `target`.
+    ///
+    /// ## Interaction with `StrategyConfig::max_holepunch_rounds`
+    ///
+    /// Each rotation step in the connect loop calls
+    /// `ConnectionStrategy::increment_round`, so the strategy's per-round
+    /// counter and the rotation index advance together. With the default
+    /// `max_holepunch_rounds = 2`, supplying `K ≥ 2` preferred coordinators
+    /// gives each coordinator (including the final one) exactly one
+    /// attempt — the rotation fully replaces the legacy retry loop and the
+    /// worst-case dial time is `(K-1) * 1.5s + 8s`.
+    ///
+    /// If a caller has explicitly raised `max_holepunch_rounds` (e.g.
+    /// `with_max_holepunch_rounds(5)`) **and** also supplies a preferred
+    /// list, the *final* coordinator inherits the leftover round budget
+    /// — it will be retried `max_rounds - K + 1` times at the full
+    /// hole-punch timeout. This is usually fine but worth knowing if you
+    /// were expecting the rotation to be the only retry mechanism.
+    pub async fn set_hole_punch_preferred_coordinators(
+        &self,
+        target: SocketAddr,
+        coordinators: Vec<SocketAddr>,
+    ) {
+        let target = normalize_socket_addr(target);
+        if coordinators.is_empty() {
+            self.hole_punch_preferred_coordinators.remove(&target);
+        } else {
+            self.hole_punch_preferred_coordinators
+                .insert(target, coordinators);
+        }
+    }
+
+    /// Set a single preferred coordinator for hole-punching to a specific
+    /// target.
+    ///
+    /// Thin wrapper around [`Self::set_hole_punch_preferred_coordinators`]
+    /// retained for callers that have only one coordinator candidate. New
+    /// callers should prefer the list form.
+    pub async fn set_hole_punch_preferred_coordinator(
+        &self,
+        target: SocketAddr,
+        coordinator: SocketAddr,
+    ) {
+        let target = normalize_socket_addr(target);
+        // Append to the existing list instead of overwriting.
+        // During an iterative DHT lookup, multiple peers may refer us
+        // to the same target. Each referrer is a potential coordinator.
+        // Accumulating them gives the hole-punch rotation loop several
+        // options, so a coordinator that lacks a connection to the
+        // target can be skipped quickly (1.5s) in favour of one that
+        // does.
+        self.hole_punch_preferred_coordinators
+            .entry(target)
+            .and_modify(|v| {
+                if !v.contains(&coordinator) {
+                    v.push(coordinator);
+                }
+            })
+            .or_insert_with(|| vec![coordinator]);
     }
 
     /// Connect with automatic fallback: Direct → HolePunch → Relay.
@@ -1275,6 +1473,38 @@ impl P2pEndpoint {
         result
     }
 
+    /// Merge a ranked list of preferred hole-punch coordinators into the
+    /// front of `coordinator_candidates`, preserving the relative order of
+    /// `preferred` and removing any pre-existing duplicates from the
+    /// candidate list.
+    ///
+    /// After this call returns, `coordinator_candidates[0..preferred.len()]`
+    /// equals `preferred` (in order). The hole-punch loop uses
+    /// `preferred.len()` directly to decide which attempts get the short
+    /// rotation timeout vs. the strategy's full hole-punch timeout.
+    ///
+    /// Pure function (no `&self`, no I/O) — extracted from
+    /// `connect_with_fallback_inner` so the front-insertion behaviour can
+    /// be unit-tested without spinning up a full endpoint.
+    fn merge_preferred_coordinators(
+        coordinator_candidates: &mut Vec<SocketAddr>,
+        preferred: &[SocketAddr],
+    ) {
+        if preferred.is_empty() {
+            return;
+        }
+        // Drop any pre-existing copies of the preferred entries from the
+        // tail so we don't end up with duplicates after the front-insert.
+        coordinator_candidates.retain(|a| !preferred.contains(a));
+        // Build the merged list in one allocation rather than calling
+        // `Vec::insert(0, ..)` in a loop (which shifts the entire tail
+        // on every iteration — O(N·M) instead of O(N+M)).
+        let mut merged = Vec::with_capacity(preferred.len() + coordinator_candidates.len());
+        merged.extend_from_slice(preferred);
+        merged.append(coordinator_candidates);
+        *coordinator_candidates = merged;
+    }
+
     /// Inner implementation of connect_with_fallback (separated for dedup wrapper).
     async fn connect_with_fallback_inner(
         &self,
@@ -1303,6 +1533,44 @@ impl P2pEndpoint {
                 if Some(addr) != target && !coordinator_candidates.contains(&addr) {
                     coordinator_candidates.push(addr);
                 }
+            }
+        }
+
+        // If the DHT layer set preferred coordinators for this target, move
+        // them to the front of the candidate list in order so the hole-punch
+        // loop tries them first. Each preferred coordinator is removed from
+        // its existing position (if any) before being inserted at the front
+        // so the relative ordering of the preferred list is preserved.
+        //
+        // `preferred_coordinator_count` is captured for the hole-punch loop:
+        // when > 0 the loop rotates through `coordinator_candidates[0..count]`
+        // with `PER_COORDINATOR_QUICK_HOLEPUNCH_TIMEOUT` per non-final attempt,
+        // and the strategy's full timeout for the last attempt. When 0 the
+        // loop falls back to the existing single-coordinator retry behaviour.
+        let mut preferred_coordinator_count: usize = 0;
+        if let Some(target_addr) = target {
+            let normalized_target_addr = normalize_socket_addr(target_addr);
+            if let Some(preferred) = self
+                .hole_punch_preferred_coordinators
+                .get(&normalized_target_addr)
+            {
+                let preferred_list: Vec<SocketAddr> = preferred.clone();
+                drop(preferred); // Release the DashMap entry guard before mutating coordinator_candidates.
+                Self::merge_preferred_coordinators(&mut coordinator_candidates, &preferred_list);
+                preferred_coordinator_count = preferred_list.len();
+                if preferred_coordinator_count > 0 {
+                    info!(
+                        "Using {} preferred coordinator(s) for target {} (DHT referrers): {:?}",
+                        preferred_list.len(),
+                        target_addr,
+                        preferred_list
+                    );
+                }
+            } else {
+                info!(
+                    "No preferred coordinator for target {} (not discovered via DHT referral)",
+                    target_addr
+                );
             }
         }
 
@@ -1382,6 +1650,14 @@ impl P2pEndpoint {
             direct_addresses.push(v4);
         }
 
+        // Index of the preferred coordinator currently being attempted (when
+        // `preferred_coordinator_count > 0`). The hole-punch loop advances
+        // this on each failed round and uses it together with
+        // `preferred_coordinator_count` to decide whether the *next* attempt
+        // is the final one (full strategy timeout) or an interim rotation
+        // attempt (`PER_COORDINATOR_QUICK_HOLEPUNCH_TIMEOUT`).
+        let mut current_preferred_coordinator_idx: usize = 0;
+
         loop {
             // Check if a previous hole-punch attempt established the connection
             // asynchronously (e.g. the target connected to us after receiving
@@ -1396,6 +1672,8 @@ impl P2pEndpoint {
                     let peer_conn = PeerConnection {
                         public_key: None,
                         remote_addr: TransportAddr::Quic(target_addr),
+                        traversal_method: TraversalMethod::HolePunch,
+                        side: Side::Client,
                         authenticated: true,
                         connected_at: Instant::now(),
                         last_activity: Instant::now(),
@@ -1415,6 +1693,7 @@ impl P2pEndpoint {
                         addr: TransportAddr::Quic(target_addr),
                         public_key: peer_conn.public_key.clone(),
                         side: Side::Client,
+                        traversal_method: TraversalMethod::HolePunch,
                     });
 
                     return Ok((
@@ -1522,53 +1801,117 @@ impl P2pEndpoint {
                         .or(target_ipv6)
                         .ok_or(EndpointError::NoAddress)?;
 
+                    // Coordinator-rotation policy (Tier 2):
+                    //
+                    // When `preferred_coordinator_count > 0` we have a ranked
+                    // list of DHT-supplied coordinators at
+                    // `coordinator_candidates[0..preferred_coordinator_count]`
+                    // and we rotate through them on each failed round. The
+                    // first `count - 1` attempts use a short timeout
+                    // (`PER_COORDINATOR_QUICK_HOLEPUNCH_TIMEOUT`) so a busy or
+                    // unreachable coordinator is abandoned quickly; the final
+                    // attempt uses the strategy's full hole-punch timeout to
+                    // give it time to actually complete.
+                    //
+                    // When `preferred_coordinator_count == 0` (no DHT
+                    // referrers — first contact, or non-DHT dial) we fall
+                    // back to the legacy single-coordinator behaviour:
+                    // strategy timeout per round, retry the same coordinator
+                    // until `should_retry_holepunch` is exhausted.
+                    let is_rotating = preferred_coordinator_count > 0;
+                    let is_final_rotation_attempt = is_rotating
+                        && current_preferred_coordinator_idx + 1 >= preferred_coordinator_count;
+                    let attempt_timeout = if is_rotating && !is_final_rotation_attempt {
+                        PER_COORDINATOR_QUICK_HOLEPUNCH_TIMEOUT
+                    } else {
+                        strategy.holepunch_timeout()
+                    };
+
+                    // Invariant: while rotating, the strategy's current
+                    // coordinator must equal `coordinator_candidates[idx]`.
+                    // This is maintained by `set_coordinator()` on every
+                    // rotation step; the assert catches any future
+                    // regression where a caller sets the strategy's
+                    // coordinator out of band without updating the
+                    // candidate list.
+                    debug_assert!(
+                        !is_rotating
+                            || coordinator_candidates
+                                .get(current_preferred_coordinator_idx)
+                                .copied()
+                                == Some(coordinator),
+                        "rotation index out of sync with strategy coordinator: idx={}, coord={}, candidates={:?}",
+                        current_preferred_coordinator_idx,
+                        coordinator,
+                        coordinator_candidates,
+                    );
+
                     info!(
-                        "Trying hole-punch to {} via {} (round {})",
-                        target, coordinator, round
+                        "Trying hole-punch to {} via {} (round {}, attempt timeout {:?}, rotating={})",
+                        target, coordinator, round, attempt_timeout, is_rotating
                     );
 
                     // Use our existing NAT traversal infrastructure
-                    match timeout(
-                        strategy.holepunch_timeout(),
-                        self.try_hole_punch(target, coordinator),
-                    )
-                    .await
-                    {
+                    let attempt_result =
+                        timeout(attempt_timeout, self.try_hole_punch(target, coordinator)).await;
+
+                    // Common post-attempt step: try a quick direct connect.
+                    // The NAT binding may have been created by the target's
+                    // outgoing packets even though our try_hole_punch didn't
+                    // detect the connection.
+                    let post_direct = async {
+                        if let Ok(Ok(peer_conn)) =
+                            timeout(POST_HOLEPUNCH_DIRECT_RETRY_TIMEOUT, self.connect(target)).await
+                        {
+                            info!("✓ Post-hole-punch direct connect succeeded to {}", target);
+                            Some(peer_conn)
+                        } else {
+                            None
+                        }
+                    };
+
+                    match attempt_result {
                         Ok(Ok(conn)) => {
                             info!("✓ Hole-punch succeeded to {} via {}", target, coordinator);
                             return Ok((conn, ConnectionMethod::HolePunched { coordinator }));
                         }
                         Ok(Err(e)) => {
-                            // After a failed hole-punch round, try a quick direct
-                            // connect — the NAT binding may have been created by
-                            // the target's outgoing packets even though our
-                            // try_hole_punch didn't detect the connection.
-                            if let Ok(Ok(peer_conn)) =
-                                timeout(Duration::from_secs(3), self.connect(target)).await
-                            {
-                                info!("✓ Post-hole-punch direct connect succeeded to {}", target);
+                            if let Some(peer_conn) = post_direct.await {
                                 return Ok((
                                     peer_conn,
                                     ConnectionMethod::HolePunched { coordinator },
                                 ));
                             }
                             strategy.record_holepunch_error(round, e.to_string());
-                            if strategy.should_retry_holepunch() {
-                                // Try a different coordinator for the next round.
-                                // The current coordinator may be behind NAT itself
-                                // and unable to relay PUNCH_ME_NOW to the target.
-                                if let Some(next) = coordinator_candidates.get(round as usize) {
-                                    info!(
-                                        "Hole-punch round {} failed, trying coordinator {} next",
-                                        round, next
-                                    );
-                                    strategy.set_coordinator(*next);
-                                } else {
-                                    debug!(
-                                        "Hole-punch round {} failed, no more coordinators",
-                                        round
-                                    );
-                                }
+                            // Bounds-safe rotation: bail out of rotation and
+                            // fall back to relay if for any reason the index
+                            // would go out of bounds (defensive — by
+                            // construction the bound holds while
+                            // `current_preferred_coordinator_idx + 1 < preferred_coordinator_count`).
+                            let next_coord = if is_rotating && !is_final_rotation_attempt {
+                                coordinator_candidates
+                                    .get(current_preferred_coordinator_idx + 1)
+                                    .copied()
+                            } else {
+                                None
+                            };
+                            if let Some(next_coord) = next_coord {
+                                current_preferred_coordinator_idx += 1;
+                                info!(
+                                    "Hole-punch via {} failed ({}), rotating to preferred coordinator {}/{}: {}",
+                                    coordinator,
+                                    e,
+                                    current_preferred_coordinator_idx + 1,
+                                    preferred_coordinator_count,
+                                    next_coord
+                                );
+                                strategy.set_coordinator(next_coord);
+                                strategy.increment_round();
+                            } else if strategy.should_retry_holepunch() {
+                                info!(
+                                    "Hole-punch round {} failed, retrying with same coordinator",
+                                    round
+                                );
                                 strategy.increment_round();
                             } else {
                                 debug!("Hole-punch failed after {} rounds", round);
@@ -1576,25 +1919,37 @@ impl P2pEndpoint {
                             }
                         }
                         Err(_) => {
-                            // Same: try a quick direct connect after timeout
-                            if let Ok(Ok(peer_conn)) =
-                                timeout(Duration::from_secs(3), self.connect(target)).await
-                            {
-                                info!("✓ Post-hole-punch direct connect succeeded to {}", target);
+                            if let Some(peer_conn) = post_direct.await {
                                 return Ok((
                                     peer_conn,
                                     ConnectionMethod::HolePunched { coordinator },
                                 ));
                             }
                             strategy.record_holepunch_error(round, "Timeout".to_string());
-                            if strategy.should_retry_holepunch() {
-                                if let Some(next) = coordinator_candidates.get(round as usize) {
-                                    info!(
-                                        "Hole-punch round {} timed out, trying coordinator {} next",
-                                        round, next
-                                    );
-                                    strategy.set_coordinator(*next);
-                                }
+                            let next_coord = if is_rotating && !is_final_rotation_attempt {
+                                coordinator_candidates
+                                    .get(current_preferred_coordinator_idx + 1)
+                                    .copied()
+                            } else {
+                                None
+                            };
+                            if let Some(next_coord) = next_coord {
+                                current_preferred_coordinator_idx += 1;
+                                info!(
+                                    "Hole-punch via {} timed out after {:?}, rotating to preferred coordinator {}/{}: {}",
+                                    coordinator,
+                                    attempt_timeout,
+                                    current_preferred_coordinator_idx + 1,
+                                    preferred_coordinator_count,
+                                    next_coord
+                                );
+                                strategy.set_coordinator(next_coord);
+                                strategy.increment_round();
+                            } else if strategy.should_retry_holepunch() {
+                                info!(
+                                    "Hole-punch round {} timed out, retrying with same coordinator",
+                                    round
+                                );
                                 strategy.increment_round();
                             } else {
                                 debug!("Hole-punch timed out after {} rounds", round);
@@ -1625,12 +1980,12 @@ impl P2pEndpoint {
                             return Ok((conn, ConnectionMethod::Relayed { relay: relay_addr }));
                         }
                         Ok(Err(e)) => {
-                            debug!("Relay connection failed: {}", e);
-                            strategy.transition_to_failed(e.to_string());
+                            debug!("Relay connection failed: {e}");
+                            strategy.transition_to_next_relay(e.to_string());
                         }
                         Err(_) => {
                             debug!("Relay connection timed out");
-                            strategy.transition_to_failed("Timeout");
+                            strategy.transition_to_next_relay("Timeout");
                         }
                     }
                 }
@@ -1712,14 +2067,19 @@ impl P2pEndpoint {
             .add_connection(addr, connection.clone())
             .map_err(EndpointError::NatTraversal)?;
 
+        // Direct outbound connection succeeded -- peer is publicly reachable
+        self.inner.set_can_coordinate(&addr, true);
+
         // Spawn connection handler (Client side - we initiated)
         self.inner
-            .spawn_connection_handler(addr, connection, Side::Client)
+            .spawn_connection_handler(addr, connection, Side::Client, TraversalMethod::Direct)
             .map_err(EndpointError::NatTraversal)?;
 
         let peer_conn = PeerConnection {
             public_key: remote_public_key.clone(),
             remote_addr: TransportAddr::Quic(addr),
+            traversal_method: TraversalMethod::Direct,
+            side: Side::Client,
             authenticated: true,
             connected_at: Instant::now(),
             last_activity: Instant::now(),
@@ -1746,6 +2106,7 @@ impl P2pEndpoint {
             addr: TransportAddr::Quic(addr),
             public_key: remote_public_key,
             side: Side::Client,
+            traversal_method: TraversalMethod::Direct,
         });
 
         Ok(peer_conn)
@@ -1762,8 +2123,11 @@ impl P2pEndpoint {
             target, coordinator
         );
 
-        // First ensure we're connected to the coordinator
-        if !self.is_connected_to_addr(coordinator).await {
+        // First ensure we're connected to the coordinator.
+        // Check both connected_peers (app-level) and the DashMap (transport-level)
+        // to avoid creating unnecessary duplicate connections when the stale reaper
+        // has cleaned connected_peers but the DashMap still has a live connection.
+        if !self.is_connected_to_addr(coordinator).await && !self.inner.is_connected(&coordinator) {
             info!(
                 "try_hole_punch: connecting to coordinator {} first",
                 coordinator
@@ -1778,19 +2142,33 @@ impl P2pEndpoint {
         }
 
         // Initiate NAT traversal — sends PUNCH_ME_NOW to coordinator.
-        // Use the stored target peer ID if available (for symmetric NAT routing).
-        // Clone (not take) — the peer ID is needed across multiple
-        // hole-punch rounds within connect_with_fallback.
-        let target_peer_id = *self.hole_punch_target_peer_id.lock().await;
-        if target_peer_id.is_some() {
+        // Look up the target peer ID from the per-target map. This avoids
+        // races when multiple concurrent connections share the same P2pEndpoint.
+        // Normalize the key to handle IPv4-mapped IPv6 addresses (::ffff:x.x.x.x)
+        // that may differ from the IPv4 key used by saorsa-core when storing.
+        let normalized_target = normalize_socket_addr(target);
+        if normalized_target != target {
             info!(
-                "try_hole_punch: calling initiate_nat_traversal({}, {}) with peer ID",
-                target, coordinator
+                "try_hole_punch: normalized target {} -> {} for peer ID lookup",
+                target, normalized_target
+            );
+        }
+        let target_peer_id = self
+            .hole_punch_target_peer_ids
+            .get(&normalized_target)
+            .map(|v| *v);
+        if let Some(ref pid) = target_peer_id {
+            info!(
+                "try_hole_punch: calling initiate_nat_traversal({}, {}) with peer ID {} (dashmap key={})",
+                target,
+                coordinator,
+                hex::encode(&pid[..8]),
+                target
             );
         } else {
             info!(
-                "try_hole_punch: calling initiate_nat_traversal({}, {}) with address-based wire ID",
-                target, coordinator
+                "try_hole_punch: calling initiate_nat_traversal({}, {}) with address-based wire ID (no dashmap entry for key={})",
+                target, coordinator, target
             );
         }
         self.inner
@@ -1816,7 +2194,8 @@ impl P2pEndpoint {
         // Poll for the connection to appear. The target node will receive
         // the relayed PUNCH_ME_NOW and initiate a QUIC connection to us,
         // which gets accepted by saorsa-core's transport handler.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        // No internal deadline — the outer strategy.holepunch_timeout()
+        // cancels this future when it expires.
         let mut poll_count = 0u32;
 
         loop {
@@ -1851,6 +2230,8 @@ impl P2pEndpoint {
                 let peer_conn = PeerConnection {
                     public_key: None,
                     remote_addr: TransportAddr::Quic(actual_addr),
+                    traversal_method: TraversalMethod::HolePunch,
+                    side: Side::Client,
                     authenticated: true,
                     connected_at: Instant::now(),
                     last_activity: Instant::now(),
@@ -1873,20 +2254,27 @@ impl P2pEndpoint {
                 }
             }
 
-            // Wait briefly then re-check, or timeout
+            // Wait briefly then re-check; the outer timeout cancels us on expiry
             tokio::select! {
                 _ = self.inner.connection_notify().notified() => {
                     debug!("try_hole_punch: connection_notify fired for {}", target);
                 }
+                _ = self.inner.nack_notify().notified() => {
+                    // Check if the NACK is for our target
+                    if let Some(ref pid) = target_peer_id {
+                        if self.inner.consume_nack(pid) {
+                            info!(
+                                "try_hole_punch: NACK received from coordinator for target {} — aborting immediately",
+                                target
+                            );
+                            return Err(EndpointError::Connection(
+                                format!("Coordinator NACK: target {} not found", target),
+                            ));
+                        }
+                    }
+                }
                 _ = self.shutdown.cancelled() => {
                     return Err(EndpointError::ShuttingDown);
-                }
-                _ = tokio::time::sleep_until(deadline) => {
-                    info!(
-                        "try_hole_punch: TIMEOUT after 15s for {} (polled {} times)",
-                        target, poll_count
-                    );
-                    return Err(EndpointError::Timeout);
                 }
                 // Wake periodically to drive session and re-check connections
                 _ = tokio::time::sleep(Duration::from_millis(500)) => {}
@@ -1904,12 +2292,25 @@ impl P2pEndpoint {
             target, relay_addr
         );
 
-        // Step 1: Establish relay session (control plane handshake)
-        let (public_addr, relay_socket) = self
-            .inner
-            .establish_relay_session(relay_addr)
-            .await
-            .map_err(EndpointError::NatTraversal)?;
+        // Step 1: Establish relay session (control plane handshake).
+        // Hard 5-second timeout: the CONNECT-UDP handshake should
+        // complete in well under 1 second on any healthy relay. If
+        // the relay is unreachable or overloaded, fail fast so the
+        // strategy can try the next relay or give up.
+        let (public_addr, relay_socket) = match timeout(
+            Duration::from_secs(5),
+            self.inner.establish_relay_session(relay_addr),
+        )
+        .await
+        {
+            Ok(result) => result.map_err(EndpointError::NatTraversal)?,
+            Err(_) => {
+                return Err(EndpointError::Connection(format!(
+                    "MASQUE relay session establishment timed out (5s) for {}",
+                    relay_addr
+                )));
+            }
+        };
 
         info!(
             "MASQUE relay session established via {} (public addr: {:?})",
@@ -1982,12 +2383,14 @@ impl P2pEndpoint {
             .map_err(EndpointError::NatTraversal)?;
 
         self.inner
-            .spawn_connection_handler(target, connection, Side::Client)
+            .spawn_connection_handler(target, connection, Side::Client, TraversalMethod::Relay)
             .map_err(EndpointError::NatTraversal)?;
 
         let peer_conn = PeerConnection {
             public_key: remote_public_key,
             remote_addr: TransportAddr::Quic(target),
+            traversal_method: TraversalMethod::Relay,
+            side: Side::Client,
             authenticated: true,
             connected_at: Instant::now(),
             last_activity: Instant::now(),
@@ -2012,7 +2415,12 @@ impl P2pEndpoint {
         Ok(peer_conn)
     }
 
-    /// Check if we're connected to a specific address
+    // NOTE: direct incoming stats (active_direct_incoming_connections and
+    // scope timestamps) are recorded exclusively in the event_callback
+    // closure when NatTraversalEvent::ConnectionEstablished is emitted by
+    // spawn_connection_handler. No separate increment here to avoid
+    // double-counting.
+
     async fn is_connected_to_addr(&self, addr: SocketAddr) -> bool {
         let transport_addr = TransportAddr::Quic(addr);
         let peers = self.connected_peers.read().await;
@@ -2040,10 +2448,12 @@ impl P2pEndpoint {
                 let remote_public_key = extract_public_key_bytes_from_connection(&connection);
 
                 // They initiated the connection to us = Server side
-                if let Err(e) =
-                    self.inner
-                        .spawn_connection_handler(remote_addr, connection, Side::Server)
-                {
+                if let Err(e) = self.inner.spawn_connection_handler(
+                    remote_addr,
+                    connection,
+                    Side::Server,
+                    TraversalMethod::Direct,
+                ) {
                     error!("Failed to spawn connection handler: {}", e);
                     return None;
                 }
@@ -2052,6 +2462,8 @@ impl P2pEndpoint {
                 let peer_conn = PeerConnection {
                     public_key: remote_public_key.clone(),
                     remote_addr: TransportAddr::Quic(remote_addr),
+                    traversal_method: TraversalMethod::Direct,
+                    side: Side::Server,
                     authenticated: true, // TLS handles authentication
                     connected_at: Instant::now(),
                     last_activity: Instant::now(),
@@ -2083,17 +2495,15 @@ impl P2pEndpoint {
                     .await
                     .insert(remote_addr, peer_conn.clone());
 
-                {
-                    let mut stats = self.stats.write().await;
-                    stats.active_connections += 1;
-                    stats.successful_connections += 1;
-                }
+                // Stats are recorded by the event_callback when
+                // spawn_connection_handler emits ConnectionEstablished.
 
                 // They initiated the connection to us = Server side
                 let _ = self.event_tx.send(P2pEvent::PeerConnected {
                     addr: TransportAddr::Quic(remote_addr),
                     public_key: remote_public_key,
                     side: Side::Server,
+                    traversal_method: TraversalMethod::Direct,
                 });
 
                 Some(peer_conn)
@@ -2213,6 +2623,8 @@ impl P2pEndpoint {
                     let peer_conn = PeerConnection {
                         public_key: None,
                         remote_addr: TransportAddr::Quic(*addr),
+                        traversal_method: TraversalMethod::HolePunch,
+                        side: Side::Server,
                         authenticated: true,
                         connected_at: Instant::now(),
                         last_activity: Instant::now(),
@@ -2222,6 +2634,7 @@ impl P2pEndpoint {
                         addr: TransportAddr::Quic(*addr),
                         public_key: None,
                         side: Side::Server,
+                        traversal_method: TraversalMethod::HolePunch,
                     });
                     (TransportAddr::Quic(*addr), Some(conn))
                 } else {
@@ -2230,11 +2643,16 @@ impl P2pEndpoint {
             }
         };
 
-        // Select protocol engine based on transport address
-        let engine = {
-            let mut router = self.router.write().await;
-            router.select_engine_for_addr(&transport_addr)
-        };
+        // Select protocol engine based on transport address.
+        //
+        // No lock: `select_engine_for_addr` takes `&self` on
+        // `ConnectionRouter` and bumps its stats counters via atomics, so
+        // concurrent sends can run fully in parallel. The previous
+        // implementation held an exclusive write lock on the router here,
+        // which serialised every outbound send on the endpoint through a
+        // single lock and was a dominant contention point at high node
+        // counts (1000-node testnet).
+        let engine = self.router.select_engine_for_addr(&transport_addr);
 
         match engine {
             crate::transport::ProtocolEngine::Quic => {
@@ -2280,7 +2698,15 @@ impl P2pEndpoint {
                 // Without this, finish() only buffers a FIN locally — if the
                 // connection is dead the caller would see Ok(()) despite the
                 // data never arriving.
-                let ack_timeout = self.config.timeouts.send_ack_timeout;
+                //
+                // The base timeout handles small messages and dead-connection
+                // detection. For large payloads we add time proportional to
+                // size at ~4 ms/KB (~250 KB/s floor): a 4 MB chunk gets ~16 s
+                // of budget on top of the base timeout.
+                let base_timeout = self.config.timeouts.send_ack_timeout;
+                let size_budget =
+                    std::time::Duration::from_millis((data.len() as u64).saturating_div(256));
+                let ack_timeout = base_timeout + size_budget;
                 match timeout(ack_timeout, send_stream.stopped()).await {
                     Ok(Ok(None)) => {}
                     Ok(Ok(Some(stop_code))) => {
@@ -2418,13 +2844,6 @@ impl P2pEndpoint {
                 / (stats.path.sent_packets + stats.path.lost_packets).max(1) as f64,
             last_activity,
         })
-    }
-
-    /// Get NAT traversal statistics
-    pub fn nat_stats(&self) -> Result<NatTraversalStatistics, EndpointError> {
-        self.inner
-            .get_nat_stats()
-            .map_err(|e| EndpointError::Connection(e.to_string()))
     }
 
     // === Known Peers ===
@@ -2752,6 +3171,8 @@ impl P2pEndpoint {
                 PeerConnection {
                     public_key: None,
                     remote_addr: addr.clone(),
+                    traversal_method: TraversalMethod::Direct,
+                    side,
                     authenticated: false,
                     connected_at: Instant::now(),
                     last_activity: Instant::now(),
@@ -2761,6 +3182,7 @@ impl P2pEndpoint {
                 addr: addr.clone(),
                 public_key: None,
                 side,
+                traversal_method: TraversalMethod::Direct,
             });
         }
 
@@ -3127,6 +3549,8 @@ impl P2pEndpoint {
                 let peer_conn = PeerConnection {
                     public_key: None,
                     remote_addr: TransportAddr::Quic(addr),
+                    traversal_method: TraversalMethod::HolePunch,
+                    side: Side::Server,
                     authenticated: true,
                     connected_at: Instant::now(),
                     last_activity: Instant::now(),
@@ -3197,6 +3621,7 @@ impl P2pEndpoint {
                     addr: TransportAddr::Quic(addr),
                     public_key: None,
                     side: Side::Server,
+                    traversal_method: TraversalMethod::HolePunch,
                 });
 
                 // Spawn a reader task for the connection so incoming streams
@@ -3286,7 +3711,8 @@ impl Clone for P2pEndpoint {
             router: Arc::clone(&self.router),
             constrained_connections: Arc::clone(&self.constrained_connections),
             constrained_peer_addrs: Arc::clone(&self.constrained_peer_addrs),
-            hole_punch_target_peer_id: Arc::clone(&self.hole_punch_target_peer_id),
+            hole_punch_target_peer_ids: Arc::clone(&self.hole_punch_target_peer_ids),
+            hole_punch_preferred_coordinators: Arc::clone(&self.hole_punch_preferred_coordinators),
             data_tx: self.data_tx.clone(),
             data_rx: Arc::clone(&self.data_rx),
             reader_tasks: Arc::clone(&self.reader_tasks),
@@ -3324,6 +3750,8 @@ mod tests {
         let conn = PeerConnection {
             public_key: None,
             remote_addr: TransportAddr::Quic(socket_addr),
+            traversal_method: TraversalMethod::Direct,
+            side: Side::Client,
             authenticated: false,
             connected_at: Instant::now(),
             last_activity: Instant::now(),
@@ -3435,6 +3863,7 @@ mod tests {
             addr: TransportAddr::Quic(socket_addr),
             public_key: None,
             side: Side::Client,
+            traversal_method: TraversalMethod::Direct,
         };
 
         // Verify event fields
@@ -3442,11 +3871,13 @@ mod tests {
             addr,
             public_key,
             side,
+            traversal_method,
         } = event
         {
             assert!(public_key.is_none());
             assert_eq!(addr, TransportAddr::Quic(socket_addr));
             assert!(side.is_client());
+            assert_eq!(traversal_method, TraversalMethod::Direct);
 
             // Verify as_socket_addr() works
             let extracted = addr.as_socket_addr();
@@ -3467,6 +3898,7 @@ mod tests {
             },
             public_key: None,
             side: Side::Server,
+            traversal_method: TraversalMethod::Direct,
         };
 
         // Verify event fields
@@ -3474,10 +3906,12 @@ mod tests {
             addr,
             public_key,
             side,
+            traversal_method,
         } = event
         {
             assert!(public_key.is_none());
             assert!(side.is_server());
+            assert_eq!(traversal_method, TraversalMethod::Direct);
 
             // Verify as_socket_addr() returns None for BLE
             assert!(addr.as_socket_addr().is_none());
@@ -3514,6 +3948,7 @@ mod tests {
             addr: TransportAddr::Quic(socket_addr),
             public_key: Some(vec![0x11; 32]),
             side: Side::Client,
+            traversal_method: TraversalMethod::Direct,
         };
 
         // Verify events are Clone
@@ -3543,6 +3978,8 @@ mod tests {
         let udp_conn = PeerConnection {
             public_key: None,
             remote_addr: TransportAddr::Quic(udp_addr),
+            traversal_method: TraversalMethod::Direct,
+            side: Side::Client,
             authenticated: true,
             connected_at: Instant::now(),
             last_activity: Instant::now(),
@@ -3561,6 +3998,8 @@ mod tests {
                 mac: mac_addr,
                 psm: 128,
             },
+            traversal_method: TraversalMethod::Direct,
+            side: Side::Client,
             authenticated: true,
             connected_at: Instant::now(),
             last_activity: Instant::now(),
@@ -3578,6 +4017,7 @@ mod tests {
             addr: TransportAddr::Quic(socket_addr),
             public_key: None,
             side: Side::Client,
+            traversal_method: TraversalMethod::Direct,
         };
 
         // Verify display formatting works for logging
@@ -3607,6 +4047,8 @@ mod tests {
         let conn = PeerConnection {
             public_key: None,
             remote_addr: TransportAddr::Quic(socket_addr),
+            traversal_method: TraversalMethod::Direct,
+            side: Side::Client,
             authenticated: true,
             connected_at: Instant::now(),
             last_activity: Instant::now(),
@@ -3637,6 +4079,8 @@ mod tests {
             PeerConnection {
                 public_key: None,
                 remote_addr: TransportAddr::Quic(udp_addr),
+                traversal_method: TraversalMethod::Direct,
+                side: Side::Client,
                 authenticated: true,
                 connected_at: Instant::now(),
                 last_activity: Instant::now(),
@@ -3655,6 +4099,8 @@ mod tests {
             PeerConnection {
                 public_key: None,
                 remote_addr: ble_addr,
+                traversal_method: TraversalMethod::Direct,
+                side: Side::Client,
                 authenticated: true,
                 connected_at: Instant::now(),
                 last_activity: Instant::now(),
@@ -3697,6 +4143,8 @@ mod tests {
                 PeerConnection {
                     public_key: None,
                     remote_addr: TransportAddr::Quic(socket_addr),
+                    traversal_method: TraversalMethod::Direct,
+                    side: Side::Client,
                     authenticated: true,
                     connected_at: Instant::now(),
                     last_activity: Instant::now(),
@@ -3746,6 +4194,8 @@ mod tests {
         let mut conn = PeerConnection {
             public_key: None,
             remote_addr: TransportAddr::Quic(socket_addr),
+            traversal_method: TraversalMethod::Direct,
+            side: Side::Client,
             authenticated: false,
             connected_at: Instant::now(),
             last_activity: Instant::now(),
@@ -3758,5 +4208,87 @@ mod tests {
         // Verify transport address is preserved
         assert_eq!(conn.remote_addr, TransportAddr::Quic(socket_addr));
         assert!(conn.authenticated);
+    }
+
+    // ---- Tier 2: preferred-coordinator front-merge ----
+
+    fn make_addr(octet: u8) -> SocketAddr {
+        SocketAddr::from(([10, 0, 0, octet], 9000))
+    }
+
+    #[test]
+    fn merge_preferred_coordinators_empty_preferred_is_no_op() {
+        let mut candidates = vec![make_addr(1), make_addr(2)];
+        let original = candidates.clone();
+        P2pEndpoint::merge_preferred_coordinators(&mut candidates, &[]);
+        assert_eq!(
+            candidates, original,
+            "empty preferred must not mutate the candidate list"
+        );
+    }
+
+    #[test]
+    fn merge_preferred_coordinators_inserts_at_front_in_order() {
+        let mut candidates = vec![make_addr(10), make_addr(11)];
+        let preferred = vec![make_addr(1), make_addr(2), make_addr(3)];
+        P2pEndpoint::merge_preferred_coordinators(&mut candidates, &preferred);
+
+        assert_eq!(
+            candidates,
+            vec![
+                make_addr(1),
+                make_addr(2),
+                make_addr(3),
+                make_addr(10),
+                make_addr(11),
+            ],
+            "preferred entries must occupy [0..preferred.len()] in order"
+        );
+    }
+
+    #[test]
+    fn merge_preferred_coordinators_dedupes_existing_entries() {
+        // make_addr(2) is BOTH a pre-existing candidate AND in the preferred
+        // list. After the merge it should appear exactly once, at its
+        // preferred-list position (index 1), not at its original tail spot.
+        let mut candidates = vec![make_addr(2), make_addr(10), make_addr(11)];
+        let preferred = vec![make_addr(1), make_addr(2)];
+        P2pEndpoint::merge_preferred_coordinators(&mut candidates, &preferred);
+
+        assert_eq!(
+            candidates,
+            vec![make_addr(1), make_addr(2), make_addr(10), make_addr(11),],
+            "duplicate preferred entries must end up in the preferred slot, not the tail"
+        );
+        // No accidental duplication.
+        assert_eq!(
+            candidates.iter().filter(|a| **a == make_addr(2)).count(),
+            1,
+            "make_addr(2) must appear exactly once after dedup"
+        );
+    }
+
+    #[test]
+    fn merge_preferred_coordinators_only_dedupes_preferred_entries() {
+        // Pre-existing candidates that are NOT in the preferred list must
+        // remain in their original tail order.
+        let mut candidates = vec![make_addr(10), make_addr(11), make_addr(12)];
+        let preferred = vec![make_addr(1)];
+        P2pEndpoint::merge_preferred_coordinators(&mut candidates, &preferred);
+
+        assert_eq!(
+            candidates,
+            vec![make_addr(1), make_addr(10), make_addr(11), make_addr(12),],
+            "non-preferred candidates must keep their original relative order"
+        );
+    }
+
+    #[test]
+    fn merge_preferred_coordinators_works_on_empty_candidate_list() {
+        let mut candidates: Vec<SocketAddr> = Vec::new();
+        let preferred = vec![make_addr(1), make_addr(2)];
+        P2pEndpoint::merge_preferred_coordinators(&mut candidates, &preferred);
+
+        assert_eq!(candidates, vec![make_addr(1), make_addr(2)]);
     }
 }

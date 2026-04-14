@@ -624,6 +624,9 @@ pub struct Capabilities {
     /// Observed external addresses for this peer.
     pub observed_addrs: Vec<SocketAddr>,
 
+    /// Broadest direct reachability scope verified for this connected peer.
+    pub direct_reachability_scope: Option<crate::reachability::ReachabilityScope>,
+
     /// Protocols this peer advertises support for.
     pub protocols: Vec<ProtocolId>,
 
@@ -661,6 +664,7 @@ impl Default for Capabilities {
             supports_relay: false,
             supports_coordination: false,
             observed_addrs: Vec::new(),
+            direct_reachability_scope: None,
             protocols: Vec::new(),
             last_seen: SystemTime::UNIX_EPOCH,
             rtt_ms_p50: 0,
@@ -1026,7 +1030,7 @@ pub type BoxStream<'a, T> = Pin<Box<dyn futures_util::Stream<Item = T> + Send + 
 ///
 /// This trait abstracts a single QUIC connection, providing methods to
 /// open streams and send/receive datagrams. Connections are obtained via
-/// [`LinkTransport::dial`] or [`LinkTransport::accept`].
+/// [`LinkTransport::dial_addr`] or [`LinkTransport::accept`].
 ///
 /// # Stream Types
 ///

@@ -853,6 +853,58 @@ pub fn peer_supports_rfc_nat(transport_params: &[u8]) -> bool {
     })
 }
 
+/// PUNCH_ME_NOW_NACK — sent by a coordinator back to the requester when
+/// it cannot relay a PUNCH_ME_NOW because the target peer is not among
+/// its connections.  This allows the requester to immediately rotate to
+/// the next coordinator instead of waiting for a timeout.
+///
+/// Wire format (single frame type — no IPv4/IPv6 variants):
+/// ```text
+/// +-------------------+------------------+
+/// | Frame Type        | Round  | Target  |
+/// | (VarInt: 0x3d7e99)| (VarInt)| Peer ID|
+/// |                   |        | (32 B)  |
+/// +-------------------+------------------+
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PunchMeNowNack {
+    /// Round number echoed from the original PUNCH_ME_NOW
+    pub round: VarInt,
+    /// The peer ID the coordinator could not find
+    pub target_peer_id: [u8; 32],
+}
+
+impl PunchMeNowNack {
+    /// Upper bound on encoded size: frame type (4) + round (9) + peer_id (32)
+    pub const SIZE_BOUND: usize = 4 + 9 + 32;
+
+    pub fn encode<W: BufMut>(&self, buf: &mut W) {
+        if self.try_encode(buf).is_err() {
+            log_encode_overflow("PunchMeNowNack");
+        }
+    }
+
+    pub fn try_encode<W: BufMut>(&self, buf: &mut W) -> Result<(), VarIntBoundsExceeded> {
+        buf.write_var(FrameType::PUNCH_ME_NOW_NACK.0)?;
+        buf.write_var(self.round.into_inner())?;
+        buf.put_slice(&self.target_peer_id);
+        Ok(())
+    }
+
+    pub fn decode<R: Buf>(r: &mut R) -> Result<Self, UnexpectedEnd> {
+        let round = r.get()?;
+        if r.remaining() < 32 {
+            return Err(UnexpectedEnd);
+        }
+        let mut target_peer_id = [0u8; 32];
+        r.copy_to_slice(&mut target_peer_id);
+        Ok(Self {
+            round,
+            target_peer_id,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1633,6 +1633,13 @@ impl Connection {
                 // Enqueue PunchMeNow frame for transmission
                 self.spaces[SpaceId::Data].pending.punch_me_now.push(punch);
             }
+            QueuePunchMeNowNack(nack) => {
+                // Enqueue NACK for transmission (coordinator → requester)
+                self.spaces[SpaceId::Data]
+                    .pending
+                    .punch_me_now_nack
+                    .push(nack);
+            }
         }
     }
 
@@ -3626,6 +3633,17 @@ impl Connection {
                 Frame::TryConnectToResponse(response) => {
                     self.handle_try_connect_to_response(&response)?;
                 }
+                Frame::PunchMeNowNack(nack) => {
+                    tracing::info!(
+                        "Received PUNCH_ME_NOW_NACK: round={}, target={}",
+                        nack.round,
+                        hex::encode(&nack.target_peer_id[..8])
+                    );
+                    self.endpoint_events
+                        .push_back(EndpointEventInner::PunchMeNowNacked {
+                            target_peer_id: nack.target_peer_id,
+                        });
+                }
             }
         }
 
@@ -4173,11 +4191,15 @@ impl Connection {
                 Some(x) => x,
                 None => break,
             };
-            trace!(
-                round = %punch_me_now.round,
-                paired_with_sequence_number = %punch_me_now.paired_with_sequence_number,
-                "PUNCH_ME_NOW"
-            );
+            if let Some(ref target) = punch_me_now.target_peer_id {
+                info!(
+                    "populate_packet: ENCODING PUNCH_ME_NOW relay frame target_peer={} remote={} buf_len={} max_size={}",
+                    hex::encode(&target[..8]),
+                    self.path.remote,
+                    buf.len(),
+                    max_size,
+                );
+            }
             // Use the correct encoding format based on negotiated configuration
             if self.nat_traversal_frame_config.use_rfc_format {
                 encode_or_close!(punch_me_now.try_encode_rfc(buf), "PUNCH_ME_NOW (rfc)");
@@ -4189,6 +4211,20 @@ impl Connection {
                 .punch_me_now
                 .push(punch_me_now);
             self.stats.frame_tx.punch_me_now += 1;
+        }
+
+        // NAT traversal frames - PunchMeNowNack
+        while buf.len() + frame::PunchMeNowNack::SIZE_BOUND < max_size && space_id == SpaceId::Data
+        {
+            let nack = match space.pending.punch_me_now_nack.pop() {
+                Some(x) => x,
+                None => break,
+            };
+            encode_or_close!(nack.try_encode(buf), "PUNCH_ME_NOW_NACK");
+            sent.retransmits
+                .get_or_create()
+                .punch_me_now_nack
+                .push(nack);
         }
 
         // NAT traversal frames - RemoveAddress
@@ -4531,6 +4567,7 @@ impl Connection {
             max_candidates,
             coordination_timeout,
             self.config.allow_loopback,
+            self.config.relay_slot_table.clone(),
         ));
 
         trace!("NAT traversal initialized for symmetric P2P node");
@@ -4729,6 +4766,7 @@ impl Connection {
             8,
             Duration::from_secs(10),
             self.config.allow_loopback,
+            self.config.relay_slot_table.clone(),
         ));
     }
 
@@ -4862,7 +4900,13 @@ impl Connection {
                         return Ok(());
                     }
                     Ok(None) => {
-                        trace!("Coordination completed or no action needed");
+                        // Reaching this branch with `target_peer_id.is_some()`
+                        // (the only branch that calls this) means the
+                        // shared back-pressure table refused the relay.
+                        // The table itself logs and counts the refusal —
+                        // we drop silently so the initiator falls back
+                        // to the per-attempt timeout (Tier 2 rotation).
+                        trace!("PUNCH_ME_NOW relay refused by node-wide back-pressure");
                         return Ok(());
                     }
                     Err(e) => {
