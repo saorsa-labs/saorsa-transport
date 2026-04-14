@@ -37,8 +37,8 @@ use rustc_hash::FxHashMap;
 #[cfg(all(not(wasm_browser), feature = "network-discovery"))]
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::sync::{Notify, futures::Notified, mpsc};
-use tracing::error;
 use tracing::{Instrument, Span};
+use tracing::{error, trace};
 
 use super::{
     ConnectionEvent, IO_LOOP_BOUND, RECV_TIME_BOUND, connection::Connecting,
@@ -416,9 +416,19 @@ impl Endpoint {
             connections = num_connections,
             "RELAY_REBIND: rebinding endpoint, notifying all connections"
         );
-        for sender in inner.recv_state.connections.senders.values() {
-            // Ignoring errors from dropped connections
-            let _ = sender.send(ConnectionEvent::Rebind(inner.socket.clone()));
+        let rebind_socket = inner.socket.clone();
+        let State {
+            stats, recv_state, ..
+        } = &mut *inner;
+        for sender in recv_state.connections.senders.values() {
+            // Rebinds are rare (socket migration). Inbox-full here means that
+            // connection is wedged; we shed the Rebind and count it rather
+            // than blocking every other connection's migration.
+            forward_or_drop(
+                sender,
+                ConnectionEvent::Rebind(rebind_socket.clone()),
+                stats,
+            );
         }
 
         Ok(())
@@ -495,12 +505,18 @@ impl Endpoint {
             }
         };
         endpoint.recv_state.connections.close = Some((error_code, reason.clone()));
-        for sender in endpoint.recv_state.connections.senders.values() {
-            // Ignoring errors from dropped connections
-            let _ = sender.send(ConnectionEvent::Close {
-                error_code,
-                reason: reason.clone(),
-            });
+        let State {
+            stats, recv_state, ..
+        } = &mut *endpoint;
+        for sender in recv_state.connections.senders.values() {
+            forward_or_drop(
+                sender,
+                ConnectionEvent::Close {
+                    error_code,
+                    reason: reason.clone(),
+                },
+                stats,
+            );
         }
         self.inner.shared.incoming.notify_waiters();
     }
@@ -548,6 +564,17 @@ pub struct EndpointStats {
     pub refused_handshakes: u64,
     /// Cummulative number of Quic handshakes ignored on this [Endpoint]
     pub ignored_handshakes: u64,
+    /// Cumulative count of [`ConnectionEvent`]s dropped because a
+    /// per-connection inbox was full.
+    ///
+    /// Since the per-connection mailbox was converted from
+    /// `mpsc::unbounded_channel` to a bounded [`mpsc::channel`] of
+    /// `CONN_EVENT_QUEUE_CAPACITY`, the endpoint sheds events when a
+    /// connection driver falls behind rather than growing memory without
+    /// bound. Shedding a `Proto` event is safe — the peer will retransmit —
+    /// but a non-zero value here is a strong signal that a connection is
+    /// overloaded or that the queue is undersized.
+    pub dropped_conn_events: u64,
 }
 
 /// A future that drives IO on an endpoint
@@ -734,16 +761,26 @@ impl State {
         self.recv_state.recv_limiter.start_cycle(get_time);
         if let Some(socket) = &self.prev_socket {
             // We don't care about the `PollProgress` from old sockets.
-            let poll_res =
-                self.recv_state
-                    .poll_socket(cx, &mut self.inner, &**socket, &*self.runtime, now);
+            let poll_res = self.recv_state.poll_socket(
+                cx,
+                &mut self.inner,
+                &**socket,
+                &*self.runtime,
+                now,
+                &mut self.stats,
+            );
             if poll_res.is_err() {
                 self.prev_socket = None;
             }
         };
-        let poll_res =
-            self.recv_state
-                .poll_socket(cx, &mut self.inner, &*self.socket, &*self.runtime, now);
+        let poll_res = self.recv_state.poll_socket(
+            cx,
+            &mut self.inner,
+            &*self.socket,
+            &*self.runtime,
+            now,
+            &mut self.stats,
+        );
         self.recv_state.recv_limiter.finish_cycle(get_time);
         let poll_res = poll_res?;
         if poll_res.received_connection_packet {
@@ -779,7 +816,7 @@ impl State {
             };
             // Ignoring errors from dropped connections that haven't yet been cleaned up
             if let Some(sender) = self.recv_state.connections.senders.get_mut(&ch) {
-                let _ = sender.send(ConnectionEvent::Proto(event));
+                forward_or_drop(sender, ConnectionEvent::Proto(event), &mut self.stats);
             }
         }
 
@@ -789,7 +826,7 @@ impl State {
             did_work = true;
             if let Some(sender) = self.recv_state.connections.senders.get_mut(&ch) {
                 tracing::debug!("Sending relay event to connection {:?}", ch);
-                let _ = sender.send(ConnectionEvent::Proto(event));
+                forward_or_drop(sender, ConnectionEvent::Proto(event), &mut self.stats);
             } else {
                 tracing::warn!(
                     "Cannot send relay event: connection {:?} not found in senders",
@@ -909,10 +946,25 @@ fn proto_ecn(ecn: quinn_udp::EcnCodepoint) -> crate::EcnCodepoint {
     }
 }
 
+/// Capacity of each per-connection `ConnectionEvent` mailbox.
+///
+/// Chosen as a compromise between memory usage (every active connection holds
+/// a queue of this size) and tolerance for transient driver lag. 1024 events
+/// is well above the burst size produced by normal congestion-window-sized
+/// inflight packets, so a healthy driver never hits the bound; under DoS or
+/// a stalled task, excess events are shed via [`mpsc::Sender::try_send`] and
+/// counted on [`EndpointStats::dropped_conn_events`].
+const CONN_EVENT_QUEUE_CAPACITY: usize = 1024;
+
 #[derive(Debug)]
 struct ConnectionSet {
-    /// Senders for communicating with the endpoint's connections
-    senders: FxHashMap<ConnectionHandle, mpsc::UnboundedSender<ConnectionEvent>>,
+    /// Senders for communicating with the endpoint's connections.
+    ///
+    /// Bounded ([`CONN_EVENT_QUEUE_CAPACITY`]) so a slow per-connection
+    /// driver can't grow memory without bound under sustained packet
+    /// arrival. Overflow is shed via [`mpsc::Sender::try_send`] and counted
+    /// on [`EndpointStats::dropped_conn_events`].
+    senders: FxHashMap<ConnectionHandle, mpsc::Sender<ConnectionEvent>>,
     /// Stored to give out clones to new ConnectionInners
     sender: mpsc::UnboundedSender<(ConnectionHandle, EndpointEvent)>,
     /// Set if the endpoint has been manually closed
@@ -927,9 +979,12 @@ impl ConnectionSet {
         socket: Arc<dyn AsyncUdpSocket>,
         runtime: Arc<dyn Runtime>,
     ) -> Connecting {
-        let (send, recv) = mpsc::unbounded_channel();
+        let (send, recv) = mpsc::channel(CONN_EVENT_QUEUE_CAPACITY);
         if let Some((error_code, ref reason)) = self.close {
-            let _ = send.send(ConnectionEvent::Close {
+            // Fresh channel has full capacity — this cannot fail, but we
+            // ignore the error defensively in case a refactor ever changes
+            // that invariant.
+            let _ = send.try_send(ConnectionEvent::Close {
                 error_code,
                 reason: reason.clone(),
             });
@@ -947,6 +1002,38 @@ fn ensure_ipv6(x: SocketAddr) -> SocketAddrV6 {
     match x {
         SocketAddr::V6(x) => x,
         SocketAddr::V4(x) => SocketAddrV6::new(x.ip().to_ipv6_mapped(), x.port(), 0, 0),
+    }
+}
+
+/// Try to forward a [`ConnectionEvent`] to a per-connection mailbox, shedding
+/// it (and bumping [`EndpointStats::dropped_conn_events`]) if the mailbox is
+/// full. Closed mailboxes correspond to a connection that has already been
+/// torn down and are silently ignored, matching the prior
+/// `let _ = sender.send(..)` behaviour.
+///
+/// A full mailbox on a [`ConnectionEvent::Proto`] is safe: the peer will
+/// retransmit the unacknowledged packets. For [`ConnectionEvent::Rebind`]
+/// and [`ConnectionEvent::Close`] it merely delays the control event for
+/// that connection; callers log the incident through the counter instead
+/// of blocking the endpoint-wide driver.
+#[inline]
+fn forward_or_drop(
+    sender: &mpsc::Sender<ConnectionEvent>,
+    event: ConnectionEvent,
+    stats: &mut EndpointStats,
+) {
+    match sender.try_send(event) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            stats.dropped_conn_events = stats.dropped_conn_events.saturating_add(1);
+            trace!(
+                dropped_total = stats.dropped_conn_events,
+                "connection inbox full, shedding event"
+            );
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            // Receiver dropped — connection is already being torn down.
+        }
     }
 }
 
@@ -1108,6 +1195,7 @@ impl RecvState {
         socket: &dyn AsyncUdpSocket,
         runtime: &dyn Runtime,
         now: Instant,
+        stats: &mut EndpointStats,
     ) -> Result<PollProgress, io::Error> {
         let mut received_connection_packet = false;
         let mut metas = [RecvMeta::default(); BATCH_SIZE];
@@ -1158,7 +1246,11 @@ impl RecvState {
                                     received_connection_packet = true;
                                     if let Some(sender) = self.connections.senders.get_mut(&handle)
                                     {
-                                        let _ = sender.send(ConnectionEvent::Proto(event));
+                                        forward_or_drop(
+                                            sender,
+                                            ConnectionEvent::Proto(event),
+                                            stats,
+                                        );
                                     }
                                 }
                                 Some(DatagramEvent::Response(transmit)) => {
