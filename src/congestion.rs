@@ -19,7 +19,7 @@ pub(crate) mod cubic;
 pub(crate) mod new_reno;
 
 // Re-export commonly used types
-// pub use self::bbr::{Bbr, BbrConfig};
+pub(crate) use self::bbr::BbrConfig;
 pub(crate) use self::cubic::CubicConfig;
 // pub use self::new_reno::{NewReno as NewRenoFull, NewRenoConfig};
 

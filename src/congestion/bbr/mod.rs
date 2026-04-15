@@ -30,7 +30,6 @@ mod min_max;
 /// of BBR <https://datatracker.ietf.org/doc/html/draft-cardwell-iccrg-bbr-congestion-control>.
 /// More discussion and links at <https://groups.google.com/g/bbr-dev>.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub(crate) struct Bbr {
     config: Arc<BbrConfig>,
     current_mtu: u64,
@@ -340,9 +339,15 @@ impl Bbr {
         // time.
         if self.is_at_full_bandwidth {
             self.cwnd = target_window.min(self.cwnd + bytes_acked);
-        } else if (self.cwnd_gain < target_window as f32) || (self.acked_bytes < self.init_cwnd) {
-            // If the connection is not yet out of startup phase, do not decrease
-            // the window.
+        } else if self.cwnd < target_window || self.acked_bytes < self.init_cwnd {
+            // Startup / initial warm-up: grow the window. The quiche reference
+            // at <https://source.chromium.org/chromium/chromium/src/+/main:net/
+            // third_party/quiche/src/quiche/quic/core/congestion_control/
+            // bbr_sender.cc> uses the same `cwnd < target_window` predicate.
+            // (The original quinn-proto port had `cwnd_gain < target_window as f32`
+            // here, which is a gain-vs-bytes type confusion — the expression is
+            // effectively always true because cwnd_gain is ~2.0-2.9 and
+            // target_window is always ≫ 3 bytes.)
             self.cwnd += bytes_acked;
         }
 
@@ -539,7 +544,6 @@ impl BbrConfig {
     /// Default limit on the amount of outstanding data in bytes.
     ///
     /// Recommended value: `min(10 * max_datagram_size, max(2 * max_datagram_size, 14720))`
-    #[allow(dead_code)]
     pub(crate) fn initial_window(&mut self, value: u64) -> &mut Self {
         self.initial_window = value;
         self

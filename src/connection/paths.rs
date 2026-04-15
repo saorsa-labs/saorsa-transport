@@ -84,6 +84,7 @@ impl PathData {
                 config.initial_rtt,
                 congestion.initial_window(),
                 config.get_initial_mtu(),
+                congestion.metrics().pacing_rate,
                 now,
             ),
             congestion,
@@ -123,7 +124,13 @@ impl PathData {
         Self {
             remote,
             rtt: prev.rtt,
-            pacing: Pacer::new(smoothed_rtt, congestion.window(), prev.current_mtu(), now),
+            pacing: Pacer::new(
+                smoothed_rtt,
+                congestion.window(),
+                prev.current_mtu(),
+                congestion.metrics().pacing_rate,
+                now,
+            ),
             sending_ecn: true,
             congestion,
             challenge: None,
@@ -248,7 +255,9 @@ impl PathData {
 
             congestion_window: Some(controller_metrics.congestion_window),
             ssthresh: controller_metrics.ssthresh,
-            pacing_rate: controller_metrics.pacing_rate,
+            // The Controller trait exposes pacing_rate in bytes/sec; the
+            // qlog `recovery_metrics_updated` event is defined in bits/sec.
+            pacing_rate: controller_metrics.pacing_rate.map(|r| r.saturating_mul(8)),
         };
 
         let event = metrics.to_qlog_event(&self.congestion_metrics);

@@ -164,6 +164,15 @@ pub struct NatConfig {
     /// not need to be reachable by other peers and advertising their address
     /// causes unnecessary inbound connection attempts.
     pub advertise_external_addresses: bool,
+
+    /// Congestion control algorithm used by the underlying QUIC transport.
+    ///
+    /// See [`crate::nat_traversal_api::CongestionAlgorithm`]. BBR is the
+    /// default — it paces at the estimated bottleneck rate and sizes the
+    /// window around the BDP, which fills MASQUE relay hops and
+    /// cross-region links that CUBIC's loss-based recovery leaves
+    /// under-used.
+    pub congestion_algorithm: crate::nat_traversal_api::CongestionAlgorithm,
 }
 
 impl Default for NatConfig {
@@ -179,6 +188,7 @@ impl Default for NatConfig {
             allow_loopback: false,
             upnp: crate::upnp::UpnpConfig::default(),
             advertise_external_addresses: true,
+            congestion_algorithm: crate::nat_traversal_api::CongestionAlgorithm::default(),
         }
     }
 }
@@ -334,6 +344,7 @@ impl P2pConfig {
             allow_loopback: self.nat.allow_loopback,
             upnp: self.nat.upnp.clone(),
             advertise_external_addresses: self.nat.advertise_external_addresses,
+            congestion_algorithm: self.nat.congestion_algorithm,
         }
     }
 

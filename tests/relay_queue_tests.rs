@@ -57,6 +57,7 @@ mod nat_traversal_api_tests {
             allow_loopback: false,
             upnp: Default::default(),
             advertise_external_addresses: true,
+            congestion_algorithm: Default::default(),
         };
 
         assert_eq!(config.known_peers.len(), 1);
@@ -195,6 +196,7 @@ mod functional_tests {
             allow_loopback: false,
             upnp: Default::default(),
             advertise_external_addresses: true,
+            congestion_algorithm: Default::default(),
         };
 
         // May fail due to zero values or other validation
@@ -223,6 +225,7 @@ mod functional_tests {
             allow_loopback: false,
             upnp: Default::default(),
             advertise_external_addresses: true,
+            congestion_algorithm: Default::default(),
         };
 
         let result = NatTraversalEndpoint::new(valid_config, None, None).await;
@@ -417,6 +420,7 @@ mod performance_tests {
                 allow_loopback: false,
                 upnp: Default::default(),
                 advertise_external_addresses: true,
+                congestion_algorithm: Default::default(),
             };
 
             // Use the config to prevent optimization
@@ -489,6 +493,7 @@ mod relay_functionality_tests {
             allow_loopback: false,
             upnp: Default::default(),
             advertise_external_addresses: true,
+            congestion_algorithm: Default::default(),
         };
 
         // This might be accepted or rejected depending on implementation

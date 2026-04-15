@@ -845,13 +845,18 @@ impl Connection {
                         continue;
                     }
 
-                    // Check whether the next datagram is blocked by pacing
+                    // Check whether the next datagram is blocked by pacing.
+                    // For rate-driven controllers (BBR) we forward the advertised
+                    // rate so the bucket paces at the model-based rate instead
+                    // of the cwnd/RTT fallback.
                     let smoothed_rtt = self.path.rtt.get();
+                    let pacing_rate = self.path.congestion.metrics().pacing_rate;
                     if let Some(delay) = self.path.pacing.delay(
                         smoothed_rtt,
                         bytes_to_send,
                         self.path.current_mtu(),
                         self.path.congestion.window(),
+                        pacing_rate,
                         now,
                     ) {
                         self.timers.set(Timer::Pacing, delay);

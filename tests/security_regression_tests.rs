@@ -39,6 +39,7 @@ fn test_peer_config() -> NatTraversalConfig {
         allow_loopback: true,
         upnp: Default::default(),
         advertise_external_addresses: true,
+        congestion_algorithm: Default::default(),
     }
 }
 
@@ -65,6 +66,7 @@ fn test_server_config() -> NatTraversalConfig {
         allow_loopback: true,
         upnp: Default::default(),
         advertise_external_addresses: true,
+        congestion_algorithm: Default::default(),
     }
 }
 
@@ -114,6 +116,7 @@ async fn test_error_handling_no_panic() {
         allow_loopback: true,
         upnp: Default::default(),
         advertise_external_addresses: true,
+        congestion_algorithm: Default::default(),
     };
 
     let result1 = NatTraversalEndpoint::new(config1, None, None).await;
@@ -144,6 +147,7 @@ async fn test_error_handling_no_panic() {
         allow_loopback: true,
         upnp: Default::default(),
         advertise_external_addresses: true,
+        congestion_algorithm: Default::default(),
     };
 
     let result2 = NatTraversalEndpoint::new(config2, None, None).await;
@@ -237,6 +241,7 @@ async fn test_malformed_config_handling() {
         allow_loopback: true,
         upnp: Default::default(),
         advertise_external_addresses: true,
+        congestion_algorithm: Default::default(),
     };
 
     let result = NatTraversalEndpoint::new(no_peers_config, None, None).await;
@@ -268,6 +273,7 @@ async fn test_malformed_config_handling() {
         allow_loopback: true,
         upnp: Default::default(),
         advertise_external_addresses: true,
+        congestion_algorithm: Default::default(),
     };
 
     let result2 = NatTraversalEndpoint::new(extreme_config, None, None).await;
@@ -306,6 +312,7 @@ async fn test_input_sanitization() {
         allow_loopback: true,
         upnp: Default::default(),
         advertise_external_addresses: true,
+        congestion_algorithm: Default::default(),
     };
 
     // This should either work or fail gracefully, not exhaust memory or panic
@@ -379,6 +386,7 @@ mod specific_regression_tests {
             allow_loopback: true,
             upnp: Default::default(),
             advertise_external_addresses: true,
+            congestion_algorithm: Default::default(),
         };
 
         // Should not panic and should handle random port selection
@@ -432,6 +440,7 @@ mod specific_regression_tests {
             allow_loopback: true,
             upnp: Default::default(),
             advertise_external_addresses: true,
+            congestion_algorithm: Default::default(),
         };
 
         // Should not panic, even if configuration is inconsistent

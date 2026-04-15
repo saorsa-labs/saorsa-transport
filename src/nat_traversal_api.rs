@@ -384,6 +384,25 @@ pub struct NatTraversalEndpoint {
     advertise_external_addresses: bool,
 }
 
+/// Congestion control algorithm used by the underlying QUIC transport.
+///
+/// BBR is the default: its rate-based pacing (wired through
+/// [`crate::connection::pacing::Pacer`]) and BDP-sized congestion window
+/// fill high-BDP paths — notably MASQUE relay hops — that CUBIC's
+/// loss-based recovery leaves under-used. CUBIC remains available as a
+/// more conservative, widely-deployed fallback.
+///
+/// Default: [`CongestionAlgorithm::Bbr`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CongestionAlgorithm {
+    /// Loss-based CUBIC congestion control (RFC 8312).
+    Cubic,
+    /// Model-based BBR congestion control. Default.
+    #[default]
+    Bbr,
+}
+
 /// Configuration for NAT traversal behavior
 ///
 /// This configuration controls various aspects of NAT traversal including security,
@@ -547,6 +566,17 @@ pub struct NatTraversalConfig {
     /// Default: `true`
     #[serde(default = "default_advertise_external_addresses")]
     pub advertise_external_addresses: bool,
+
+    /// Congestion control algorithm used by the underlying QUIC transport.
+    ///
+    /// See [`CongestionAlgorithm`]. BBR is the default — it paces at the
+    /// estimated bottleneck rate and sizes the window around the BDP,
+    /// which fills MASQUE relay hops and cross-region links that CUBIC's
+    /// loss-based recovery leaves under-used.
+    ///
+    /// Default: [`CongestionAlgorithm::Bbr`].
+    #[serde(default)]
+    pub congestion_algorithm: CongestionAlgorithm,
 }
 
 fn default_advertise_external_addresses() -> bool {
@@ -555,6 +585,32 @@ fn default_advertise_external_addresses() -> bool {
 
 fn default_max_message_size() -> usize {
     crate::unified_config::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE
+}
+
+/// Build a congestion-controller factory for the chosen algorithm, primed with
+/// the given initial congestion window.
+///
+/// The initial window matters here because relay-tunnelled paths see RTTs of
+/// 200-400 ms; without a boosted initial window CUBIC's slow start under-fills
+/// the pipe during the first chunk's worth of bytes. BBR performs its own
+/// pacing from bandwidth estimates after the first round, but starts from
+/// the same initial window to keep the first RTT's behaviour comparable.
+fn build_congestion_factory(
+    algorithm: CongestionAlgorithm,
+    initial_window: u64,
+) -> Arc<dyn crate::congestion::ControllerFactory + Send + Sync> {
+    match algorithm {
+        CongestionAlgorithm::Cubic => {
+            let mut cc = crate::congestion::CubicConfig::default();
+            cc.initial_window(initial_window);
+            Arc::new(cc)
+        }
+        CongestionAlgorithm::Bbr => {
+            let mut cc = crate::congestion::BbrConfig::default();
+            cc.initial_window(initial_window);
+            Arc::new(cc)
+        }
+    }
 }
 
 /// Convert `max_message_size` to a QUIC `VarInt` for stream/send window configuration.
@@ -1144,6 +1200,7 @@ impl Default for NatTraversalConfig {
             allow_loopback: false,
             upnp: crate::upnp::UpnpConfig::default(),
             advertise_external_addresses: true,
+            congestion_algorithm: CongestionAlgorithm::default(),
         }
     }
 }
@@ -2689,9 +2746,10 @@ impl NatTraversalEndpoint {
             // completes in ~2 RTTs through slow-start) with pacing that
             // receivers can absorb.
             const INITIAL_CONGESTION_WINDOW: u64 = 1024 * 1024;
-            let mut cc = crate::congestion::CubicConfig::default();
-            cc.initial_window(INITIAL_CONGESTION_WINDOW);
-            transport_config.congestion_controller_factory(Arc::new(cc));
+            transport_config.congestion_controller_factory(build_congestion_factory(
+                config.congestion_algorithm,
+                INITIAL_CONGESTION_WINDOW,
+            ));
 
             // v0.13.0+: All nodes use ServerSupport for full P2P capabilities
             // Per draft-seemann-quic-nat-traversal-02, all nodes can coordinate
@@ -2768,9 +2826,10 @@ impl NatTraversalEndpoint {
             // relay-tunnelled connections can push a full chunk without
             // waiting for slow-start.  See the server config comment for
             // the full rationale.
-            let mut cc = crate::congestion::CubicConfig::default();
-            cc.initial_window(config.max_message_size as u64);
-            transport_config.congestion_controller_factory(Arc::new(cc));
+            transport_config.congestion_controller_factory(build_congestion_factory(
+                config.congestion_algorithm,
+                config.max_message_size as u64,
+            ));
 
             // v0.13.0+: All nodes use ServerSupport for full P2P capabilities
             // Per draft-seemann-quic-nat-traversal-02, all nodes can coordinate
@@ -7261,5 +7320,45 @@ mod tests {
             handles.is_empty(),
             "Handles should remain empty after shutdown"
         );
+    }
+
+    #[test]
+    fn test_congestion_algorithm_default_is_bbr() {
+        let config = NatTraversalConfig::default();
+        assert_eq!(config.congestion_algorithm, CongestionAlgorithm::Bbr);
+    }
+
+    #[test]
+    fn test_congestion_algorithm_serde_roundtrip_cubic() {
+        let json = serde_json::to_string(&CongestionAlgorithm::Cubic).unwrap();
+        assert_eq!(json, "\"cubic\"");
+        let parsed: CongestionAlgorithm = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, CongestionAlgorithm::Cubic);
+    }
+
+    #[test]
+    fn test_congestion_algorithm_serde_roundtrip_bbr() {
+        let json = serde_json::to_string(&CongestionAlgorithm::Bbr).unwrap();
+        assert_eq!(json, "\"bbr\"");
+        let parsed: CongestionAlgorithm = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, CongestionAlgorithm::Bbr);
+    }
+
+    #[test]
+    fn test_build_congestion_factory_produces_distinct_controllers() {
+        // Smoke test: both algorithms produce a valid controller that can be
+        // instantiated and reports an initial window. We don't inspect internal
+        // state — we just verify the factory path wires through for both.
+        const WINDOW: u64 = 1024 * 1024;
+        const MIN_WINDOW: u64 = 2400;
+        const MAX_WINDOW: u64 = u64::MAX;
+
+        let cubic_factory = build_congestion_factory(CongestionAlgorithm::Cubic, WINDOW);
+        let cubic = cubic_factory.new_controller(MIN_WINDOW, MAX_WINDOW, std::time::Instant::now());
+        assert!(cubic.initial_window() >= MIN_WINDOW);
+
+        let bbr_factory = build_congestion_factory(CongestionAlgorithm::Bbr, WINDOW);
+        let bbr = bbr_factory.new_controller(MIN_WINDOW, MAX_WINDOW, std::time::Instant::now());
+        assert!(bbr.initial_window() >= MIN_WINDOW);
     }
 }
