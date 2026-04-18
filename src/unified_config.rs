@@ -167,11 +167,12 @@ pub struct NatConfig {
 
     /// Congestion control algorithm used by the underlying QUIC transport.
     ///
-    /// See [`crate::nat_traversal_api::CongestionAlgorithm`]. BBR is the
+    /// See [`crate::nat_traversal_api::CongestionAlgorithm`]. BBRv2 is the
     /// default — it paces at the estimated bottleneck rate and sizes the
     /// window around the BDP, which fills MASQUE relay hops and
     /// cross-region links that CUBIC's loss-based recovery leaves
-    /// under-used.
+    /// under-used, while handling lossy paths and shared bottlenecks
+    /// more gracefully than BBRv1.
     pub congestion_algorithm: crate::nat_traversal_api::CongestionAlgorithm,
 }
 

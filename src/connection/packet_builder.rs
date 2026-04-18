@@ -23,6 +23,11 @@ pub(super) struct PacketBuilder {
     pub(super) partial_encode: PartialEncode,
     pub(super) ack_eliciting: bool,
     pub(super) exact_number: u64,
+    /// Connection-wide monotonic counter value assigned to this packet.
+    /// Fed to the congestion controller in place of `exact_number` so
+    /// per-packet CC (BBRv2) sees a strictly increasing sequence across
+    /// all packet-number spaces. See [`Connection::next_sample_pn`].
+    pub(super) sample_pn: u64,
     pub(super) short_header: bool,
     /// Smallest absolute position in the associated buffer that must be occupied by this packet's
     /// frames
@@ -84,6 +89,8 @@ impl PacketBuilder {
                 return None;
             }
         }
+
+        let sample_pn = conn.allocate_sample_pn();
 
         let space = &mut conn.spaces[space_id];
         let exact_number = match space_id {
@@ -173,6 +180,7 @@ impl PacketBuilder {
             space: space_id,
             partial_encode,
             exact_number,
+            sample_pn,
             short_header: header.is_short(),
             min_size,
             max_size,
@@ -203,6 +211,7 @@ impl PacketBuilder {
     ) {
         let ack_eliciting = self.ack_eliciting;
         let exact_number = self.exact_number;
+        let sample_pn = self.sample_pn;
         let space_id = self.space;
         let (size, padded) = self.finish(conn, buffer);
         let sent = match sent {
@@ -218,6 +227,7 @@ impl PacketBuilder {
         let packet = SentPacket {
             largest_acked: sent.largest_acked,
             time_sent: now,
+            sample_pn,
             size,
             ack_eliciting,
             retransmits: sent.retransmits,

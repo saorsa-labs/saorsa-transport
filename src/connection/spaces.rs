@@ -288,6 +288,11 @@ impl IndexMut<SpaceId> for [PacketSpace; 3] {
 pub(super) struct SentPacket {
     /// The time the packet was sent.
     pub(super) time_sent: Instant,
+    /// Connection-wide monotonic "sample" packet number (see
+    /// [`Connection::next_sample_pn`]). Used only as the key fed to the
+    /// congestion controller so that per-packet CC algorithms (BBRv2)
+    /// see a strictly increasing sequence across Initial/Handshake/Data.
+    pub(super) sample_pn: u64,
     /// The number of bytes sent in the packet, not including UDP or IP overhead, but including QUIC
     /// framing overhead. Zero if this packet is not counted towards congestion control, i.e. not an
     /// "in flight" packet.

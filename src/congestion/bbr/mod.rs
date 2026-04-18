@@ -10,7 +10,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use rand::{Rng, SeedableRng};
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::congestion::ControllerMetrics;
 use crate::congestion::bbr::bw_estimation::BandwidthEstimation;
@@ -51,9 +51,12 @@ pub(crate) struct Bbr {
     min_cwnd: u64,
     prev_in_flight_count: u64,
     exit_probe_rtt_at: Option<Instant>,
-    probe_rtt_last_started_at: Option<Instant>,
     min_rtt: Duration,
-    exiting_quiescence: bool,
+    /// Time at which `min_rtt` was last improved. Used to detect when the
+    /// stored minimum is stale (> `K_MIN_RTT_EXPIRY` without improvement),
+    /// which is the trigger for entering ProbeRtt. `None` until we record
+    /// the first RTT sample. Mirrors Chromium's `min_rtt_timestamp_`.
+    min_rtt_timestamp: Option<Instant>,
     pacing_rate: u64,
     max_acked_packet_number: u64,
     max_sent_packet_number: u64,
@@ -84,17 +87,18 @@ impl Bbr {
             pacing_gain: K_DEFAULT_HIGH_GAIN,
             high_gain: K_DEFAULT_HIGH_GAIN,
             drain_gain: 1.0 / K_DEFAULT_HIGH_GAIN,
-            cwnd_gain: K_DEFAULT_HIGH_GAIN,
-            high_cwnd_gain: K_DEFAULT_HIGH_GAIN,
+            // Startup/Drain cwnd_gain per Chromium's BBRv1: kDerivedHighCWNDGain (2.0).
+            // Not K_DEFAULT_HIGH_GAIN — that's the *pacing* gain.
+            cwnd_gain: K_DERIVED_HIGH_CWNDGAIN,
+            high_cwnd_gain: K_DERIVED_HIGH_CWNDGAIN,
             last_cycle_start: None,
             current_cycle_offset: 0,
             init_cwnd: initial_window,
             min_cwnd: calculate_min_window(current_mtu as u64),
             prev_in_flight_count: 0,
             exit_probe_rtt_at: None,
-            probe_rtt_last_started_at: None,
             min_rtt: Default::default(),
-            exiting_quiescence: false,
+            min_rtt_timestamp: None,
             pacing_rate: 0,
             max_acked_packet_number: 0,
             max_sent_packet_number: 0,
@@ -217,15 +221,25 @@ impl Bbr {
         }
     }
 
+    /// Has the stored `min_rtt` become stale? True when we have a recorded
+    /// sample and more than `K_MIN_RTT_EXPIRY` has elapsed since it was
+    /// last improved.
+    ///
+    /// Mirrors Chromium's `min_rtt_ != 0 && now > min_rtt_timestamp_ +
+    /// kMinRttExpiry`. The `app_limited` guard prevents stale-min_rtt checks
+    /// while we're not actively filling the pipe (rtt measurements would be
+    /// noisy in that regime).
     fn is_min_rtt_expired(&self, now: Instant, app_limited: bool) -> bool {
-        !app_limited
-            && self
-                .probe_rtt_last_started_at
-                .map(|last| now.saturating_duration_since(last) > Duration::from_secs(10))
-                .unwrap_or(true)
+        if app_limited {
+            return false;
+        }
+        let Some(timestamp) = self.min_rtt_timestamp else {
+            // No RTT sample yet: nothing to probe for.
+            return false;
+        };
+        now.saturating_duration_since(timestamp) > K_MIN_RTT_EXPIRY
     }
 
-    #[allow(clippy::panic)]
     fn maybe_enter_or_exit_probe_rtt(
         &mut self,
         now: Instant,
@@ -234,13 +248,16 @@ impl Bbr {
         app_limited: bool,
     ) {
         let min_rtt_expired = self.is_min_rtt_expired(now, app_limited);
-        if min_rtt_expired && !self.exiting_quiescence && self.mode != Mode::ProbeRtt {
+        if min_rtt_expired && self.mode != Mode::ProbeRtt {
             self.mode = Mode::ProbeRtt;
             self.pacing_gain = 1.0;
             // Do not decide on the time to exit ProbeRtt until the
             // |bytes_in_flight| is at the target small value.
             self.exit_probe_rtt_at = None;
-            self.probe_rtt_last_started_at = Some(now);
+            // Reset the min_rtt timestamp to `now` so that probing restarts
+            // the 10-second clock — the ProbeRtt we just entered *is* the
+            // probe, so we don't want to re-enter it on the very next ACK.
+            self.min_rtt_timestamp = Some(now);
         }
 
         if self.mode == Mode::ProbeRtt {
@@ -250,27 +267,20 @@ impl Bbr {
                 // kMinimumCongestionWindow, but we allow an extra packet since QUIC
                 // checks CWND before sending a packet.
                 if bytes_in_flight < self.get_probe_rtt_cwnd() + self.current_mtu {
-                    const K_PROBE_RTT_TIME: Duration = Duration::from_millis(200);
                     self.exit_probe_rtt_at = Some(now + K_PROBE_RTT_TIME);
                 }
             } else if is_round_start {
-                match self.exit_probe_rtt_at {
-                    Some(exit_at) if now >= exit_at => {
+                if let Some(exit_at) = self.exit_probe_rtt_at {
+                    if now >= exit_at {
                         if !self.is_at_full_bandwidth {
                             self.enter_startup_mode();
                         } else {
                             self.enter_probe_bandwidth_mode(now);
                         }
                     }
-                    Some(_) => {}
-                    None => {
-                        warn!("Probe RTT exit time missing while in ProbeRtt mode");
-                    }
                 }
             }
         }
-
-        self.exiting_quiescence = false;
     }
 
     fn get_target_cwnd(&self, gain: f32) -> u64 {
@@ -414,7 +424,13 @@ impl Bbr {
 }
 
 impl Controller for Bbr {
-    fn on_sent(&mut self, now: Instant, bytes: u64, last_packet_number: u64) {
+    fn on_sent(
+        &mut self,
+        now: Instant,
+        bytes: u64,
+        last_packet_number: u64,
+        _is_retransmissible: bool,
+    ) {
         self.max_sent_packet_number = last_packet_number;
         self.max_bandwidth.on_sent(now, bytes);
     }
@@ -426,12 +442,22 @@ impl Controller for Bbr {
         bytes: u64,
         app_limited: bool,
         rtt: &RttEstimator,
+        _pn: u64,
     ) {
         self.max_bandwidth
             .on_ack(now, sent, bytes, self.round_count, app_limited);
         self.acked_bytes += bytes;
-        if self.is_min_rtt_expired(now, app_limited) || self.min_rtt > rtt.min() {
-            self.min_rtt = rtt.min();
+        // Record a new minimum RTT only when the sample is lower than the
+        // stored minimum (or this is the very first sample). Do *not*
+        // refresh the timestamp on equal/higher samples, because the
+        // stale-min_rtt timestamp is exactly what triggers ProbeRtt re-entry
+        // (`is_min_rtt_expired` in `on_end_acks`). Chromium handles path-
+        // change recovery via ProbeRtt's own 200 ms drain, which discovers
+        // the new min on the next ACK with a lower sample.
+        let sample = rtt.min();
+        if self.min_rtt_timestamp.is_none() || sample < self.min_rtt {
+            self.min_rtt = sample;
+            self.min_rtt_timestamp = Some(now);
         }
     }
 
@@ -559,13 +585,7 @@ impl Default for BbrConfig {
 }
 
 impl ControllerFactory for BbrConfig {
-    fn new_controller(
-        &self,
-        min_window: u64,
-        _max_window: u64,
-        _now: Instant,
-    ) -> Box<dyn Controller + Send + Sync> {
-        let current_mtu = (min_window / 4).max(1200).min(65535) as u16; // Derive MTU from min_window
+    fn new_controller(&self, current_mtu: u16, _now: Instant) -> Box<dyn Controller + Send + Sync> {
         Box::new(Bbr::new(Arc::new(self.clone()), current_mtu))
     }
 }
@@ -677,3 +697,170 @@ const K_MAX_INITIAL_CONGESTION_WINDOW: u64 = 200;
 
 const PROBE_RTT_BASED_ON_BDP: bool = true;
 const DRAIN_TO_TARGET: bool = true;
+
+/// Maximum time we keep a stored `min_rtt` before considering it stale and
+/// entering ProbeRtt to rediscover the path's propagation delay. Matches
+/// Chromium's `kMinRttExpiry`.
+const K_MIN_RTT_EXPIRY: Duration = Duration::from_secs(10);
+
+/// Duration of the ProbeRtt phase: long enough for ack trains to drain the
+/// queue and reveal the true propagation delay. Matches Chromium's
+/// `kProbeRttTime`.
+const K_PROBE_RTT_TIME: Duration = Duration::from_millis(200);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::congestion::{Controller, ControllerFactory};
+    use crate::connection::RttEstimator;
+
+    const TEST_MTU: u16 = 1200;
+
+    fn make_bbr() -> Bbr {
+        Bbr::new(Arc::new(BbrConfig::default()), TEST_MTU)
+    }
+
+    fn rtt_of(d: Duration) -> RttEstimator {
+        RttEstimator::new(d)
+    }
+
+    // ---- Fix 2.1: cwnd_gain in Startup/Drain is 2.0, not the pacing gain.
+
+    #[test]
+    fn startup_uses_derived_cwnd_gain() {
+        let bbr = make_bbr();
+        assert_eq!(bbr.mode, Mode::Startup);
+        assert!(
+            (bbr.pacing_gain - K_DEFAULT_HIGH_GAIN).abs() < f32::EPSILON,
+            "pacing_gain should be 2.885 (2/ln 2) in Startup"
+        );
+        assert!(
+            (bbr.cwnd_gain - K_DERIVED_HIGH_CWNDGAIN).abs() < f32::EPSILON,
+            "cwnd_gain should be 2.0 in Startup (Chromium kDerivedHighCWNDGain), \
+             not the high pacing gain"
+        );
+    }
+
+    // ---- Fix 2.2: no premature ProbeRtt entry.
+
+    #[test]
+    fn is_min_rtt_expired_is_false_before_first_sample() {
+        let bbr = make_bbr();
+        // No RTT sample yet: expiry check must not fire, even well past the
+        // 10-second window.
+        let future = Instant::now() + Duration::from_secs(60);
+        assert!(!bbr.is_min_rtt_expired(future, /* app_limited = */ false));
+    }
+
+    #[test]
+    fn first_ack_stays_in_startup() {
+        let mut bbr = make_bbr();
+        let t0 = Instant::now();
+        let rtt = rtt_of(Duration::from_millis(50));
+
+        bbr.on_sent(t0, 1200, 1, true);
+        bbr.on_ack(t0 + Duration::from_millis(50), t0, 1200, false, &rtt, 1);
+        bbr.on_end_acks(t0 + Duration::from_millis(50), 0, false, Some(1));
+
+        assert_eq!(
+            bbr.mode,
+            Mode::Startup,
+            "must not enter ProbeRtt on the first ACK — min_rtt_timestamp was just set"
+        );
+        assert!(
+            bbr.min_rtt_timestamp.is_some(),
+            "min_rtt timestamp must be recorded"
+        );
+        assert_eq!(bbr.min_rtt, Duration::from_millis(50));
+    }
+
+    // ---- The 10-second stale-min_rtt trigger.
+
+    #[test]
+    fn probe_rtt_fires_after_min_rtt_goes_stale() {
+        let mut bbr = make_bbr();
+        let t0 = Instant::now();
+        let rtt = rtt_of(Duration::from_millis(50));
+
+        // Establish a baseline min_rtt at t0.
+        bbr.on_sent(t0, 1200, 1, true);
+        bbr.on_ack(t0 + Duration::from_millis(50), t0, 1200, false, &rtt, 1);
+        bbr.on_end_acks(t0 + Duration::from_millis(50), 0, false, Some(1));
+        assert_eq!(bbr.mode, Mode::Startup);
+
+        // Jump 11 seconds into the future with an ACK that does *not* improve
+        // min_rtt. Expiry should trigger → ProbeRtt.
+        let t1 = t0 + K_MIN_RTT_EXPIRY + Duration::from_secs(1);
+        bbr.on_sent(t1, 1200, 2, true);
+        bbr.on_ack(t1, t1, 1200, false, &rtt, 2);
+        bbr.on_end_acks(t1, 0, false, Some(2));
+        assert_eq!(bbr.mode, Mode::ProbeRtt);
+    }
+
+    // ---- Startup → Drain → ProbeBw state-machine transitions.
+
+    #[test]
+    fn startup_exits_to_drain_on_full_bandwidth() {
+        // Force is_at_full_bandwidth and observe the Startup→Drain transition.
+        // Keep in_flight above the BDP target so the second branch (Drain→
+        // ProbeBw) doesn't fire in the same call.
+        let mut bbr = make_bbr();
+        bbr.is_at_full_bandwidth = true;
+
+        let high_in_flight = 10 * bbr.init_cwnd;
+        bbr.maybe_exit_startup_or_drain(Instant::now(), high_in_flight);
+        assert_eq!(bbr.mode, Mode::Drain);
+        assert!(
+            (bbr.pacing_gain - bbr.drain_gain).abs() < f32::EPSILON,
+            "drain must pace with drain_gain (~1/high_gain)"
+        );
+    }
+
+    #[test]
+    fn drain_transitions_to_probe_bw_when_inflight_drains() {
+        let mut bbr = make_bbr();
+        bbr.is_at_full_bandwidth = true;
+        let high_in_flight = 10 * bbr.init_cwnd;
+        bbr.maybe_exit_startup_or_drain(Instant::now(), high_in_flight);
+        assert_eq!(bbr.mode, Mode::Drain);
+
+        // in_flight <= BDP: drain is complete.
+        bbr.maybe_exit_startup_or_drain(Instant::now(), 0);
+        assert_eq!(bbr.mode, Mode::ProbeBw);
+    }
+
+    // ---- Pacing rate reporting.
+
+    #[test]
+    fn pacing_rate_is_zero_before_first_bw_sample() {
+        let bbr = make_bbr();
+        assert_eq!(
+            bbr.metrics().pacing_rate,
+            Some(0),
+            "pacing_rate must be 0 before we've observed any bandwidth — \
+             the Pacer falls back to cwnd-based refill"
+        );
+    }
+
+    // ---- Factory wiring.
+
+    #[test]
+    fn factory_applies_current_mtu() {
+        let factory = BbrConfig::default();
+        let ctl = factory.new_controller(9000, Instant::now());
+        // min_window = 4 * MTU by `calculate_min_window`; initial_window is the
+        // configured default, floored at min_window after `on_mtu_update`.
+        assert!(ctl.initial_window() > 0);
+        assert!(ctl.window() >= 4 * 9000);
+    }
+
+    #[test]
+    fn factory_does_not_divide_min_window_for_mtu() {
+        // Regression for the `min_window / 4` derivation that used to pass a
+        // byte-count as MTU. If the factory still did this, passing
+        // current_mtu=1200 would be lost — the cwnd floor should reflect 1200,
+        // not whatever min_window/4 resolved to.
+        let ctl = BbrConfig::default().new_controller(1200, Instant::now());
+        assert!(ctl.window() >= 4 * 1200);
+    }
+}

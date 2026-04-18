@@ -220,6 +220,21 @@ pub struct Connection {
     /// Identifies Data-space packet numbers to skip. Not used in earlier spaces.
     packet_number_filter: PacketNumberFilter,
 
+    /// Connection-wide monotonic packet-number counter, used only as the
+    /// key fed to per-packet congestion controllers (e.g. BBRv2's
+    /// `BandwidthSampler`) whose invariant is "packet numbers increase
+    /// strictly over the lifetime of the controller".
+    ///
+    /// QUIC's wire packet numbers are per packet-number space and restart
+    /// at 0 for each space, so they cannot satisfy that invariant. This
+    /// counter is incremented once per transmitted packet across all
+    /// spaces and stored alongside the wire pn in each [`SentPacket`],
+    /// so ack/loss/neuter paths can translate back.
+    ///
+    /// Mirrors quiche's `Connection::next_pkt_num` (quiche/src/lib.rs),
+    /// on which the vendored BBRv2 code relies.
+    next_sample_pn: u64,
+
     //
     // Queued non-retransmittable 1-RTT data
     //
@@ -383,6 +398,8 @@ impl Connection {
             },
             #[cfg(not(test))]
             packet_number_filter: PacketNumberFilter::new(&mut rng),
+
+            next_sample_pn: 0,
 
             path_responses: PathResponses::default(),
             close: false,
@@ -1228,17 +1245,26 @@ impl Connection {
                 builder.pad_to(segment_size as u16);
             }
 
-            let last_packet_number = builder.exact_number;
+            let sample_pn = builder.sample_pn;
+            let ack_eliciting = builder.ack_eliciting;
             builder.finish_and_track(now, self, sent_frames, buf);
             self.path
                 .congestion
-                .on_sent(now, buf.len() as u64, last_packet_number);
+                .on_sent(now, buf.len() as u64, sample_pn, ack_eliciting);
 
             #[cfg(feature = "__qlog")]
             self.emit_qlog_recovery_metrics(now);
         }
 
         self.app_limited = buf.is_empty() && !congestion_blocked;
+        if self.app_limited {
+            // BBRv2 uses this hook to tag in-flight packets so bandwidth
+            // samples from the current app-limited window don't get
+            // mistaken for a bandwidth ceiling.
+            self.path
+                .congestion
+                .on_app_limited(self.path.in_flight.bytes);
+        }
 
         // Send MTU probe if necessary
         if buf.is_empty() && self.state.is_established() {
@@ -1845,6 +1871,15 @@ impl Connection {
         self.pqc_state.using_pqc
     }
 
+    /// Allocate the next connection-wide monotonic "sample" packet
+    /// number. Called once per transmitted packet. See
+    /// [`Connection::next_sample_pn`] for the rationale.
+    pub(super) fn allocate_sample_pn(&mut self) -> u64 {
+        let pn = self.next_sample_pn;
+        self.next_sample_pn += 1;
+        pn
+    }
+
     /// Update traffic keys spontaneously
     ///
     /// This can be useful for testing key updates, as they otherwise only happen infrequently.
@@ -2082,13 +2117,6 @@ impl Connection {
             }
         }
 
-        self.path.congestion.on_end_acks(
-            now,
-            self.path.in_flight.bytes,
-            self.app_limited,
-            self.spaces[space].largest_acked_packet,
-        );
-
         if new_largest && ack_eliciting_acked {
             let ack_delay = if space != SpaceId::Data {
                 Duration::from_micros(0)
@@ -2106,8 +2134,20 @@ impl Connection {
             }
         }
 
-        // Must be called before crypto/pto_count are clobbered
+        // Detect losses *before* on_end_acks so the controller sees a
+        // unified per-batch view: per-packet acks → per-packet losses
+        // (via `on_packet_lost`) → `on_congestion_event` → `on_end_acks`
+        // as the final "flush this batch" signal.
+        //
+        // Must be called before crypto/pto_count are clobbered.
         self.detect_lost_packets(now, space, true);
+
+        self.path.congestion.on_end_acks(
+            now,
+            self.path.in_flight.bytes,
+            self.app_limited,
+            self.spaces[space].largest_acked_packet,
+        );
 
         if self.peer_completed_address_validation() {
             self.pto_count = 0;
@@ -2175,6 +2215,7 @@ impl Connection {
                 info.size.into(),
                 self.app_limited,
                 &self.path.rtt,
+                info.sample_pn,
             );
         }
 
@@ -2329,6 +2370,14 @@ impl Connection {
 
             for &packet in &lost_packets {
                 let info = self.spaces[pn_space].take(packet).unwrap(); // safe: lost_packets is populated just above
+                // Feed per-packet loss info to the controller before the
+                // aggregate `on_congestion_event` — BBRv2's sampler needs
+                // (pn, bytes) to reach its per-packet state map.
+                if info.ack_eliciting {
+                    self.path
+                        .congestion
+                        .on_packet_lost(now, info.sample_pn, info.size.into());
+                }
                 self.remove_in_flight(packet, &info);
                 for frame in info.stream_frames {
                     self.streams.retransmit(frame);
@@ -2786,6 +2835,10 @@ impl Connection {
         space.in_flight = 0;
         let sent_packets = mem::take(&mut space.sent_packets);
         for (pn, packet) in sent_packets.into_iter() {
+            // Neuter the packet in the congestion controller too — BBRv2's
+            // per-packet sampler would otherwise keep the send-time state
+            // around indefinitely as a zombie entry.
+            self.path.congestion.on_packet_neutered(packet.sample_pn);
             self.remove_in_flight(pn, &packet);
         }
         self.set_loss_detection_timer(now)

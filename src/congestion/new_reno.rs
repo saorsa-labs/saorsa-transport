@@ -58,6 +58,7 @@ impl Controller for NewReno {
         bytes: u64,
         app_limited: bool,
         _rtt: &RttEstimator,
+        _pn: u64,
     ) {
         if app_limited || sent <= self.recovery_start_time {
             return;
@@ -179,13 +180,7 @@ impl Default for NewRenoConfig {
 }
 
 impl ControllerFactory for NewRenoConfig {
-    fn new_controller(
-        &self,
-        min_window: u64,
-        _max_window: u64,
-        now: Instant,
-    ) -> Box<dyn Controller + Send + Sync> {
-        let current_mtu = (min_window / 4).max(1200).min(65535) as u16; // Derive MTU from min_window
+    fn new_controller(&self, current_mtu: u16, now: Instant) -> Box<dyn Controller + Send + Sync> {
         Box::new(NewReno::new(Arc::new(self.clone()), now, current_mtu))
     }
 }

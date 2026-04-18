@@ -394,21 +394,27 @@ pub struct NatTraversalEndpoint {
 
 /// Congestion control algorithm used by the underlying QUIC transport.
 ///
-/// BBR is the default: its rate-based pacing (wired through
-/// [`crate::connection::pacing::Pacer`]) and BDP-sized congestion window
-/// fill high-BDP paths — notably MASQUE relay hops — that CUBIC's
-/// loss-based recovery leaves under-used. CUBIC remains available as a
-/// more conservative, widely-deployed fallback.
+/// BBRv2 is the default: its per-packet delivery-rate sampler, loss-aware
+/// startup exit, and short-term `inflight_hi`/`inflight_lo` caps handle
+/// lossy paths and shared bottlenecks better than BBRv1, while preserving
+/// BBR's rate-based pacing (wired through [`crate::connection::pacing::Pacer`])
+/// and BDP-sized congestion window that fill high-BDP paths like MASQUE
+/// relay hops. CUBIC remains available as a conservative fallback, and
+/// BBRv1 is kept for comparison / debugging.
 ///
-/// Default: [`CongestionAlgorithm::Bbr`].
+/// Default: [`CongestionAlgorithm::Bbr2`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CongestionAlgorithm {
     /// Loss-based CUBIC congestion control (RFC 8312).
     Cubic,
-    /// Model-based BBR congestion control. Default.
-    #[default]
+    /// Model-based BBR congestion control (BBRv1).
     Bbr,
+    /// BBRv2 with per-packet delivery rate sampling, loss-aware
+    /// startup exit, and short-term `inflight_hi`/`inflight_lo` caps.
+    /// Ported from Cloudflare quiche. **Default.**
+    #[default]
+    Bbr2,
 }
 
 /// Configuration for NAT traversal behavior
@@ -577,12 +583,13 @@ pub struct NatTraversalConfig {
 
     /// Congestion control algorithm used by the underlying QUIC transport.
     ///
-    /// See [`CongestionAlgorithm`]. BBR is the default — it paces at the
+    /// See [`CongestionAlgorithm`]. BBRv2 is the default — it paces at the
     /// estimated bottleneck rate and sizes the window around the BDP,
     /// which fills MASQUE relay hops and cross-region links that CUBIC's
-    /// loss-based recovery leaves under-used.
+    /// loss-based recovery leaves under-used, while handling lossy paths
+    /// and shared bottlenecks more gracefully than BBRv1.
     ///
-    /// Default: [`CongestionAlgorithm::Bbr`].
+    /// Default: [`CongestionAlgorithm::Bbr2`].
     #[serde(default)]
     pub congestion_algorithm: CongestionAlgorithm,
 }
@@ -606,6 +613,7 @@ fn default_max_message_size() -> usize {
 fn build_congestion_factory(
     algorithm: CongestionAlgorithm,
     initial_window: u64,
+    initial_rtt: std::time::Duration,
 ) -> Arc<dyn crate::congestion::ControllerFactory + Send + Sync> {
     match algorithm {
         CongestionAlgorithm::Cubic => {
@@ -616,6 +624,12 @@ fn build_congestion_factory(
         CongestionAlgorithm::Bbr => {
             let mut cc = crate::congestion::BbrConfig::default();
             cc.initial_window(initial_window);
+            Arc::new(cc)
+        }
+        CongestionAlgorithm::Bbr2 => {
+            let mut cc = crate::congestion::Bbr2Config::default();
+            cc.initial_window(initial_window);
+            cc.initial_rtt(initial_rtt);
             Arc::new(cc)
         }
     }
@@ -2776,6 +2790,7 @@ impl NatTraversalEndpoint {
             transport_config.congestion_controller_factory(build_congestion_factory(
                 config.congestion_algorithm,
                 INITIAL_CONGESTION_WINDOW,
+                transport_config.initial_rtt,
             ));
 
             // v0.13.0+: All nodes use ServerSupport for full P2P capabilities
@@ -2856,6 +2871,7 @@ impl NatTraversalEndpoint {
             transport_config.congestion_controller_factory(build_congestion_factory(
                 config.congestion_algorithm,
                 config.max_message_size as u64,
+                transport_config.initial_rtt,
             ));
 
             // v0.13.0+: All nodes use ServerSupport for full P2P capabilities
@@ -7377,9 +7393,9 @@ mod tests {
     }
 
     #[test]
-    fn test_congestion_algorithm_default_is_bbr() {
+    fn test_congestion_algorithm_default_is_bbr2() {
         let config = NatTraversalConfig::default();
-        assert_eq!(config.congestion_algorithm, CongestionAlgorithm::Bbr);
+        assert_eq!(config.congestion_algorithm, CongestionAlgorithm::Bbr2);
     }
 
     #[test]
@@ -7400,19 +7416,22 @@ mod tests {
 
     #[test]
     fn test_build_congestion_factory_produces_distinct_controllers() {
-        // Smoke test: both algorithms produce a valid controller that can be
-        // instantiated and reports an initial window. We don't inspect internal
-        // state — we just verify the factory path wires through for both.
+        // Smoke test: each algorithm produces a valid controller that can
+        // be instantiated and reports an initial window.
         const WINDOW: u64 = 1024 * 1024;
-        const MIN_WINDOW: u64 = 2400;
-        const MAX_WINDOW: u64 = u64::MAX;
+        const MTU: u16 = 1200;
+        let rtt = std::time::Duration::from_millis(100);
 
-        let cubic_factory = build_congestion_factory(CongestionAlgorithm::Cubic, WINDOW);
-        let cubic = cubic_factory.new_controller(MIN_WINDOW, MAX_WINDOW, std::time::Instant::now());
-        assert!(cubic.initial_window() >= MIN_WINDOW);
+        let cubic_factory = build_congestion_factory(CongestionAlgorithm::Cubic, WINDOW, rtt);
+        let cubic = cubic_factory.new_controller(MTU, std::time::Instant::now());
+        assert!(cubic.initial_window() >= 2 * MTU as u64);
 
-        let bbr_factory = build_congestion_factory(CongestionAlgorithm::Bbr, WINDOW);
-        let bbr = bbr_factory.new_controller(MIN_WINDOW, MAX_WINDOW, std::time::Instant::now());
-        assert!(bbr.initial_window() >= MIN_WINDOW);
+        let bbr_factory = build_congestion_factory(CongestionAlgorithm::Bbr, WINDOW, rtt);
+        let bbr = bbr_factory.new_controller(MTU, std::time::Instant::now());
+        assert!(bbr.initial_window() >= 2 * MTU as u64);
+
+        let bbr2_factory = build_congestion_factory(CongestionAlgorithm::Bbr2, WINDOW, rtt);
+        let bbr2 = bbr2_factory.new_controller(MTU, std::time::Instant::now());
+        assert!(bbr2.initial_window() >= 2 * MTU as u64);
     }
 }

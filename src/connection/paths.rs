@@ -71,11 +71,9 @@ impl PathData {
         now: Instant,
         config: &TransportConfig,
     ) -> Self {
-        let congestion = config.congestion_controller_factory.new_controller(
-            config.get_initial_mtu() as u64,
-            16 * 1024 * 1024,
-            now,
-        );
+        let congestion = config
+            .congestion_controller_factory
+            .new_controller(config.get_initial_mtu(), now);
         Self {
             remote,
             rtt: RttEstimator::new(config.initial_rtt),
@@ -157,11 +155,9 @@ impl PathData {
     /// This is useful when it is known the underlying path has changed.
     pub(super) fn reset(&mut self, now: Instant, config: &TransportConfig) {
         self.rtt = RttEstimator::new(config.initial_rtt);
-        self.congestion = config.congestion_controller_factory.new_controller(
-            config.get_initial_mtu() as u64,
-            16 * 1024 * 1024,
-            now,
-        );
+        self.congestion = config
+            .congestion_controller_factory
+            .new_controller(config.get_initial_mtu(), now);
         self.mtud.reset(config.get_initial_mtu(), config.min_mtu);
         self.address_info = PathAddressInfo::new(); // Reset address info
         // Reset tokens but preserve rate
@@ -354,7 +350,7 @@ pub struct RttEstimator {
 }
 
 impl RttEstimator {
-    fn new(initial_rtt: Duration) -> Self {
+    pub(crate) fn new(initial_rtt: Duration) -> Self {
         Self {
             latest: initial_rtt,
             smoothed: None,

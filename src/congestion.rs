@@ -15,11 +15,13 @@ use std::time::Instant;
 
 // Re-export the congestion control implementations
 pub(crate) mod bbr;
+pub(crate) mod bbr2;
 pub(crate) mod cubic;
 pub(crate) mod new_reno;
 
 // Re-export commonly used types
 pub(crate) use self::bbr::BbrConfig;
+pub(crate) use self::bbr2::Bbr2Config;
 pub(crate) use self::cubic::CubicConfig;
 // pub use self::new_reno::{NewReno as NewRenoFull, NewRenoConfig};
 
@@ -36,12 +38,23 @@ pub struct ControllerMetrics {
 
 /// Congestion controller interface
 pub trait Controller: Send + Sync {
-    /// Called when a packet is sent
-    fn on_sent(&mut self, now: Instant, bytes: u64, last_packet_number: u64) {
-        let _ = (now, bytes, last_packet_number);
+    /// Called when a packet is sent. `is_retransmissible` is `true` iff the
+    /// packet carries congestion-controlled data (ack-eliciting); BBRv2's
+    /// sampler uses this flag to decide whether to track the packet for
+    /// delivery-rate sampling.
+    fn on_sent(
+        &mut self,
+        now: Instant,
+        bytes: u64,
+        last_packet_number: u64,
+        is_retransmissible: bool,
+    ) {
+        let _ = (now, bytes, last_packet_number, is_retransmissible);
     }
 
-    /// Called when a packet is acknowledged
+    /// Called when a packet is acknowledged. `pn` is the real packet
+    /// number — BBRv2's `BandwidthSampler` uses it to look up per-packet
+    /// send-time state in its `ConnectionStateMap`.
     fn on_ack(
         &mut self,
         now: Instant,
@@ -49,7 +62,30 @@ pub trait Controller: Send + Sync {
         bytes: u64,
         app_limited: bool,
         rtt: &RttEstimator,
+        pn: u64,
     );
+
+    /// Called once per lost packet, **before** the aggregate
+    /// [`Controller::on_congestion_event`] call. BBRv2 needs per-packet
+    /// `(pn, bytes)` to feed its sampler's loss path; BBRv1/CUBIC/NewReno
+    /// ignore this signal (default no-op).
+    fn on_packet_lost(&mut self, now: Instant, pn: u64, bytes: u64) {
+        let _ = (now, pn, bytes);
+    }
+
+    /// Signal that the sender has run out of data to send (app-limited).
+    /// BBRv2 uses this to tag in-flight packets so bandwidth samples
+    /// don't mistake the throughput dip for a bandwidth ceiling.
+    fn on_app_limited(&mut self, bytes_in_flight: u64) {
+        let _ = bytes_in_flight;
+    }
+
+    /// A packet that was in flight has been "neutered" — its protection
+    /// keys have been discarded, so it can neither be acked nor
+    /// retransmitted. BBRv2 removes it from its sampler state map.
+    fn on_packet_neutered(&mut self, pn: u64) {
+        let _ = pn;
+    }
 
     /// Called when the known in-flight packet count has decreased (should be called exactly once per on_ack_received)
     fn on_end_acks(
@@ -152,6 +188,7 @@ impl Controller for NewReno {
         bytes: u64,
         app_limited: bool,
         _rtt: &RttEstimator,
+        _pn: u64,
     ) {
         if app_limited || sent <= self.recovery_start_time {
             return;
@@ -220,11 +257,7 @@ impl Controller for NewReno {
 
 /// Factory trait for creating congestion controllers
 pub trait ControllerFactory: Send + Sync {
-    /// Create a new controller instance
-    fn new_controller(
-        &self,
-        min_window: u64,
-        max_window: u64,
-        now: Instant,
-    ) -> Box<dyn Controller + Send + Sync>;
+    /// Create a new controller instance for a path whose current MTU is
+    /// `current_mtu` bytes.
+    fn new_controller(&self, current_mtu: u16, now: Instant) -> Box<dyn Controller + Send + Sync>;
 }
