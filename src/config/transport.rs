@@ -329,7 +329,7 @@ impl TransportConfig {
     /// use saorsa_transport::config::TransportConfig;
     ///
     /// let mut config = TransportConfig::default();
-    /// // The default uses CubicConfig, but custom implementations can be provided
+    /// // The default uses Bbr2Config, but custom implementations can be provided
     /// // by implementing the congestion::ControllerFactory trait
     /// ```
     pub fn congestion_controller_factory(
@@ -512,7 +512,7 @@ impl Default for TransportConfig {
             #[cfg(test)]
             deterministic_packet_numbers: false,
 
-            congestion_controller_factory: Arc::new(congestion::CubicConfig::default()),
+            congestion_controller_factory: Arc::new(congestion::Bbr2Config::default()),
 
             enable_segmentation_offload: true,
             nat_traversal_config: None,
