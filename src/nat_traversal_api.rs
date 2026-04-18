@@ -39,6 +39,76 @@ const MASQUE_RELAY_FULL_STATUS: u16 = 503;
 /// stalls don't block the accept loop.
 const HANDSHAKE_CHANNEL_CAPACITY: usize = 1024;
 
+/// Minimum number of *distinct* remote peers that must independently report
+/// the same observed external address before we treat it as our own and
+/// emit [`NatTraversalEvent::ExternalAddressDiscovered`] to upper layers.
+///
+/// A single observer is not trustworthy in two situations we hit in the
+/// saorsa testnet:
+///
+/// - **Per-observer ephemeral NAT mappings.** Under port-restricted cone
+///   NAT the external `(ip, port)` mapping is endpoint-independent in
+///   principle, but a stale conntrack entry or a MASQUE-relayed path can
+///   make the address a peer reports valid only for *that* peer's 5-tuple.
+///   Publishing it as a primary address sends every other node chasing a
+///   dead mapping.
+/// - **Ghost addresses from shared UDP sockets.** When a node dials out
+///   through several coordinators, a buggy observer can report back the
+///   coordinator's IP instead of our own. Droplet 11 in the testnet was
+///   pinning droplet 4's public IP this way — six times out of ten.
+///
+/// Requiring two independent observers filters both cases. A symmetric NAT
+/// deployment will never clear the gate (each observer sees a different
+/// port), which is correct: a symmetric mapping is *not* a publishable
+/// primary address. For port-restricted and fuller-cone NATs the gate
+/// lets the real address through on the second observation.
+const MIN_OBSERVERS_FOR_QUORUM: usize = 2;
+
+/// Outcome of recording a single observation against the external-address
+/// quorum tracker used by [`NatTraversalEndpoint::poll_discovery`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct QuorumCheck {
+    /// `true` iff this observer had not previously reported this address.
+    new_observer: bool,
+    /// How many distinct observers have now reported this address.
+    observer_count: usize,
+    /// `true` iff `observer_count >= MIN_OBSERVERS_FOR_QUORUM`.
+    quorum_reached: bool,
+    /// `true` only on the transition from below-quorum to at-quorum. The
+    /// caller should emit `ExternalAddressDiscovered` exactly when this is
+    /// set; subsequent observers of an already-promoted address leave this
+    /// `false`.
+    promote_now: bool,
+}
+
+/// Record `observer` against `addr` and decide whether the address has just
+/// crossed the quorum threshold for the first time.
+///
+/// Pure over `(observers_per_address, promoted_addresses)`: no I/O, no time.
+/// Split out of `poll_discovery` so the quorum rule is unit-testable without
+/// spinning a full QUIC endpoint.
+fn record_observer_and_check_quorum(
+    observers_per_address: &mut std::collections::HashMap<
+        SocketAddr,
+        std::collections::HashSet<SocketAddr>,
+    >,
+    promoted_addresses: &mut std::collections::HashSet<SocketAddr>,
+    addr: SocketAddr,
+    observer: SocketAddr,
+) -> QuorumCheck {
+    let observers = observers_per_address.entry(addr).or_default();
+    let new_observer = observers.insert(observer);
+    let observer_count = observers.len();
+    let quorum_reached = observer_count >= MIN_OBSERVERS_FOR_QUORUM;
+    let promote_now = quorum_reached && promoted_addresses.insert(addr);
+    QuorumCheck {
+        new_observer,
+        observer_count,
+        quorum_reached,
+        promote_now,
+    }
+}
+
 /// Creates a bind address that allows the OS to select a random available port
 ///
 /// This provides protocol obfuscation by preventing port fingerprinting, which improves
@@ -3267,7 +3337,19 @@ impl NatTraversalEndpoint {
         use tokio::time::{Duration, interval};
 
         let mut poll_interval = interval(Duration::from_secs(1));
-        let mut emitted_discovery = std::collections::HashSet::new();
+        // Per-observed-address set of distinct remotes that have reported it.
+        // We only promote an address to `ExternalAddressDiscovered` (and thus
+        // to `pin_direct` downstream) once it clears `MIN_OBSERVERS_FOR_QUORUM`
+        // distinct observers. See the constant's doc for why one observer is
+        // not enough.
+        let mut observers_per_address: std::collections::HashMap<
+            SocketAddr,
+            std::collections::HashSet<SocketAddr>,
+        > = std::collections::HashMap::new();
+        // Addresses that have already crossed the quorum threshold and for
+        // which we have fired `ExternalAddressDiscovered`. Prevents re-firing
+        // as further observers pile in.
+        let mut promoted_addresses = std::collections::HashSet::<SocketAddr>::new();
         // Track addresses we've already advertised to avoid spamming
         let mut advertised_addresses = std::collections::HashSet::new();
         // Unique QUIC-observed addresses already registered with the local
@@ -3302,11 +3384,30 @@ impl NatTraversalEndpoint {
                     observed
                 );
                 if let Some(observed_addr) = observed {
-                    // Emit event if this is the first time this remote reported this address
-                    if emitted_discovery.insert((remote_addr, observed_addr)) {
+                    // Record this observer against the observed address and
+                    // only promote once a quorum of distinct remotes have
+                    // independently reported it. See MIN_OBSERVERS_FOR_QUORUM.
+                    let check = record_observer_and_check_quorum(
+                        &mut observers_per_address,
+                        &mut promoted_addresses,
+                        observed_addr,
+                        remote_addr,
+                    );
+
+                    if check.new_observer && !check.quorum_reached {
+                        tracing::debug!(
+                            "poll_discovery_task: {} reported by {} ({}/{} observers, holding)",
+                            observed_addr,
+                            remote_addr,
+                            check.observer_count,
+                            MIN_OBSERVERS_FOR_QUORUM
+                        );
+                    }
+
+                    if check.promote_now {
                         info!(
-                            "poll_discovery_task: FOUND external address {} from remote {}",
-                            observed_addr, remote_addr
+                            "poll_discovery_task: FOUND external address {} (confirmed by {} observers)",
+                            observed_addr, check.observer_count
                         );
                         let event = NatTraversalEvent::ExternalAddressDiscovered {
                             reported_by: conn.remote_address(),
@@ -3392,21 +3493,48 @@ impl NatTraversalEndpoint {
                     } => {
                         debug!("{}", event);
 
-                        // Notify that our external address was discovered
-                        let _ = event_tx.send(NatTraversalEvent::ExternalAddressDiscovered {
-                            reported_by: *bootstrap_node,
-                            address: candidate.address,
-                        });
+                        // Count the bootstrap node as an observer of this
+                        // reflexive candidate. A STUN-style discovery from a
+                        // single bootstrap has the same reliability problem
+                        // as a single QUIC OBSERVED_ADDRESS frame, so gate
+                        // the emission behind the same quorum.
+                        let check = record_observer_and_check_quorum(
+                            &mut observers_per_address,
+                            &mut promoted_addresses,
+                            candidate.address,
+                            *bootstrap_node,
+                        );
 
-                        // Send ADD_ADDRESS frame to all connected peers so they know
-                        // how to reach us (critical for CGNAT hole punching).
-                        // Outbound-only clients skip this to avoid inbound dials.
-                        if advertise_external_addresses {
-                            broadcast_address_to_peers(
-                                &connections,
+                        if check.new_observer && !check.quorum_reached {
+                            tracing::debug!(
+                                "poll_discovery_task: reflexive candidate {} reported by bootstrap {} ({}/{} observers, holding)",
                                 candidate.address,
-                                candidate.priority,
+                                bootstrap_node,
+                                check.observer_count,
+                                MIN_OBSERVERS_FOR_QUORUM
                             );
+                        }
+
+                        if check.promote_now {
+                            info!(
+                                "poll_discovery_task: FOUND external address {} (confirmed by {} observers, reflexive)",
+                                candidate.address, check.observer_count
+                            );
+                            let _ = event_tx.send(NatTraversalEvent::ExternalAddressDiscovered {
+                                reported_by: *bootstrap_node,
+                                address: candidate.address,
+                            });
+
+                            // Send ADD_ADDRESS frame to all connected peers so they know
+                            // how to reach us (critical for CGNAT hole punching).
+                            // Outbound-only clients skip this to avoid inbound dials.
+                            if advertise_external_addresses {
+                                broadcast_address_to_peers(
+                                    &connections,
+                                    candidate.address,
+                                    candidate.priority,
+                                );
+                            }
                         }
                     }
                     DiscoveryEvent::DiscoveryCompleted { .. } => {
@@ -7433,5 +7561,113 @@ mod tests {
         let bbr2_factory = build_congestion_factory(CongestionAlgorithm::Bbr2, WINDOW, rtt);
         let bbr2 = bbr2_factory.new_controller(MTU, std::time::Instant::now());
         assert!(bbr2.initial_window() >= 2 * MTU as u64);
+    }
+
+    // ------------------------------------------------------------------
+    // External-address quorum gate
+    // ------------------------------------------------------------------
+
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn quorum_single_observer_does_not_promote() {
+        let mut observers = std::collections::HashMap::new();
+        let mut promoted = std::collections::HashSet::new();
+        let external = addr("203.0.113.10:40000");
+        let observer_a = addr("198.51.100.1:10000");
+
+        let check =
+            record_observer_and_check_quorum(&mut observers, &mut promoted, external, observer_a);
+
+        assert!(check.new_observer);
+        assert_eq!(check.observer_count, 1);
+        assert!(!check.quorum_reached);
+        assert!(!check.promote_now);
+        assert!(promoted.is_empty(), "address must not be promoted yet");
+    }
+
+    #[test]
+    fn quorum_second_distinct_observer_promotes_exactly_once() {
+        let mut observers = std::collections::HashMap::new();
+        let mut promoted = std::collections::HashSet::new();
+        let external = addr("203.0.113.10:40000");
+        let observer_a = addr("198.51.100.1:10000");
+        let observer_b = addr("198.51.100.2:10000");
+        let observer_c = addr("198.51.100.3:10000");
+
+        let first =
+            record_observer_and_check_quorum(&mut observers, &mut promoted, external, observer_a);
+        assert!(!first.promote_now);
+
+        let second =
+            record_observer_and_check_quorum(&mut observers, &mut promoted, external, observer_b);
+        assert!(second.new_observer);
+        assert_eq!(second.observer_count, 2);
+        assert!(second.quorum_reached);
+        assert!(
+            second.promote_now,
+            "second distinct observer should promote"
+        );
+
+        // Additional observers confirm the same address but must not
+        // re-promote — callers would fire duplicate events otherwise.
+        let third =
+            record_observer_and_check_quorum(&mut observers, &mut promoted, external, observer_c);
+        assert!(third.new_observer);
+        assert!(third.quorum_reached);
+        assert!(
+            !third.promote_now,
+            "already-promoted address must not re-promote"
+        );
+    }
+
+    #[test]
+    fn quorum_same_observer_reporting_twice_does_not_cross_gate() {
+        let mut observers = std::collections::HashMap::new();
+        let mut promoted = std::collections::HashSet::new();
+        let external = addr("203.0.113.10:40000");
+        let observer_a = addr("198.51.100.1:10000");
+
+        let first =
+            record_observer_and_check_quorum(&mut observers, &mut promoted, external, observer_a);
+        assert!(first.new_observer);
+        assert!(!first.promote_now);
+
+        // Same observer reporting again: poll_discovery iterates every
+        // second, so the same (remote, observed_addr) pair is seen many
+        // times and MUST NOT be mistaken for a second independent observer.
+        let repeat =
+            record_observer_and_check_quorum(&mut observers, &mut promoted, external, observer_a);
+        assert!(!repeat.new_observer);
+        assert_eq!(repeat.observer_count, 1);
+        assert!(!repeat.quorum_reached);
+        assert!(!repeat.promote_now);
+    }
+
+    #[test]
+    fn quorum_is_per_address_not_global() {
+        let mut observers = std::collections::HashMap::new();
+        let mut promoted = std::collections::HashSet::new();
+        // A ghost (cross-droplet leak) reported by one peer, and the real
+        // address reported by a different peer. Neither should promote.
+        let ghost = addr("198.51.100.99:50750");
+        let real = addr("203.0.113.10:40000");
+        let observer_a = addr("198.51.100.1:10000");
+        let observer_b = addr("198.51.100.2:10000");
+
+        let g1 = record_observer_and_check_quorum(&mut observers, &mut promoted, ghost, observer_a);
+        let r1 = record_observer_and_check_quorum(&mut observers, &mut promoted, real, observer_b);
+        assert!(!g1.promote_now, "ghost with one observer must not promote");
+        assert!(!r1.promote_now, "real with one observer must not promote");
+        assert!(promoted.is_empty());
+
+        // A second observer confirms only the real address. Ghost remains
+        // unpromoted; real crosses the gate.
+        let r2 = record_observer_and_check_quorum(&mut observers, &mut promoted, real, observer_a);
+        assert!(r2.promote_now);
+        assert!(promoted.contains(&real));
+        assert!(!promoted.contains(&ghost));
     }
 }
