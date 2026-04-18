@@ -3396,12 +3396,25 @@ impl NatTraversalEndpoint {
 
                     if check.new_observer && !check.quorum_reached {
                         tracing::debug!(
-                            "poll_discovery_task: {} reported by {} ({}/{} observers, holding)",
+                            "poll_discovery_task: {} reported by {} ({}/{} observers, holding pin)",
                             observed_addr,
                             remote_addr,
                             check.observer_count,
                             MIN_OBSERVERS_FOR_QUORUM
                         );
+                    }
+
+                    // Broadcast ADD_ADDRESS on the *first* observer, not the
+                    // quorum cross. Rationale: peers need our external
+                    // address early to coordinate hole-punches back to us.
+                    // Gating broadcast on quorum starved the NAT-traversal
+                    // path (testnet: HolePunched dropped from 12 → 3) and
+                    // observably slowed uploads. Sending a speculative
+                    // ADD_ADDRESS for a not-yet-confirmed address is cheap:
+                    // the peer just pockets it as a candidate and learns
+                    // quickly whether it actually reaches us.
+                    if check.new_observer && advertised_addresses.insert(observed_addr) {
+                        new_addresses.push(observed_addr);
                     }
 
                     if check.promote_now {
@@ -3433,11 +3446,6 @@ impl NatTraversalEndpoint {
                                 let updated = SocketAddr::new(observed_addr.ip(), current.port());
                                 server.set_public_address(updated);
                             }
-                        }
-
-                        // Track this address for ADD_ADDRESS advertisement
-                        if advertised_addresses.insert(observed_addr) {
-                            new_addresses.push(observed_addr);
                         }
                     }
 
@@ -3496,8 +3504,8 @@ impl NatTraversalEndpoint {
                         // Count the bootstrap node as an observer of this
                         // reflexive candidate. A STUN-style discovery from a
                         // single bootstrap has the same reliability problem
-                        // as a single QUIC OBSERVED_ADDRESS frame, so gate
-                        // the emission behind the same quorum.
+                        // as a single QUIC OBSERVED_ADDRESS frame, so the
+                        // pin/publish path is gated behind the same quorum.
                         let check = record_observer_and_check_quorum(
                             &mut observers_per_address,
                             &mut promoted_addresses,
@@ -3507,11 +3515,23 @@ impl NatTraversalEndpoint {
 
                         if check.new_observer && !check.quorum_reached {
                             tracing::debug!(
-                                "poll_discovery_task: reflexive candidate {} reported by bootstrap {} ({}/{} observers, holding)",
+                                "poll_discovery_task: reflexive candidate {} reported by bootstrap {} ({}/{} observers, holding pin)",
                                 candidate.address,
                                 bootstrap_node,
                                 check.observer_count,
                                 MIN_OBSERVERS_FOR_QUORUM
+                            );
+                        }
+
+                        // Broadcast ADD_ADDRESS to connected peers on the
+                        // first observer so hole-punch coordination can
+                        // start before quorum. See the OBSERVED_ADDRESS
+                        // path above for the rationale.
+                        if check.new_observer && advertise_external_addresses {
+                            broadcast_address_to_peers(
+                                &connections,
+                                candidate.address,
+                                candidate.priority,
                             );
                         }
 
@@ -3524,17 +3544,6 @@ impl NatTraversalEndpoint {
                                 reported_by: *bootstrap_node,
                                 address: candidate.address,
                             });
-
-                            // Send ADD_ADDRESS frame to all connected peers so they know
-                            // how to reach us (critical for CGNAT hole punching).
-                            // Outbound-only clients skip this to avoid inbound dials.
-                            if advertise_external_addresses {
-                                broadcast_address_to_peers(
-                                    &connections,
-                                    candidate.address,
-                                    candidate.priority,
-                                );
-                            }
                         }
                     }
                     DiscoveryEvent::DiscoveryCompleted { .. } => {
