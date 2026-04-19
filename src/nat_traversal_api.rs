@@ -4227,16 +4227,49 @@ impl NatTraversalEndpoint {
 
         let remote_address = connection.remote_address();
 
-        // Only emit ConnectionEstablished if we haven't already for this address
-        // DashSet::insert returns true if this is a new address (not already present)
-        let should_emit = self.emitted_established_events.insert(addr);
+        // Decide whether to emit ConnectionEstablished. The dedup set's
+        // intent is to suppress accept-path races that would double-emit
+        // for the *same* live connection — not to block reconnects to the
+        // same address after the previous connection has died.
+        //
+        // Prior to this fix the set was checked by insert-only semantics
+        // and only cleared in `remove_connection`, which itself is
+        // conditional on `close_reason().is_some()`. A pathological but
+        // common flow left the entry indefinitely: connection dies without
+        // a close_reason (e.g. QUIC idle timeout without a frame),
+        // remove_connection early-returns without clearing, the next
+        // reconnect's spawn_connection_handler finds the stale entry and
+        // gets silently suppressed. On a clean 57-node testnet this suppression
+        // accounts for 57% of incoming connection events, each dropping
+        // the downstream identity-announce send.
+        //
+        // The fix: emit whenever either (a) the address is new to the dedup
+        // set, or (b) there is no currently-live connection at that
+        // address. Race windows produce at most a redundant emission,
+        // which downstream consumers (connection_lifecycle_monitor,
+        // identity-announce send, etc.) already handle idempotently via
+        // DashMap upserts.
+        let freshly_inserted = self.emitted_established_events.insert(addr);
+        let has_live_existing = self
+            .connections
+            .get(&addr)
+            .map(|entry| entry.value().close_reason().is_none())
+            .unwrap_or(false);
+        let should_emit = freshly_inserted || !has_live_existing;
 
         if should_emit {
             let public_key = Self::extract_public_key_from_connection(&connection);
-            info!(
-                "dedup-probe: ConnectionEstablished EMITTED for {} (side={:?}, method={:?})",
-                addr, side, traversal_method
-            );
+            if freshly_inserted {
+                info!(
+                    "dedup-probe: ConnectionEstablished EMITTED for {} (fresh; side={:?}, method={:?})",
+                    addr, side, traversal_method
+                );
+            } else {
+                info!(
+                    "dedup-probe: ConnectionEstablished EMITTED for {} (reconnect; side={:?}, method={:?})",
+                    addr, side, traversal_method
+                );
+            }
             let _ = event_tx.send(NatTraversalEvent::ConnectionEstablished {
                 remote_address,
                 side,
@@ -4245,13 +4278,12 @@ impl NatTraversalEndpoint {
             });
             self.incoming_notify.notify_one();
         } else {
-            // Every time this fires, the peer's downstream handlers
-            // (identity-announce send, ConnectionRouter registration, etc.)
-            // are skipped for this new connection object because their
-            // driver event never ran. Correlate with the client's
-            // identity-exchange-probe timeouts to confirm the causal chain.
-            warn!(
-                "dedup-probe: ConnectionEstablished SUPPRESSED for {} (addr already in emitted_events; side={:?}, method={:?})",
+            // True duplicate: an entry exists in the dedup set AND a live
+            // connection exists at this address. This is the accept-path
+            // race the dedup is designed to catch. Downgraded from warn
+            // because it's an expected legitimate dedup, not a bug hit.
+            debug!(
+                "dedup-probe: ConnectionEstablished SUPPRESSED for {} (live duplicate; side={:?}, method={:?})",
                 addr, side, traversal_method
             );
         }
