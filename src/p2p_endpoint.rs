@@ -2620,6 +2620,11 @@ impl P2pEndpoint {
                         "send: found hole-punched connection to {}, registering",
                         addr
                     );
+                    info!(
+                        "endpoint-send-probe: path=hole-punched-cache to {} ({} bytes)",
+                        addr,
+                        data.len()
+                    );
                     let peer_conn = PeerConnection {
                         public_key: None,
                         remote_addr: TransportAddr::Quic(*addr),
@@ -2638,6 +2643,16 @@ impl P2pEndpoint {
                     });
                     (TransportAddr::Quic(*addr), Some(conn))
                 } else {
+                    // Peer not found in either map. This is the path that
+                    // fires when an identity-announce is attempted for a
+                    // connection that's gone away between accept and send.
+                    // Surfacing at warn so diagnostic runs can count how
+                    // often this hits.
+                    warn!(
+                        "endpoint-send-probe: peer-not-found (no live connection) for {} ({} bytes attempted)",
+                        addr,
+                        data.len()
+                    );
                     return Err(EndpointError::PeerNotFound(*addr));
                 }
             }
@@ -2660,10 +2675,24 @@ impl P2pEndpoint {
                 let connection = if let Some(conn) = cached_connection {
                     conn
                 } else {
-                    self.inner
-                        .get_connection(addr)
-                        .map_err(EndpointError::NatTraversal)?
-                        .ok_or(EndpointError::PeerNotFound(*addr))?
+                    match self.inner.get_connection(addr) {
+                        Ok(Some(c)) => c,
+                        Ok(None) => {
+                            warn!(
+                                "endpoint-send-probe: peer-not-found (fresh lookup) for {} ({} bytes attempted)",
+                                addr,
+                                data.len()
+                            );
+                            return Err(EndpointError::PeerNotFound(*addr));
+                        }
+                        Err(e) => {
+                            warn!(
+                                "endpoint-send-probe: nat-traversal-lookup-error for {}: {}",
+                                addr, e
+                            );
+                            return Err(EndpointError::NatTraversal(e));
+                        }
+                    }
                 };
 
                 // Log connection state before attempting to open stream
@@ -2727,6 +2756,11 @@ impl P2pEndpoint {
                 }
 
                 debug!("Sent {} bytes to {} via QUIC", data.len(), addr);
+                info!(
+                    "endpoint-send-probe: sent OK {} bytes to {}",
+                    data.len(),
+                    addr
+                );
             }
             crate::transport::ProtocolEngine::Constrained => {
                 // Check if we have an established constrained connection for this address
