@@ -3048,6 +3048,30 @@ impl P2pEndpoint {
 
         let abort_handle = self.reader_tasks.lock().await.spawn(async move {
             info!("Reader task STARTED for {}", addr);
+            let task_start = Instant::now();
+
+            // transport-probe: silent-connection detector.
+            //
+            // wait_for_peer_identity (saorsa-core) times out when the app-level
+            // identity-announce message never arrives. At this layer, the
+            // identity-announce is delivered as an incoming unidirectional
+            // stream. If the peer never opens any stream within 5 s we log
+            // that fact at info level so a caller trying to diagnose a stuck
+            // connection can distinguish "peer is alive and sending to us"
+            // from "peer never sent anything on this connection".
+            //
+            // The task aborts on first incoming data so the log only fires
+            // for truly silent connections.
+            let silent_probe = {
+                let addr_for_probe = addr;
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    info!(
+                        "transport-probe: no streams from {} after 5s (connection silent)",
+                        addr_for_probe
+                    );
+                })
+            };
 
             // Ensure the connection is in the NatTraversalEndpoint's DashMap
             // so the send path can find it. This is critical for NAT-traversed
@@ -3059,6 +3083,7 @@ impl P2pEndpoint {
                 Err(e) => warn!("Reader task: add_connection FAILED for {}: {:?}", addr, e),
             }
 
+            let mut first_stream_seen = false;
             loop {
                 // Accept the next unidirectional stream
                 let mut recv_stream = match connection.accept_uni().await {
@@ -3068,6 +3093,16 @@ impl P2pEndpoint {
                         break;
                     }
                 };
+
+                if !first_stream_seen {
+                    first_stream_seen = true;
+                    silent_probe.abort();
+                    info!(
+                        "transport-probe: first stream from {} after {:?}",
+                        addr,
+                        task_start.elapsed()
+                    );
+                }
 
                 let data = match recv_stream.read_to_end(max_read_bytes).await {
                     Ok(data) if data.is_empty() => continue,
