@@ -1034,35 +1034,46 @@ impl P2pEndpoint {
         // and can serve as a NAT traversal coordinator.
         self.inner.set_can_coordinate(&addr, true);
 
-        // Spawn handler (we initiated the connection = Client side)
-        self.inner
-            .spawn_connection_handler(addr, connection, Side::Client, TraversalMethod::Direct)
-            .map_err(EndpointError::NatTraversal)?;
+        // Spawn the reader task before anything else: accepts incoming streams
+        // so no data is lost during setup. This has to come before
+        // `connected_peers.insert` (reader-before-insert recv-race guard) and
+        // before `spawn_connection_handler` (which fires
+        // NatTraversalEvent::ConnectionEstablished and can cause consumers to
+        // start sending to this peer immediately).
+        if let Ok(Some(conn)) = self.inner.get_connection(&addr) {
+            self.spawn_reader_task(addr, conn).await;
+        }
 
-        // Create peer connection record
-        // v0.2: Peer is authenticated via TLS (ML-DSA-65) during handshake
+        // Create peer connection record.
+        // v0.2: Peer is authenticated via TLS (ML-DSA-65) during handshake.
         let peer_conn = PeerConnection {
             public_key: remote_public_key.clone(),
             remote_addr: TransportAddr::Quic(addr),
             traversal_method: TraversalMethod::Direct,
             side: Side::Client,
-            authenticated: true, // TLS handles authentication
+            authenticated: true,
             connected_at: Instant::now(),
             last_activity: Instant::now(),
         };
 
-        // Spawn background reader task BEFORE storing peer in connected_peers
-        // This prevents a race where recv() called immediately after connect()
-        // returns might miss early data if the peer sends before the task starts
-        if let Ok(Some(conn)) = self.inner.get_connection(&addr) {
-            self.spawn_reader_task(addr, conn).await;
-        }
-
-        // Store peer (reader task is already running, so no data loss window)
+        // Register the peer in `connected_peers` BEFORE spawning the
+        // connection handler. `spawn_connection_handler` fires
+        // NatTraversalEvent::ConnectionEstablished, which this endpoint's
+        // own listener (see line ~731) forwards as P2pEvent::PeerConnected.
+        // Consumers like saorsa-core's connection_lifecycle_monitor send
+        // data back on receipt of that event (identity-announce being the
+        // canonical example). If we spawn the handler first, the consumer
+        // can race ahead of the insert below and hit `PeerNotFound` on
+        // `P2pEndpoint::send` — see findings.md Finding 9.
         self.connected_peers
             .write()
             .await
             .insert(addr, peer_conn.clone());
+
+        // Spawn handler (we initiated the connection = Client side)
+        self.inner
+            .spawn_connection_handler(addr, connection, Side::Client, TraversalMethod::Direct)
+            .map_err(EndpointError::NatTraversal)?;
 
         // Update stats
         {
@@ -1072,7 +1083,10 @@ impl P2pEndpoint {
             stats.direct_connections += 1;
         }
 
-        // Broadcast event (we initiated the connection = Client side)
+        // Broadcast event (we initiated the connection = Client side).
+        // This is a duplicate of the emission the line-731 listener does
+        // in response to NatTraversalEvent::ConnectionEstablished, but
+        // both fire after the insert so consumers see a consistent state.
         let _ = self.event_tx.send(P2pEvent::PeerConnected {
             addr: TransportAddr::Quic(addr),
             public_key: remote_public_key,
@@ -2070,10 +2084,10 @@ impl P2pEndpoint {
         // Direct outbound connection succeeded -- peer is publicly reachable
         self.inner.set_can_coordinate(&addr, true);
 
-        // Spawn connection handler (Client side - we initiated)
-        self.inner
-            .spawn_connection_handler(addr, connection, Side::Client, TraversalMethod::Direct)
-            .map_err(EndpointError::NatTraversal)?;
+        // Spawn reader task before anything else (recv-race guard).
+        if let Ok(Some(conn)) = self.inner.get_connection(&addr) {
+            self.spawn_reader_task(addr, conn).await;
+        }
 
         let peer_conn = PeerConnection {
             public_key: remote_public_key.clone(),
@@ -2085,15 +2099,19 @@ impl P2pEndpoint {
             last_activity: Instant::now(),
         };
 
-        // Spawn reader task before storing peer to prevent data loss race
-        if let Ok(Some(conn)) = self.inner.get_connection(&addr) {
-            self.spawn_reader_task(addr, conn).await;
-        }
-
+        // Register BEFORE spawn_connection_handler so the
+        // NatTraversalEvent::ConnectionEstablished listener at line ~731
+        // can't race us by broadcasting P2pEvent::PeerConnected before
+        // connected_peers has the entry. See findings.md Finding 9.
         self.connected_peers
             .write()
             .await
             .insert(addr, peer_conn.clone());
+
+        // Spawn connection handler (Client side - we initiated)
+        self.inner
+            .spawn_connection_handler(addr, connection, Side::Client, TraversalMethod::Direct)
+            .map_err(EndpointError::NatTraversal)?;
 
         {
             let mut stats = self.stats.write().await;
@@ -2382,9 +2400,10 @@ impl P2pEndpoint {
             .add_connection(target, connection.clone())
             .map_err(EndpointError::NatTraversal)?;
 
-        self.inner
-            .spawn_connection_handler(target, connection, Side::Client, TraversalMethod::Relay)
-            .map_err(EndpointError::NatTraversal)?;
+        // Spawn reader task first (recv-race guard).
+        if let Ok(Some(conn)) = self.inner.get_connection(&target) {
+            self.spawn_reader_task(target, conn).await;
+        }
 
         let peer_conn = PeerConnection {
             public_key: remote_public_key,
@@ -2396,16 +2415,18 @@ impl P2pEndpoint {
             last_activity: Instant::now(),
         };
 
-        // Spawn background reader task
-        if let Ok(Some(conn)) = self.inner.get_connection(&target) {
-            self.spawn_reader_task(target, conn).await;
-        }
-
-        // Store peer connection
+        // Register BEFORE spawn_connection_handler (see findings.md Finding 9).
+        // This path has no manual P2pEvent::PeerConnected emission — it
+        // relies on the NatTraversalEvent forwarder at line ~731 — which
+        // makes the ordering even more important here.
         self.connected_peers
             .write()
             .await
             .insert(target, peer_conn.clone());
+
+        self.inner
+            .spawn_connection_handler(target, connection, Side::Client, TraversalMethod::Relay)
+            .map_err(EndpointError::NatTraversal)?;
 
         info!(
             "MASQUE relay connection succeeded to {} via {}",
@@ -2447,30 +2468,22 @@ impl P2pEndpoint {
                 // Extract public key from TLS handshake
                 let remote_public_key = extract_public_key_bytes_from_connection(&connection);
 
-                // They initiated the connection to us = Server side
-                if let Err(e) = self.inner.spawn_connection_handler(
-                    remote_addr,
-                    connection,
-                    Side::Server,
-                    TraversalMethod::Direct,
-                ) {
-                    error!("Failed to spawn connection handler: {}", e);
-                    return None;
-                }
-
                 // v0.2: Peer is authenticated via TLS (ML-DSA-65) during handshake
                 let peer_conn = PeerConnection {
                     public_key: remote_public_key.clone(),
                     remote_addr: TransportAddr::Quic(remote_addr),
                     traversal_method: TraversalMethod::Direct,
                     side: Side::Server,
-                    authenticated: true, // TLS handles authentication
+                    authenticated: true,
                     connected_at: Instant::now(),
                     last_activity: Instant::now(),
                 };
 
-                // Spawn background reader task BEFORE storing in connected_peers
-                // to prevent race where recv() misses early data
+                // Spawn background reader task before registering the peer
+                // (recv-race guard: catch any early streams). On the accept
+                // path the inner NatTraversal DashMap is populated by
+                // `accept_connection_direct` itself, so `get_connection`
+                // returns the live connection here.
                 match self.inner.get_connection(&remote_addr) {
                     Ok(Some(conn)) => {
                         info!("accept: spawning reader task for {}", remote_addr);
@@ -2490,15 +2503,36 @@ impl P2pEndpoint {
                     }
                 }
 
+                // Register the peer in connected_peers BEFORE
+                // spawn_connection_handler so the
+                // NatTraversalEvent::ConnectionEstablished listener at
+                // line ~731 cannot broadcast P2pEvent::PeerConnected to a
+                // consumer that then tries to send back here and hits
+                // `PeerNotFound`. See findings.md Finding 9.
                 self.connected_peers
                     .write()
                     .await
                     .insert(remote_addr, peer_conn.clone());
 
+                // They initiated the connection to us = Server side
+                if let Err(e) = self.inner.spawn_connection_handler(
+                    remote_addr,
+                    connection,
+                    Side::Server,
+                    TraversalMethod::Direct,
+                ) {
+                    error!("Failed to spawn connection handler: {}", e);
+                    // Roll back the connected_peers insert so stale state
+                    // doesn't linger if the handler rejected this connection.
+                    self.connected_peers.write().await.remove(&remote_addr);
+                    return None;
+                }
+
                 // Stats are recorded by the event_callback when
                 // spawn_connection_handler emits ConnectionEstablished.
 
-                // They initiated the connection to us = Server side
+                // Duplicate of the listener's emission — safe now that the
+                // insert preceded both.
                 let _ = self.event_tx.send(P2pEvent::PeerConnected {
                     addr: TransportAddr::Quic(remote_addr),
                     public_key: remote_public_key,
