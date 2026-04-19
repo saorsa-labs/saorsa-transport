@@ -4233,6 +4233,10 @@ impl NatTraversalEndpoint {
 
         if should_emit {
             let public_key = Self::extract_public_key_from_connection(&connection);
+            info!(
+                "dedup-probe: ConnectionEstablished EMITTED for {} (side={:?}, method={:?})",
+                addr, side, traversal_method
+            );
             let _ = event_tx.send(NatTraversalEvent::ConnectionEstablished {
                 remote_address,
                 side,
@@ -4240,6 +4244,16 @@ impl NatTraversalEndpoint {
                 public_key,
             });
             self.incoming_notify.notify_one();
+        } else {
+            // Every time this fires, the peer's downstream handlers
+            // (identity-announce send, ConnectionRouter registration, etc.)
+            // are skipped for this new connection object because their
+            // driver event never ran. Correlate with the client's
+            // identity-exchange-probe timeouts to confirm the causal chain.
+            warn!(
+                "dedup-probe: ConnectionEstablished SUPPRESSED for {} (addr already in emitted_events; side={:?}, method={:?})",
+                addr, side, traversal_method
+            );
         }
 
         // Spawn connection monitoring task
