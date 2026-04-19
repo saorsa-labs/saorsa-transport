@@ -21,7 +21,7 @@
 //!
 //! | Profile | Bandwidth | MTU | RTT | Use Case |
 //! |---------|-----------|-----|-----|----------|
-//! | `broadband()` | 100 Mbps | 1200 | 50ms | UDP/IP |
+//! | `broadband()` | 100 Mbps | 1500 | 50ms | UDP/IP |
 //! | `ble()` | 125 kbps | 244 | 100ms | Bluetooth LE |
 //! | `lora_long_range()` | 293 bps | 222 | 5s | LoRa SF12 |
 //! | `lora_fast()` | 22 kbps | 222 | 500ms | LoRa SF7 |
@@ -146,10 +146,12 @@ impl TransportCapabilities {
     /// High-bandwidth, low-latency UDP/IP transport
     ///
     /// Typical for Internet connectivity over Ethernet, WiFi, or mobile data.
+    /// MTU reflects the standard Ethernet frame size (1500 B); QUIC's own
+    /// per-connection MTU discovery still probes the actual path.
     pub fn broadband() -> Self {
         Self {
             bandwidth_bps: 100_000_000, // 100 Mbps
-            mtu: 1200,
+            mtu: 1500,
             typical_rtt: Duration::from_millis(50),
             max_rtt: Duration::from_secs(5),
             half_duplex: false,

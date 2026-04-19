@@ -9,6 +9,16 @@ use std::{fmt, sync::Arc};
 
 use crate::{Duration, INITIAL_MTU, MAX_UDP_PAYLOAD, VarInt, VarIntBoundsExceeded, congestion};
 
+/// Starting MTU for PLPMTUD when no application override is given.
+///
+/// Sized to fit comfortably inside a standard 1500 B Ethernet frame while
+/// leaving headroom for common tunnelling overhead (PPPoE, WireGuard, IPv6
+/// in IPv4). PLPMTUD probes upward from here toward
+/// [`MtuDiscoveryConfig::upper_bound`] on paths that allow it, and
+/// black-hole detection falls back to [`TransportConfig::min_mtu`] (the
+/// RFC 9000 1200 B floor) if the path turns out to be smaller.
+const DEFAULT_INITIAL_MTU: u16 = 1350;
+
 /// Parameters governing the core QUIC state machine
 ///
 /// Default values should be suitable for most internet applications. Applications protocols which
@@ -493,7 +503,7 @@ impl Default for TransportConfig {
             packet_threshold: 3,
             time_threshold: 9.0 / 8.0,
             initial_rtt: Duration::from_millis(333), // per spec, intentionally distinct from EXPECTED_RTT
-            initial_mtu: INITIAL_MTU,
+            initial_mtu: DEFAULT_INITIAL_MTU,
             min_mtu: INITIAL_MTU,
             mtu_discovery_config: Some(MtuDiscoveryConfig::default()),
             pad_to_mtu: false,
