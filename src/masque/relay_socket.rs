@@ -28,20 +28,23 @@
 //! channels rather than unbounded ones.  The receiver path gets natural
 //! backpressure from `Sender::send().await` in the reader task: if
 //! Quinn stops consuming, the reader stalls on the channel and QUIC
-//! flow control eventually pauses the peer.  The sender path drops
-//! outbound packets when the channel is full — this mirrors UDP's
-//! lossy semantics and is the only safe behaviour, because Quinn calls
-//! `try_send` synchronously and cannot be awaited.  Reliable QUIC
-//! streams retransmit on loss, so dropped packets are not fatal.
+//! flow control eventually pauses the peer.  The sender path propagates
+//! backpressure up into Quinn: when the send channel is full,
+//! `try_send` returns [`io::ErrorKind::WouldBlock`] and the
+//! [`TunnelPoller`] blocks on a [`Notify`] until the stream writer
+//! task drains an item and frees a slot.  This preserves the
+//! reliable-stream invariant of the MASQUE tunnel — packets are never
+//! silently dropped — at the cost of pausing the inner Quinn endpoint
+//! when the tunnel cannot keep up.
 
 use bytes::Bytes;
 use parking_lot::Mutex as PlMutex;
 use std::fmt;
+use std::future::Future;
 use std::io::{self, IoSliceMut};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::sync::{Notify, mpsc};
@@ -104,10 +107,12 @@ pub struct MasqueRelaySocket {
     /// Bounded channel for outbound packets (drained by the background
     /// writer task into the relay send stream).
     send_tx: mpsc::Sender<Bytes>,
-    /// Count of outbound packets dropped because `send_tx` was full.
-    /// Surfaced only through tracing so operators can see when the
-    /// relay stream cannot keep up with offered load.
-    dropped_sends: AtomicU64,
+    /// Notified once after every item the writer task drains from
+    /// `send_tx`.  Pollers parked on a full queue re-check capacity
+    /// after each notification.  `notify_one` is used (not
+    /// `notify_waiters`) so a drain that races with a poller entering
+    /// the wait state stores a permit, avoiding lost wakeups.
+    send_capacity_freed: Arc<Notify>,
     /// The original socket is kept alive so the relay connection's own
     /// QUIC traffic (keepalives, ACKs, stream data) continues to flow
     /// directly.  Without this reference the OS may reclaim the socket.
@@ -118,7 +123,7 @@ impl fmt::Debug for MasqueRelaySocket {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MasqueRelaySocket")
             .field("relay_public_addr", &self.relay_public_addr)
-            .field("dropped_sends", &self.dropped_sends.load(Ordering::Relaxed))
+            .field("send_capacity", &self.send_tx.capacity())
             .finish()
     }
 }
@@ -158,12 +163,13 @@ impl MasqueRelaySocket {
         let (send_tx, mut send_rx) = mpsc::channel::<Bytes>(SEND_QUEUE_CAPACITY);
         let (recv_tx, recv_rx) = mpsc::channel::<(Bytes, SocketAddr)>(RECV_QUEUE_CAPACITY);
         let closed = Arc::new(Notify::new());
+        let send_capacity_freed = Arc::new(Notify::new());
 
         let socket = Arc::new(Self {
             relay_public_addr,
             recv_rx: PlMutex::new(recv_rx),
             send_tx: send_tx.clone(),
-            dropped_sends: AtomicU64::new(0),
+            send_capacity_freed: Arc::clone(&send_capacity_freed),
             _original_socket: original_socket,
         });
 
@@ -226,8 +232,17 @@ impl MasqueRelaySocket {
         });
 
         // Background task: write queued outbound packets to relay stream.
+        let writer_capacity = Arc::clone(&send_capacity_freed);
         tokio::spawn(async move {
             while let Some(encoded) = send_rx.recv().await {
+                // `recv` completing means the channel just freed a
+                // slot.  Wake any poller parked on full-queue
+                // backpressure before proceeding with the (potentially
+                // slow) stream write — so the Quinn endpoint can start
+                // assembling the next packet concurrently with this
+                // frame going out on the wire.
+                writer_capacity.notify_one();
+
                 let frame_len = encoded.len() as u32;
                 if let Err(e) = send_stream.write_all(&frame_len.to_be_bytes()).await {
                     tracing::debug!(error = %e, "MasqueRelaySocket: stream write error (length)");
@@ -242,6 +257,15 @@ impl MasqueRelaySocket {
                     }
                 }
             }
+            // Writer exited (stream error or receiver dropped). Dropping
+            // `send_rx` closes the channel so subsequent `try_send`
+            // calls fail fast with `Closed` instead of filling a queue
+            // that nobody will drain. Wake any poller currently parked
+            // on `send_capacity_freed`: it will re-check, observe the closed
+            // channel via `is_closed`, and surface the failure instead
+            // of waiting forever.
+            drop(send_rx);
+            writer_capacity.notify_waiters();
         });
 
         // Background task: periodic keepalive pings.
@@ -266,26 +290,30 @@ impl MasqueRelaySocket {
         (socket, closed)
     }
 
-    /// Number of outbound packets dropped because the send queue was
-    /// saturated (exposed for tests and metrics).
-    pub fn dropped_send_count(&self) -> u64 {
-        self.dropped_sends.load(Ordering::Relaxed)
+    /// Remaining capacity in the outbound send channel.  Exposed for
+    /// tests and metrics — a sustained value of 0 means the tunnel
+    /// stream can't keep up with Quinn's offered load and the poller
+    /// is serialising sends.
+    pub fn send_capacity(&self) -> usize {
+        self.send_tx.capacity()
     }
 
-    /// Internal helper: enqueue an already-encoded outbound frame with
-    /// UDP-style drop-on-overflow semantics.
+    /// Internal helper: enqueue an already-encoded outbound frame.
+    ///
+    /// Returns [`io::ErrorKind::WouldBlock`] when the send channel is
+    /// full so the Quinn UDP driver re-polls
+    /// [`UdpPoller::poll_writable`] instead of dropping the packet.
+    /// This preserves the reliable-stream invariant of the MASQUE
+    /// tunnel — packets never silently disappear — at the cost of
+    /// pausing the inner Quinn endpoint until the stream writer
+    /// drains a slot.
     fn enqueue_outbound(&self, encoded: Bytes) -> io::Result<()> {
         match self.send_tx.try_send(encoded) {
             Ok(()) => Ok(()),
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                // Drop the packet — consistent with a kernel UDP socket
-                // whose send buffer is full.  Quinn's reliable streams
-                // will retransmit; unreliable datagrams are expected to
-                // tolerate loss.
-                self.dropped_sends.fetch_add(1, Ordering::Relaxed);
-                tracing::trace!("MasqueRelaySocket: send queue full, dropping packet");
-                Ok(())
-            }
+            Err(mpsc::error::TrySendError::Full(_)) => Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "relay send queue full",
+            )),
             Err(mpsc::error::TrySendError::Closed(_)) => Err(io::Error::new(
                 io::ErrorKind::ConnectionAborted,
                 "relay stream closed",
@@ -296,9 +324,10 @@ impl MasqueRelaySocket {
 
 impl AsyncUdpSocket for MasqueRelaySocket {
     fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
-        // We use drop-on-overflow rather than backpressure for the send
-        // path (see module-level docs), so the poller is always ready.
-        Box::pin(TunnelPoller)
+        Box::pin(TunnelPoller {
+            socket: self,
+            wait: None,
+        })
     }
 
     fn try_send(&self, transmit: &Transmit) -> io::Result<()> {
@@ -413,13 +442,86 @@ impl AsyncUdpSocket for MasqueRelaySocket {
 
 /// Poller for the tunnel socket.
 ///
-/// The tunnel drops on overflow rather than applying backpressure (see
-/// module-level docs), so this immediately returns `Ready`.
-#[derive(Debug)]
-struct TunnelPoller;
+/// Backpressure model: when the outbound send channel is full,
+/// [`poll_writable`](UdpPoller::poll_writable) parks on the socket's
+/// `send_capacity_freed` [`Notify`] and wakes when the stream writer drains
+/// a slot.  Each wake re-checks remaining capacity because multiple
+/// pollers may race against the same notification and because the
+/// keepalive task can refill the slot before we observe it.
+///
+/// The inner `wait` future captures an `Arc<MasqueRelaySocket>` so it
+/// owns its own keep-alive reference to the `Notify`; the boxed future
+/// is kept alive across polls (following the same pattern as
+/// `UdpPollHelper` in `high_level::runtime`) so the registered waker
+/// is not lost between calls.
+struct TunnelPoller {
+    socket: Arc<MasqueRelaySocket>,
+    wait: Option<Pin<Box<dyn Future<Output = ()> + Send + Sync>>>,
+}
+
+impl fmt::Debug for TunnelPoller {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TunnelPoller")
+            .field("socket", &self.socket)
+            .field("waiting", &self.wait.is_some())
+            .finish()
+    }
+}
 
 impl UdpPoller for TunnelPoller {
-    fn poll_writable(self: Pin<&mut Self>, _cx: &mut Context) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
+    fn poll_writable(self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
+        // `TunnelPoller` is `Unpin` (all fields are `Unpin`), so we can
+        // freely take `&mut self` out of the `Pin`.
+        let this = self.get_mut();
+
+        // Fast path: capacity is available right now, or the channel
+        // is closed (writer task exited — return Ready so Quinn
+        // attempts a `try_send`, which surfaces the failure as
+        // `ConnectionAborted`).
+        if this.socket.send_tx.capacity() > 0 || this.socket.send_tx.is_closed() {
+            this.wait = None;
+            return Poll::Ready(Ok(()));
+        }
+
+        // Slow path: park on the `send_capacity_freed` notify and re-check
+        // capacity after each wake.  The future is created once and
+        // kept alive until it resolves, so the waker registered via
+        // `Notified::enable()` survives across polls — discarding the
+        // future after each poll would deregister the waker and lead
+        // to lost wakeups.
+        let fut = this.wait.get_or_insert_with(|| {
+            let socket = Arc::clone(&this.socket);
+            Box::pin(async move {
+                loop {
+                    // Register interest BEFORE re-checking capacity.
+                    // If the writer task calls `notify_one` between our
+                    // last check and `enable`, `enable` stashes the
+                    // permit and the subsequent `.await` returns
+                    // immediately.
+                    let notified = socket.send_capacity_freed.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+
+                    if socket.send_tx.capacity() > 0 || socket.send_tx.is_closed() {
+                        return;
+                    }
+                    notified.await;
+                    if socket.send_tx.capacity() > 0 || socket.send_tx.is_closed() {
+                        return;
+                    }
+                    // Spurious wake (e.g., another poller consumed the
+                    // freed slot before we saw it).  Loop and wait for
+                    // the next drain.
+                }
+            })
+        });
+
+        match fut.as_mut().poll(cx) {
+            Poll::Ready(()) => {
+                this.wait = None;
+                Poll::Ready(Ok(()))
+            }
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
