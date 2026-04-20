@@ -4185,11 +4185,12 @@ impl NatTraversalEndpoint {
                     let remote_address = connection.remote_address();
                     info!("Accepted connection from {} (unified path)", remote_address);
 
-                    // Only insert if no existing LIVE connection to this address.
-                    // Unconditionally overwriting would replace a working connection
-                    // with a duplicate that may die shortly, leaving the DashMap
-                    // pointing at a dead connection while the original's reader
-                    // task still runs.
+                    // Only insert into `connections` if no existing LIVE
+                    // connection is keyed at this address. Unconditionally
+                    // overwriting would replace a working connection with a
+                    // duplicate that may die shortly, leaving the DashMap
+                    // pointing at a dead connection while the original's
+                    // reader task still runs.
                     // Check both raw and normalized forms (IPv4-mapped IPv6).
                     let normalized_remote = crate::shared::normalize_socket_addr(remote_address);
                     let has_live = |addr: &std::net::SocketAddr| -> bool {
@@ -4198,12 +4199,41 @@ impl NatTraversalEndpoint {
                             .is_some_and(|e| e.value().close_reason().is_none())
                     };
                     if has_live(&remote_address) || has_live(&normalized_remote) {
+                        // Symmetric P2P + port-preserving NAT collapses every
+                        // outbound from the same NAT'd peer onto one
+                        // (src_ip, src_port) tuple, so the remote can end up
+                        // dialing a second QUIC connection to us with the
+                        // same remote_address as an existing one — for
+                        // example to open a CONNECT-UDP bidi stream for
+                        // proactive relay acquisition against a fresh
+                        // connection. Quinn distinguishes these via
+                        // Connection IDs, but our `connections` map is keyed
+                        // by remote address, so we can hold only one.
+                        //
+                        // Keep the existing connection as the canonical DHT
+                        // path and attach a relay request handler to the
+                        // new one so its CONNECT-UDP streams can be served.
+                        // The new connection is not added to `connections`
+                        // and is not emitted as `ConnectionEstablished`; it
+                        // lives as long as the handler (and thus the peer)
+                        // keeps it open, then drops naturally on idle
+                        // timeout. Previously we force-closed it with
+                        // `b"duplicate"`, which made proactive relay
+                        // acquisition fail with "connection lost" mid-
+                        // handshake and kept NAT'd peers from ever publishing
+                        // a Relay address.
                         info!(
-                            "accept_loop: {} already has a live connection, keeping existing",
+                            "accept_loop: {} already has a live connection, \
+                             attaching relay handler to the new connection \
+                             without replacing the existing entry",
                             remote_address
                         );
-                        connection.close(0u32.into(), b"duplicate");
-                        return; // exit this handshake task
+                        Self::spawn_relay_handler_task(
+                            &relay_server2,
+                            &relay_handler_connections2,
+                            &connection,
+                        );
+                        return; // new connection is not tracked in `connections`
                     }
                     connections2.insert(remote_address, connection.clone());
 
@@ -4794,11 +4824,22 @@ impl NatTraversalEndpoint {
                             .is_some_and(|e| e.value().close_reason().is_none())
                     };
                     if has_live(&remote_address) || has_live(&normalized_remote) {
+                        // See the matching comment in the unified accept loop:
+                        // a duplicate-remote connection is expected when the
+                        // peer opens a second QUIC session for proactive
+                        // relay acquisition. Serve its CONNECT-UDP bidi
+                        // streams on a fresh handler instead of force-closing.
                         info!(
-                            "relay accept_loop: {} already has a live connection, keeping existing",
+                            "relay accept_loop: {} already has a live connection, \
+                             attaching relay handler to the new connection \
+                             without replacing the existing entry",
                             remote_address
                         );
-                        connection.close(0u32.into(), b"duplicate");
+                        Self::spawn_relay_handler_task(
+                            &relay_server2,
+                            &relay_handler_connections2,
+                            &connection,
+                        );
                         return;
                     }
                     connections2.insert(remote_address, connection.clone());
