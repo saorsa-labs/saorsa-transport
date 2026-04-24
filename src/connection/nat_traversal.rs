@@ -2157,7 +2157,7 @@ impl NatTraversalState {
     fn sort_and_reindex_pairs(&mut self) {
         // Sort pairs by priority (highest first) - use unstable sort for better performance
         self.candidate_pairs
-            .sort_unstable_by(|a, b| b.priority.cmp(&a.priority));
+            .sort_unstable_by_key(|b| std::cmp::Reverse(b.priority));
 
         // Rebuild index after sorting - since pairs are sorted by priority (highest first),
         // we iterate in reverse to ensure the HIGHEST priority pair for each remote_addr
@@ -2390,7 +2390,7 @@ impl NatTraversalState {
             .map(|(k, v)| (*k, v))
             .collect();
         // Sort by priority (higher priority first)
-        candidates.sort_by(|a, b| b.1.priority.cmp(&a.1.priority));
+        candidates.sort_by_key(|b| std::cmp::Reverse(b.1.priority));
         candidates
     }
 
@@ -3233,13 +3233,10 @@ impl NatTraversalState {
                         }
                     }
                 }
-                CoordinationPhase::Preparing => {
-                    // Check if it's time to start punching
-                    if now >= coord.punch_start {
-                        debug!("Starting coordinated hole punching");
-                        coord.state = CoordinationPhase::Punching;
-                        actions.push(TimeoutAction::StartValidation);
-                    }
+                CoordinationPhase::Preparing if now >= coord.punch_start => {
+                    debug!("Starting coordinated hole punching");
+                    coord.state = CoordinationPhase::Punching;
+                    actions.push(TimeoutAction::StartValidation);
                 }
                 CoordinationPhase::Punching | CoordinationPhase::Validating => {
                     let timeout_at = coord.round_start + coord.timeout_state.get_timeout();
