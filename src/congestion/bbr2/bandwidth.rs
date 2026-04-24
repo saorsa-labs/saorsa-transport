@@ -143,11 +143,10 @@ impl Bandwidth {
     }
 
     pub fn transfer_time(&self, bytes: usize) -> Duration {
-        if self.bits_per_second == 0 {
-            Duration::ZERO
-        } else {
-            Duration::from_nanos((bytes as u64 * 8 * NUM_NANOS_PER_SECOND) / self.bits_per_second)
-        }
+        (bytes as u64 * 8 * NUM_NANOS_PER_SECOND)
+            .checked_div(self.bits_per_second)
+            .map(Duration::from_nanos)
+            .unwrap_or(Duration::ZERO)
     }
 
     pub fn to_bytes_per_period(self, time_period: Duration) -> u64 {
