@@ -244,11 +244,27 @@ impl Endpoint {
         self.pending_peer_address_updates.drain(..)
     }
 
-    /// Set the peer ID for an existing connection
-    pub fn set_connection_peer_id(&mut self, connection_handle: ConnectionHandle, peer_id: PeerId) {
+    /// Set the peer ID for an existing connection.
+    ///
+    /// Returns `true` when the peer ID was newly assigned (or changed) on the
+    /// connection, and `false` when the connection already had this peer ID
+    /// (or no such connection exists). This lets callers skip duplicate work
+    /// — notably duplicate log emissions when the dual-stack adapter
+    /// re-registers the same peer through both v4 and v6 socket forms.
+    pub fn set_connection_peer_id(
+        &mut self,
+        connection_handle: ConnectionHandle,
+        peer_id: PeerId,
+    ) -> bool {
         if let Some(connection) = self.connections.get_mut(connection_handle.0) {
+            if connection.peer_id == Some(peer_id) {
+                return false;
+            }
             connection.peer_id = Some(peer_id);
             self.register_peer(peer_id, connection_handle);
+            true
+        } else {
+            false
         }
     }
 

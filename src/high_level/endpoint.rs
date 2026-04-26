@@ -321,12 +321,14 @@ impl Endpoint {
             // Find the connection handle for this address
             let handle = state.inner.connection_handle_for_addr(&addr);
             if let Some(ch) = handle {
-                state.inner.set_connection_peer_id(ch, peer_id);
-                tracing::info!(
-                    "Registered peer ID {} for connection {} at low-level endpoint",
-                    hex::encode(&peer_id.0[..8]),
-                    addr
-                );
+                let changed = state.inner.set_connection_peer_id(ch, peer_id);
+                if changed {
+                    tracing::debug!(
+                        "Registered peer ID {} for connection {} at low-level endpoint",
+                        hex::encode(&peer_id.0[..8]),
+                        addr
+                    );
+                }
             } else {
                 tracing::debug!(
                     "No connection handle found for {} — peer ID not registered",
