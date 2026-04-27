@@ -129,7 +129,7 @@ igd-next = { version = "0.17", default-features = false, features = ["aio_tokio"
 
 # BLE transport dependencies (cross-platform, optional)
 # btleplug supports Linux (BlueZ), macOS (Core Bluetooth), and Windows (WinRT)
-btleplug = { version = "0.11", optional = true }
+btleplug = { version = "0.12", optional = true }
 
 # Essential dependencies (formerly production-ready)
 rcgen = { version = "0.14" }
