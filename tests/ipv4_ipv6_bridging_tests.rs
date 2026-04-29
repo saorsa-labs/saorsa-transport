@@ -23,7 +23,6 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use bytes::Bytes;
-use saorsa_transport::bootstrap_cache::{CachedPeer, PeerCapabilities};
 use saorsa_transport::masque::{
     ConnectUdpRequest, MasqueRelayConfig, MasqueRelayServer, RelayManager, RelayManagerConfig,
 };
@@ -49,58 +48,6 @@ fn dual_stack_relay_config() -> MasqueRelayConfig {
         require_authentication: false, // Simplified for tests
         ..Default::default()
     }
-}
-
-// ============================================================================
-// PROOF LEVEL 1: Unit Tests - PeerCapabilities dual-stack
-// ============================================================================
-
-#[test]
-fn test_peer_capabilities_dual_stack_detection() {
-    let mut caps = PeerCapabilities::default();
-
-    // Default should not have dual-stack
-    assert!(
-        !caps.supports_dual_stack(),
-        "Default should not support dual-stack"
-    );
-
-    // After adding both IPv4 and IPv6 addresses, should detect dual-stack
-    caps.external_addresses.push(ipv4_addr(9000));
-    caps.external_addresses.push(ipv6_addr(9001));
-
-    assert!(
-        caps.supports_dual_stack(),
-        "Should detect dual-stack from addresses"
-    );
-}
-
-#[test]
-fn test_peer_capabilities_ipv4_only() {
-    let mut caps = PeerCapabilities::default();
-    caps.external_addresses.push(ipv4_addr(9000));
-    caps.external_addresses.push(ipv4_addr(9001));
-
-    assert!(
-        !caps.supports_dual_stack(),
-        "IPv4-only should not be dual-stack"
-    );
-    assert!(caps.has_ipv4(), "Should have IPv4");
-    assert!(!caps.has_ipv6(), "Should not have IPv6");
-}
-
-#[test]
-fn test_peer_capabilities_ipv6_only() {
-    let mut caps = PeerCapabilities::default();
-    caps.external_addresses.push(ipv6_addr(9000));
-    caps.external_addresses.push(ipv6_addr(9001));
-
-    assert!(
-        !caps.supports_dual_stack(),
-        "IPv6-only should not be dual-stack"
-    );
-    assert!(!caps.has_ipv4(), "Should not have IPv4");
-    assert!(caps.has_ipv6(), "Should have IPv6");
 }
 
 // ============================================================================
@@ -332,32 +279,6 @@ async fn test_relay_manager_fallback_to_chaining() {
 }
 
 // ============================================================================
-// PROOF LEVEL 6: Bootstrap Cache Dual-Stack Integration
-// ============================================================================
-
-#[tokio::test]
-#[ignore] // TODO: Implement BootstrapCache relay selection
-async fn test_bootstrap_cache_prefers_dual_stack_relay() {
-    // TODO: Implement when BootstrapCache has add_peer and select_relay_for_cross_version
-    // use saorsa_transport::bootstrap_cache::{BootstrapCache, BootstrapCacheConfig};
-    // use tempfile::tempdir;
-    //
-    // let dir = tempdir().unwrap();
-    // let config = BootstrapCacheConfig::builder().cache_dir(dir.path()).build();
-    // let cache = BootstrapCache::open(config).await.unwrap();
-    //
-    // let ipv4_peer = create_test_peer(ipv4_addr(9600), false);
-    // cache.add_peer(ipv4_peer).await;
-    //
-    // let dual_stack_peer = create_test_peer_dual_stack(ipv4_addr(9601), ipv6_addr(9601));
-    // cache.add_peer(dual_stack_peer).await;
-    //
-    // let selected = cache.select_relay_for_cross_version(ipv6_addr(20000)).await;
-    // assert!(selected.is_some());
-    // assert!(selected.unwrap().capabilities.supports_dual_stack());
-}
-
-// ============================================================================
 // PROOF LEVEL 7: Load Test (30 seconds)
 // ============================================================================
 
@@ -410,50 +331,4 @@ async fn test_sustained_bridging_load_30s() {
         "Success rate {:.2}% should be >= 99%",
         success_rate
     );
-}
-
-// ============================================================================
-// Test Helpers
-// ============================================================================
-
-#[allow(dead_code)]
-fn create_test_peer(addr: SocketAddr, dual_stack: bool) -> CachedPeer {
-    use saorsa_transport::bootstrap_cache::PeerSource;
-
-    let external_addresses = if dual_stack {
-        vec![
-            addr,
-            match addr {
-                SocketAddr::V4(_) => ipv6_addr(addr.port()),
-                SocketAddr::V6(_) => ipv4_addr(addr.port()),
-            },
-        ]
-    } else {
-        vec![addr]
-    };
-
-    let mut peer = CachedPeer::new(addr, vec![addr], PeerSource::Seed);
-    peer.capabilities = PeerCapabilities {
-        supports_relay: true,
-        supports_coordination: true,
-        external_addresses,
-        ..PeerCapabilities::default()
-    };
-    peer.quality_score = 0.8;
-    peer
-}
-
-#[allow(dead_code)]
-fn create_test_peer_dual_stack(v4: SocketAddr, v6: SocketAddr) -> CachedPeer {
-    use saorsa_transport::bootstrap_cache::PeerSource;
-
-    let mut peer = CachedPeer::new(v4, vec![v4, v6], PeerSource::Seed);
-    peer.capabilities = PeerCapabilities {
-        supports_relay: true,
-        supports_coordination: true,
-        external_addresses: vec![v4, v6],
-        ..PeerCapabilities::default()
-    };
-    peer.quality_score = 0.9; // Higher score for dual-stack
-    peer
 }

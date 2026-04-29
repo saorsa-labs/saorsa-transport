@@ -817,12 +817,6 @@ pub enum LinkEvent {
         /// Coordination round number.
         round: u64,
     },
-
-    /// The bootstrap cache has been updated.
-    BootstrapCacheUpdated {
-        /// Number of peers in the cache.
-        peer_count: usize,
-    },
 }
 
 // ============================================================================

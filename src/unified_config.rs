@@ -27,7 +27,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 // v0.2: AuthConfig removed - TLS handles peer authentication via ML-DSA-65
-use crate::bootstrap_cache::BootstrapCacheConfig;
 use crate::config::nat_timeouts::TimeoutConfig;
 use crate::crypto::pqc::PqcConfig;
 use crate::crypto::pqc::types::{MlDsaPublicKey, MlDsaSecretKey};
@@ -78,9 +77,6 @@ pub struct P2pConfig {
     /// If `None`, a fresh keypair is generated on startup.
     /// Provide this for persistent identity across restarts.
     pub keypair: Option<(MlDsaPublicKey, MlDsaSecretKey)>,
-
-    /// Bootstrap cache configuration
-    pub bootstrap_cache: BootstrapCacheConfig,
 
     /// Transport registry for multi-transport support
     ///
@@ -296,7 +292,6 @@ impl Default for P2pConfig {
             mtu: MtuConfig::default(),
             stats_interval: Duration::from_secs(30),
             keypair: None,
-            bootstrap_cache: BootstrapCacheConfig::default(),
             transport_registry: TransportRegistry::new(),
             data_channel_capacity: Self::DEFAULT_DATA_CHANNEL_CAPACITY,
             max_message_size: Self::DEFAULT_MAX_MESSAGE_SIZE,
@@ -377,7 +372,6 @@ pub struct P2pConfigBuilder {
     mtu: Option<MtuConfig>,
     stats_interval: Option<Duration>,
     keypair: Option<(MlDsaPublicKey, MlDsaSecretKey)>,
-    bootstrap_cache: Option<BootstrapCacheConfig>,
     transport_registry: Option<TransportRegistry>,
     data_channel_capacity: Option<usize>,
     max_message_size: Option<usize>,
@@ -637,12 +631,6 @@ impl P2pConfigBuilder {
         Ok(self)
     }
 
-    /// Set bootstrap cache configuration
-    pub fn bootstrap_cache(mut self, config: BootstrapCacheConfig) -> Self {
-        self.bootstrap_cache = Some(config);
-        self
-    }
-
     /// Add a single transport provider to the registry
     ///
     /// This method can be called multiple times to add multiple providers.
@@ -736,7 +724,6 @@ impl P2pConfigBuilder {
             mtu: self.mtu.unwrap_or_default(),
             stats_interval: self.stats_interval.unwrap_or(Duration::from_secs(30)),
             keypair: self.keypair,
-            bootstrap_cache: self.bootstrap_cache.unwrap_or_default(),
             transport_registry: self.transport_registry.unwrap_or_default(),
             data_channel_capacity: self
                 .data_channel_capacity
