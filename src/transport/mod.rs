@@ -77,42 +77,53 @@
 // Sub-modules
 mod addr;
 mod capabilities;
+#[cfg(feature = "native")]
 mod provider;
 
 // Transport provider implementations
+#[cfg(feature = "native")]
 mod udp;
 
 #[cfg(feature = "ble")]
+#[cfg(feature = "native")]
 mod ble;
 
 // Re-export core QUIC types for backward compatibility
+#[cfg(feature = "native")]
 pub use crate::connection::{
     Connection as QuicConnection, ConnectionError, ConnectionStats, Event as ConnectionEvent,
     FinishError, PathStats, ReadError, RecvStream, SendStream, ShouldTransmit, StreamEvent,
     Streams, WriteError,
 };
 
+#[cfg(feature = "native")]
 pub use crate::endpoint::{
     AcceptError, ConnectError, ConnectionHandle, Endpoint as QuicEndpoint, Incoming,
 };
 
+#[cfg(feature = "native")]
 pub use crate::shared::{ConnectionId, EcnCodepoint};
+#[cfg(feature = "native")]
 pub use crate::transport_error::{Code as TransportErrorCode, Error as TransportError};
+#[cfg(feature = "native")]
 pub use crate::transport_parameters;
 
 // Re-export transport abstraction types
-pub use addr::{LoRaParams, TransportAddr, TransportType};
+pub use addr::{LoRaParams, TransportAddr, TransportType, WebRtcCertificateHash, WebRtcDirectAddr};
 pub use capabilities::{BandwidthClass, TransportCapabilities, TransportCapabilitiesBuilder};
+#[cfg(feature = "native")]
 pub use provider::{
     InboundDatagram, LinkQuality, ProtocolEngine, TransportDiagnostics,
     TransportError as ProviderError, TransportProvider, TransportRegistry, TransportStats,
 };
 
 // Re-export UDP transport provider
+#[cfg(feature = "native")]
 pub use udp::UdpTransport;
 
 // Re-export BLE transport provider when feature is enabled
 #[cfg(feature = "ble")]
+#[cfg(feature = "native")]
 pub use ble::{
     BleConfig, BleConnection, BleConnectionState, BleTransport, CCCD_DISABLE,
     CCCD_ENABLE_INDICATION, CCCD_ENABLE_NOTIFICATION, CCCD_UUID, CharacteristicHandle,
@@ -133,6 +144,7 @@ pub use ble::{
 /// let registry = default_registry("0.0.0.0:0").await?;
 /// assert!(registry.has_quic_capable_transport());
 /// ```
+#[cfg(feature = "native")]
 pub async fn default_registry(bind_addr: &str) -> Result<TransportRegistry, std::io::Error> {
     use std::sync::Arc;
 
@@ -151,7 +163,9 @@ pub async fn default_registry(bind_addr: &str) -> Result<TransportRegistry, std:
     Ok(registry)
 }
 
+#[cfg(feature = "native")]
 #[cfg(test)]
+#[cfg(feature = "native")]
 mod tests {
     use super::*;
     use std::net::SocketAddr;

@@ -16,6 +16,8 @@
 //! ```text
 //! /ip4/<ipv4>/udp/<port>/quic
 //! /ip6/<ipv6>/udp/<port>/quic
+//! /ip4/<ipv4>/udp/<port>/webrtc-direct/certhash/<multihash>
+//! /ip6/<ipv6>/udp/<port>/webrtc-direct/certhash/<multihash>
 //! /ip4/<ipv4>/tcp/<port>
 //! /ip6/<ipv6>/tcp/<port>
 //! /ip4/<ipv4>/udp/<port>
@@ -38,12 +40,19 @@ use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
 
 use anyhow::{Result, anyhow};
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+const SHA2_256_MULTIHASH_CODE: u8 = 0x12;
+const SHA2_256_MULTIHASH_LENGTH: u8 = 32;
 
 /// Transport type identifier for routing and capability matching.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TransportType {
     /// QUIC over UDP — primary Saorsa transport
     Quic,
+    /// Browser-compatible WebRTC Direct over UDP, DTLS, SCTP, and DataChannels.
+    WebRtcDirect,
     /// Plain TCP
     Tcp,
     /// Raw UDP (no QUIC)
@@ -70,6 +79,7 @@ impl fmt::Display for TransportType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Quic => write!(f, "QUIC"),
+            Self::WebRtcDirect => write!(f, "WebRTC Direct"),
             Self::Tcp => write!(f, "TCP"),
             Self::Udp => write!(f, "UDP"),
             Self::Bluetooth => write!(f, "Bluetooth"),
@@ -81,6 +91,140 @@ impl fmt::Display for TransportType {
             Self::I2p => write!(f, "I2P"),
             Self::Yggdrasil => write!(f, "Yggdrasil"),
         }
+    }
+}
+
+/// A stable SHA-256 DTLS-certificate digest encoded as a multiaddr `certhash` value.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct WebRtcCertificateHash([u8; 32]);
+
+impl WebRtcCertificateHash {
+    /// Construct a certificate hash from a SHA-256 digest.
+    #[must_use]
+    pub const fn new(digest: [u8; 32]) -> Self {
+        Self(digest)
+    }
+
+    /// Return the raw SHA-256 digest used to authenticate the DTLS certificate.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl From<[u8; 32]> for WebRtcCertificateHash {
+    fn from(digest: [u8; 32]) -> Self {
+        Self::new(digest)
+    }
+}
+
+impl fmt::Display for WebRtcCertificateHash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut multihash = [0_u8; 34];
+        multihash[0] = SHA2_256_MULTIHASH_CODE;
+        multihash[1] = SHA2_256_MULTIHASH_LENGTH;
+        multihash[2..].copy_from_slice(&self.0);
+        write!(f, "u{}", URL_SAFE_NO_PAD.encode(multihash))
+    }
+}
+
+impl fmt::Debug for WebRtcCertificateHash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("WebRtcCertificateHash")
+            .field(&self.to_string())
+            .finish()
+    }
+}
+
+impl FromStr for WebRtcCertificateHash {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        let encoded = value
+            .strip_prefix('u')
+            .ok_or_else(|| anyhow!("Certificate multihash must use base64url multibase ('u')"))?;
+        let decoded = URL_SAFE_NO_PAD
+            .decode(encoded)
+            .map_err(|_| anyhow!("Certificate multihash is not valid unpadded base64url"))?;
+        if decoded.len() != 34
+            || decoded[0] != SHA2_256_MULTIHASH_CODE
+            || decoded[1] != SHA2_256_MULTIHASH_LENGTH
+        {
+            return Err(anyhow!(
+                "Certificate multihash must contain a 32-byte SHA-256 digest"
+            ));
+        }
+        let digest: [u8; 32] = decoded[2..]
+            .try_into()
+            .map_err(|_| anyhow!("Certificate multihash digest has the wrong length"))?;
+        Ok(Self(digest))
+    }
+}
+
+/// Validated WebRTC Direct endpoint carried by [`TransportAddr`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct WebRtcDirectAddr {
+    socket_addr: SocketAddr,
+    certificate_hash: WebRtcCertificateHash,
+}
+
+impl WebRtcDirectAddr {
+    /// Construct an endpoint from a literal IP address, UDP port, and stable certificate pin.
+    pub fn new(socket_addr: SocketAddr, certificate_hash: WebRtcCertificateHash) -> Result<Self> {
+        if matches!(socket_addr, SocketAddr::V6(addr) if addr.scope_id() != 0 || addr.flowinfo() != 0)
+        {
+            return Err(anyhow!(
+                "WebRTC Direct addresses cannot encode IPv6 scope or flow information"
+            ));
+        }
+        if socket_addr.port() == 0 {
+            return Err(anyhow!("WebRTC Direct UDP port must not be zero"));
+        }
+        Ok(Self {
+            socket_addr,
+            certificate_hash,
+        })
+    }
+
+    /// Literal IP address advertised to browser clients.
+    #[must_use]
+    pub const fn ip(&self) -> IpAddr {
+        self.socket_addr.ip()
+    }
+
+    /// UDP port used by ICE, DTLS, SCTP, and DataChannels.
+    #[must_use]
+    pub const fn port(&self) -> u16 {
+        self.socket_addr.port()
+    }
+
+    /// Stable SHA-256 DTLS certificate pin.
+    #[must_use]
+    pub const fn certificate_hash(&self) -> WebRtcCertificateHash {
+        self.certificate_hash
+    }
+
+    /// UDP socket address.
+    #[must_use]
+    pub const fn socket_addr(&self) -> SocketAddr {
+        self.socket_addr
+    }
+}
+
+impl fmt::Display for WebRtcDirectAddr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let protocol = if self.socket_addr.is_ipv4() {
+            "ip4"
+        } else {
+            "ip6"
+        };
+        write!(
+            f,
+            "/{protocol}/{}/udp/{}/webrtc-direct/certhash/{}",
+            self.ip(),
+            self.port(),
+            self.certificate_hash
+        )
     }
 }
 
@@ -133,6 +277,12 @@ impl Default for LoRaParams {
 pub enum TransportAddr {
     /// QUIC over UDP (primary Saorsa transport).
     Quic(SocketAddr),
+
+    /// Browser-compatible WebRTC Direct over UDP, DTLS, SCTP, and DataChannels.
+    ///
+    /// This is an advertised endpoint descriptor. Native Saorsa QUIC dialing
+    /// does not treat it as a directly dialable [`TransportAddr`].
+    WebRtcDirect(WebRtcDirectAddr),
 
     /// Plain TCP.
     Tcp(SocketAddr),
@@ -208,6 +358,7 @@ impl TransportAddr {
     pub fn transport_type(&self) -> TransportType {
         match self {
             Self::Quic(_) => TransportType::Quic,
+            Self::WebRtcDirect(_) => TransportType::WebRtcDirect,
             Self::Tcp(_) => TransportType::Tcp,
             Self::Udp(_) => TransportType::Udp,
             Self::Bluetooth { .. } => TransportType::Bluetooth,
@@ -260,8 +411,8 @@ impl TransportAddr {
         matches!(self, Self::Broadcast { .. })
     }
 
-    /// Returns the socket address for IP-based transports (`Quic`, `Tcp`, `Udp`),
-    /// `None` for non-IP transports.
+    /// Returns the socket address for native IP transports (`Quic`, `Tcp`, `Udp`).
+    /// Advertised WebRTC Direct endpoints and non-IP transports return `None`.
     pub fn as_socket_addr(&self) -> Option<SocketAddr> {
         match self {
             Self::Quic(a) | Self::Tcp(a) | Self::Udp(a) => Some(*a),
@@ -273,6 +424,7 @@ impl TransportAddr {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Quic(_) => "quic",
+            Self::WebRtcDirect(_) => "webrtc-direct",
             Self::Tcp(_) => "tcp",
             Self::Udp(_) => "udp",
             Self::Bluetooth { .. } => "bluetooth",
@@ -297,6 +449,7 @@ impl TransportAddr {
     pub fn to_synthetic_socket_addr(&self) -> SocketAddr {
         match self {
             Self::Quic(addr) | Self::Tcp(addr) | Self::Udp(addr) => *addr,
+            Self::WebRtcDirect(address) => address.socket_addr(),
             Self::Bluetooth { mac, channel } => {
                 let addr = Ipv6Addr::new(
                     0x2001,
@@ -411,6 +564,7 @@ impl TransportAddr {
             Self::Broadcast { transport_type } => {
                 let type_code = match transport_type {
                     TransportType::Quic => 0x0000,
+                    TransportType::WebRtcDirect => 0x000c,
                     TransportType::Tcp => 0x0009,
                     TransportType::Udp => 0x000A,
                     TransportType::Bluetooth => 0x0007,
@@ -442,6 +596,7 @@ impl fmt::Display for TransportAddr {
                 IpAddr::V4(ip) => write!(f, "/ip4/{}/udp/{}/quic", ip, addr.port()),
                 IpAddr::V6(ip) => write!(f, "/ip6/{}/udp/{}/quic", ip, addr.port()),
             },
+            Self::WebRtcDirect(address) => write!(f, "{address}"),
             Self::Tcp(addr) => match addr.ip() {
                 IpAddr::V4(ip) => write!(f, "/ip4/{}/tcp/{}", ip, addr.port()),
                 IpAddr::V6(ip) => write!(f, "/ip6/{}/tcp/{}", ip, addr.port()),
@@ -493,6 +648,7 @@ impl fmt::Display for TransportAddr {
             Self::Broadcast { transport_type } => {
                 let kind = match transport_type {
                     TransportType::Quic => "quic",
+                    TransportType::WebRtcDirect => "webrtc-direct",
                     TransportType::Tcp => "tcp",
                     TransportType::Udp => "udp",
                     TransportType::Bluetooth => "bluetooth",
@@ -518,6 +674,7 @@ impl fmt::Debug for TransportAddr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Quic(addr) => write!(f, "Quic({addr})"),
+            Self::WebRtcDirect(address) => write!(f, "WebRtcDirect({address})"),
             Self::Tcp(addr) => write!(f, "Tcp({addr})"),
             Self::Udp(addr) => write!(f, "Udp({addr})"),
             Self::Bluetooth { mac, channel } => {
@@ -623,6 +780,8 @@ fn parse_ip_addr(parts: &[&str], original: &str) -> Result<TransportAddr> {
                     ));
                 }
                 Ok(TransportAddr::Quic(addr))
+            } else if parts.len() >= 7 && parts[4] == "webrtc-direct" {
+                parse_webrtc_direct(addr, &parts[4..], original)
             } else if parts.len() == 4 {
                 Ok(TransportAddr::Udp(addr))
             } else {
@@ -635,6 +794,30 @@ fn parse_ip_addr(parts: &[&str], original: &str) -> Result<TransportAddr> {
             original
         )),
     }
+}
+
+fn parse_webrtc_direct(
+    socket_addr: SocketAddr,
+    suffix: &[&str],
+    original: &str,
+) -> Result<TransportAddr> {
+    if !original.starts_with('/') || original.ends_with('/') || original.contains("//") {
+        return Err(anyhow!(
+            "WebRTC Direct address must use canonical slash delimiters: {}",
+            original
+        ));
+    }
+    if suffix.len() != 3 || suffix[0] != "webrtc-direct" || suffix[1] != "certhash" {
+        return Err(anyhow!(
+            "WebRTC Direct address must contain exactly one /certhash component: {}",
+            original
+        ));
+    }
+    let certificate_hash = suffix[2].parse::<WebRtcCertificateHash>()?;
+    Ok(TransportAddr::WebRtcDirect(WebRtcDirectAddr::new(
+        socket_addr,
+        certificate_hash,
+    )?))
 }
 
 /// Parse `/bt/<MAC>/rfcomm/<channel>`.
@@ -769,6 +952,7 @@ fn parse_broadcast(parts: &[&str], original: &str) -> Result<TransportAddr> {
     }
     let transport_type = match parts[1] {
         "quic" => TransportType::Quic,
+        "webrtc-direct" => TransportType::WebRtcDirect,
         "tcp" => TransportType::Tcp,
         "udp" => TransportType::Udp,
         "bluetooth" => TransportType::Bluetooth,
@@ -992,6 +1176,69 @@ mod tests {
     }
 
     #[test]
+    fn test_display_roundtrip_webrtc_direct() {
+        let certificate_hash = WebRtcCertificateHash::new([0x11; 32]);
+        let endpoint = WebRtcDirectAddr::new(
+            SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 443),
+            certificate_hash,
+        )
+        .unwrap();
+        let addr = TransportAddr::WebRtcDirect(endpoint.clone());
+
+        let encoded = addr.to_string();
+        assert_eq!(encoded.matches("/certhash/").count(), 1);
+        assert_eq!(
+            encoded,
+            format!("/ip4/127.0.0.1/udp/443/webrtc-direct/certhash/{certificate_hash}")
+        );
+        assert_eq!(encoded.parse::<TransportAddr>().unwrap(), addr);
+        assert_eq!(endpoint.socket_addr(), "127.0.0.1:443".parse().unwrap());
+    }
+
+    #[test]
+    fn webrtc_direct_rejects_unrepresentable_ipv6_metadata() {
+        let hash = WebRtcCertificateHash::new([0x44; 32]);
+        for (flow, scope) in [(0, 3), (1, 0)] {
+            let addr = SocketAddr::V6(std::net::SocketAddrV6::new(
+                "fe80::1".parse().unwrap(),
+                443,
+                flow,
+                scope,
+            ));
+            assert!(WebRtcDirectAddr::new(addr, hash).is_err());
+        }
+    }
+
+    #[test]
+    fn test_webrtc_direct_rejects_dns_and_invalid_address_components() {
+        let hash = WebRtcCertificateHash::new([0x44; 32]);
+        let duplicate =
+            format!("/ip4/127.0.0.1/udp/443/webrtc-direct/certhash/{hash}/certhash/{hash}");
+
+        assert!(duplicate.parse::<TransportAddr>().is_err());
+        assert!(
+            "/ip4/127.0.0.1/udp/443/webrtc-direct"
+                .parse::<TransportAddr>()
+                .is_err()
+        );
+        assert!(
+            format!("/ip4/127.0.0.1/udp/0/webrtc-direct/certhash/{hash}")
+                .parse::<TransportAddr>()
+                .is_err()
+        );
+        assert!(
+            format!("/ip4/127.0.0.1/udp/443/webrtc-direct/certhash/{hash}/")
+                .parse::<TransportAddr>()
+                .is_err()
+        );
+        assert!(
+            format!("/dns/node.example/udp/443/webrtc-direct/certhash/{hash}")
+                .parse::<TransportAddr>()
+                .is_err()
+        );
+    }
+
+    #[test]
     fn test_display_roundtrip_bluetooth() {
         let addr = TransportAddr::Bluetooth {
             mac: [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
@@ -1072,6 +1319,7 @@ mod tests {
     #[test]
     fn test_transport_type_display() {
         assert_eq!(format!("{}", TransportType::Quic), "QUIC");
+        assert_eq!(format!("{}", TransportType::WebRtcDirect), "WebRTC Direct");
         assert_eq!(format!("{}", TransportType::Tcp), "TCP");
         assert_eq!(format!("{}", TransportType::Udp), "UDP");
         assert_eq!(format!("{}", TransportType::Bluetooth), "Bluetooth");

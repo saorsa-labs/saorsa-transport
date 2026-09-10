@@ -434,3 +434,24 @@ at your option.
 ## Security
 
 For security vulnerabilities, please email security@autonomi.com rather than filing a public issue.
+
+## Portable WASM surface
+
+`default-features = false` exposes the shared transport addresses and capability
+model on `wasm32-unknown-unknown`. The default `native` feature adds sockets,
+QUIC, certificate verification, discovery, and OS transport providers. Disabling
+default features on native targets now also disables that runtime; enable `native`
+explicitly when using the QUIC APIs without discovery defaults.
+
+The `webrtc` feature exposes `saorsa_transport::webrtc`, supplying the shared
+browser/native session and frame contract using saorsa-pqc. The `webrtc-direct`
+feature additionally enables the native listener in `webrtc::direct`. Its `chunk_protocol` frame carries native ant-protocol
+messages, allowing clients and nodes to reuse the same application handler.
+These frames allow 5 MiB for serialized requests/proofs; ordinary record frames
+retain their 4 MiB limit. Peers advertise this additive capability in HELLO.
+
+```sh
+cargo check --lib --no-default-features --target wasm32-unknown-unknown
+cargo check --lib --no-default-features --features webrtc --target wasm32-unknown-unknown
+cargo test --lib --no-default-features --features webrtc webrtc::
+```

@@ -1231,9 +1231,10 @@ impl ConnectionRouter {
     /// Get transport capabilities for an address type
     pub fn capabilities_for_addr(addr: &TransportAddr) -> TransportCapabilities {
         match addr {
-            TransportAddr::Quic(_) | TransportAddr::Tcp(_) | TransportAddr::Udp(_) => {
-                TransportCapabilities::broadband()
-            }
+            TransportAddr::Quic(_)
+            | TransportAddr::WebRtcDirect(_)
+            | TransportAddr::Tcp(_)
+            | TransportAddr::Udp(_) => TransportCapabilities::broadband(),
             TransportAddr::Bluetooth { .. } => TransportCapabilities::broadband(),
             TransportAddr::Ble { .. } => TransportCapabilities::ble(),
             TransportAddr::LoRa { .. } => TransportCapabilities::lora_long_range(),

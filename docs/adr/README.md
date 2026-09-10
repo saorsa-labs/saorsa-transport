@@ -24,6 +24,7 @@ ADRs document significant architectural decisions made in the project. Each reco
 | [ADR-012](ADR-012-keep-alive-dial-accept-split.md) | Keep-Alive on the Dialling Side Only | Proposed | 2026-08-14 |
 | [ADR-013](ADR-013-relay-tunnel-teardown-ordering.md) | Relay Tunnel Teardown Ordering and Failure Classification | Proposed | 2026-08-19 |
 | [ADR-014](ADR-014-accept-side-keep-alive-backstop.md) | Accept-Side Keep-Alive Backstop | Proposed | 2026-08-20 |
+| [ADR-015](ADR-015-direct-browser-webrtc.md) | Direct Browser Connections over WebRTC | Proposed | 2026-09-07 |
 
 ## ADR Template
 

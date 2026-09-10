@@ -40,6 +40,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
 
       - uses: Swatinem/rust-cache@v2
 
@@ -49,8 +50,14 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-features --lib --bins --examples -- -D warnings
 
+      - name: Clippy portable WebRTC profile
+        run: cargo clippy -p saorsa-transport --lib --no-default-features --features webrtc -- -D warnings
+
       - name: Build check
         run: cargo check --lib --bins --examples
+
+      - name: Build portable WebRTC profile for WASM
+        run: cargo check -p saorsa-transport --lib --no-default-features --features webrtc --target wasm32-unknown-unknown
 
   # Main test suite
   test:
@@ -76,6 +83,9 @@ jobs:
 
       - name: Run library tests
         run: cargo test --lib --all-features -- --test-threads=2
+
+      - name: Run portable WebRTC profile tests
+        run: cargo test -p saorsa-transport --lib --no-default-features --features webrtc webrtc::
 
       - name: Run integration tests
         run: |

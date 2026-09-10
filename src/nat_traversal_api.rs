@@ -6047,8 +6047,9 @@ impl NatTraversalEndpoint {
     ///
     /// This method broadcasts the transport address to all active connections
     /// using ADD_ADDRESS frames. For UDP transports, this falls back to the
-    /// standard socket address advertising. For other transports (BLE, LoRa, etc.),
-    /// the transport type and optional capability flags are included in the advertisement.
+    /// standard socket address advertising. Other transports return an error:
+    /// this API does not negotiate or transmit extended transport advertisements.
+    /// WebRTC endpoints are advertised through the application's peer records.
     ///
     /// # Arguments
     /// * `address` - The transport address to advertise
@@ -6095,31 +6096,11 @@ impl NatTraversalEndpoint {
             return Ok(());
         }
 
-        // For non-UDP transports, we need to store the transport candidate
-        // and advertise it via the extended ADD_ADDRESS frames
-        let candidate = TransportCandidate {
-            address: address.clone(),
-            priority,
-            source: CandidateSource::Local,
-            state: CandidateState::New,
-            capabilities,
-        };
-
-        info!(
-            "Advertising {:?} transport address with priority {} (capabilities: {:?})",
-            candidate.transport_type(),
-            priority,
-            capabilities
-        );
-
-        // For now, log the advertisement - full frame transmission for non-UDP
-        // transports will be implemented when we have multi-transport connections
-        debug!(
-            "Transport candidate registered: {:?}, capabilities: {:?}",
-            address, capabilities
-        );
-
-        Ok(())
+        let _ = capabilities;
+        Err(NatTraversalError::ConfigError(format!(
+            "transport advertisement is unsupported for {}; use the application's peer-record address plane",
+            address.transport_type()
+        )))
     }
 
     /// Advertise a transport address with full capability information
@@ -6258,6 +6239,7 @@ impl NatTraversalEndpoint {
         // Transport type bonus (0-10000)
         let transport_bonus = match candidate.transport_type() {
             TransportType::Quic => 10000,
+            TransportType::WebRtcDirect => 9750,
             TransportType::Tcp => 9500,
             TransportType::Udp => 9000,
             TransportType::Yggdrasil => 8000,

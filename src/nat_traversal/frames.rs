@@ -47,7 +47,9 @@ use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use crate::coding::{self, Codec};
-use crate::transport::{TransportAddr, TransportCapabilities, TransportType};
+use crate::transport::{
+    TransportAddr, TransportCapabilities, TransportType, WebRtcCertificateHash, WebRtcDirectAddr,
+};
 use crate::varint::VarInt;
 
 /// Compact capability flags for wire transmission in ADD_ADDRESS frames
@@ -514,6 +516,9 @@ const TRANSPORT_TYPE_TCP: u64 = 7;
 const TRANSPORT_TYPE_BLUETOOTH: u64 = 8;
 const TRANSPORT_TYPE_LORAWAN: u64 = 9;
 const TRANSPORT_TYPE_RAW_UDP: u64 = 10;
+// Value 11 belonged to the superseded WebTransport proof of concept. Do not
+// reinterpret persisted or in-flight WebTransport advertisements as WebRTC.
+const TRANSPORT_TYPE_WEBRTC_DIRECT: u64 = 12;
 
 impl Codec for AddAddress {
     fn decode<B: Buf>(buf: &mut B) -> coding::Result<Self> {
@@ -547,7 +552,8 @@ impl Codec for AddAddress {
             TRANSPORT_TYPE_BLUETOOTH => TransportType::Bluetooth,
             TRANSPORT_TYPE_LORAWAN => TransportType::LoRaWan,
             TRANSPORT_TYPE_RAW_UDP => TransportType::Udp,
-            _ => TransportType::Quic, // Unknown types fall back to QUIC
+            TRANSPORT_TYPE_WEBRTC_DIRECT => TransportType::WebRtcDirect,
+            _ => return Err(coding::UnexpectedEnd), // Unknown layouts cannot be safely skipped
         };
 
         // Decode transport-specific address
@@ -589,6 +595,7 @@ impl Codec for AddAddress {
                     _ => TransportAddr::Udp(sock),
                 }
             }
+            TransportType::WebRtcDirect => decode_webrtc_direct_address(buf)?,
             TransportType::Bluetooth => {
                 // Bluetooth: MAC (6 bytes) + channel (1 byte)
                 if buf.remaining() < 7 {
@@ -682,6 +689,7 @@ impl Codec for AddAddress {
         // Encode transport type (VarInt)
         let transport_type_raw = match self.transport_type {
             TransportType::Quic => TRANSPORT_TYPE_QUIC,
+            TransportType::WebRtcDirect => TRANSPORT_TYPE_WEBRTC_DIRECT,
             TransportType::Tcp => TRANSPORT_TYPE_TCP,
             TransportType::Udp => TRANSPORT_TYPE_RAW_UDP,
             TransportType::Bluetooth => TRANSPORT_TYPE_BLUETOOTH,
@@ -713,6 +721,9 @@ impl Codec for AddAddress {
                     }
                 }
                 buf.put_u16(socket_addr.port());
+            }
+            TransportAddr::WebRtcDirect(address) => {
+                encode_webrtc_direct_address(address, buf);
             }
             TransportAddr::Bluetooth { mac, channel } => {
                 buf.put_slice(mac);
@@ -773,6 +784,59 @@ impl Codec for AddAddress {
             }
         }
     }
+}
+
+fn decode_webrtc_direct_address<B: Buf>(buf: &mut B) -> coding::Result<TransportAddr> {
+    if buf.remaining() < 1 {
+        return Err(coding::UnexpectedEnd);
+    }
+    let address_type = buf.get_u8();
+    let ip = match address_type {
+        4 => {
+            if buf.remaining() < 4 {
+                return Err(coding::UnexpectedEnd);
+            }
+            let mut octets = [0_u8; 4];
+            buf.copy_to_slice(&mut octets);
+            IpAddr::V4(octets.into())
+        }
+        6 => {
+            if buf.remaining() < 16 {
+                return Err(coding::UnexpectedEnd);
+            }
+            let mut octets = [0_u8; 16];
+            buf.copy_to_slice(&mut octets);
+            IpAddr::V6(octets.into())
+        }
+        _ => return Err(coding::UnexpectedEnd),
+    };
+    if buf.remaining() < 34 {
+        return Err(coding::UnexpectedEnd);
+    }
+    let port = buf.get_u16();
+    let mut digest = [0_u8; 32];
+    buf.copy_to_slice(&mut digest);
+    let address = WebRtcDirectAddr::new(
+        SocketAddr::new(ip, port),
+        WebRtcCertificateHash::new(digest),
+    )
+    .map_err(|_| coding::UnexpectedEnd)?;
+    Ok(TransportAddr::WebRtcDirect(address))
+}
+
+fn encode_webrtc_direct_address<B: BufMut>(address: &WebRtcDirectAddr, buf: &mut B) {
+    match address.ip() {
+        IpAddr::V4(ip) => {
+            buf.put_u8(4);
+            buf.put_slice(&ip.octets());
+        }
+        IpAddr::V6(ip) => {
+            buf.put_u8(6);
+            buf.put_slice(&ip.octets());
+        }
+    }
+    buf.put_u16(address.port());
+    buf.put_slice(address.certificate_hash().as_bytes());
 }
 
 impl Codec for PunchMeNow {
@@ -972,6 +1036,34 @@ mod tests {
     }
 
     #[test]
+    fn test_add_address_webrtc_direct_roundtrip() {
+        let endpoint = WebRtcDirectAddr::new(
+            "203.0.113.7:443".parse().expect("valid socket address"),
+            WebRtcCertificateHash::new([0x11; 32]),
+        )
+        .expect("valid WebRTC Direct endpoint");
+        let original = AddAddress::new(12, 75, TransportAddr::WebRtcDirect(endpoint));
+
+        let mut buf = BytesMut::new();
+        Codec::encode(&original, &mut buf);
+        let decoded = AddAddress::decode(&mut buf.freeze()).expect("decode failed");
+
+        assert_eq!(decoded, original);
+        assert_eq!(decoded.transport_type, TransportType::WebRtcDirect);
+    }
+
+    #[test]
+    fn unknown_address_types_are_rejected_before_payload_decoding() {
+        for transport_type in [11u8, 13, 63] {
+            // A valid QUIC-shaped payload must not make an unknown type dialable.
+            let encoded = [1, 1, transport_type, 4, 127, 0, 0, 1, 1, 187, 0];
+            let mut remaining = &encoded[..];
+            assert!(AddAddress::decode(&mut remaining).is_err());
+            assert_eq!(remaining, &encoded[3..]);
+        }
+    }
+
+    #[test]
     fn test_add_address_ble_roundtrip() {
         let mac = [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC];
         let original = AddAddress::new(10, 200, TransportAddr::Ble { mac, psm: 128 });
@@ -1134,6 +1226,7 @@ mod tests {
         assert_eq!(TRANSPORT_TYPE_BLUETOOTH, 8);
         assert_eq!(TRANSPORT_TYPE_LORAWAN, 9);
         assert_eq!(TRANSPORT_TYPE_RAW_UDP, 10);
+        assert_eq!(TRANSPORT_TYPE_WEBRTC_DIRECT, 12);
     }
 
     #[test]

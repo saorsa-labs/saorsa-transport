@@ -39,23 +39,72 @@ exclude = [
 [features]
 # Default features include essential functionality with 100% PQC support
 # v0.15.0: Simplified feature flags - crypto is always enabled
-default = ["platform-verifier", "network-discovery", "upnp"]
+default = ["native", "platform-verifier", "network-discovery", "upnp"]
+
+# Native QUIC, sockets, OS integration, and background runtime.
+# Address parsing and transport capability descriptions remain portable.
+native = [
+    "dep:async-trait",
+    "dep:bytes",
+    "dep:enum_dispatch",
+    "dep:rustc-hash",
+    "dep:rand",
+    "dep:thiserror",
+    "dep:tinyvec",
+    "dep:tracing",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:serde_yaml",
+    "dep:x25519-dalek",
+    "dep:saorsa-pqc",
+    "saorsa-pqc/simd",
+    "dep:slab",
+    "dep:indexmap",
+    "dep:lru-slab",
+    "dep:dirs",
+    "dep:keyring",
+    "dep:rustls",
+    "dep:aws-lc-rs",
+    "dep:rustls-post-quantum",
+    "dep:rcgen",
+    "dep:tokio-util",
+    "dep:futures-util",
+    "dep:time",
+    "dep:rustls-pemfile",
+    "dep:uuid",
+    "dep:unicode-width",
+    "dep:hex",
+    "dep:blake3",
+    "dep:once_cell",
+    "dep:dashmap",
+    "dep:parking_lot",
+    "dep:zeroize",
+    "dep:clap",
+    "dep:reqwest",
+    "dep:tokio",
+    "dep:tracing-subscriber",
+    "dep:quinn-udp",
+    "dep:pin-project-lite",
+    "dep:regex",
+    "dep:chrono",
+    "dep:rustls-native-certs",
+]
 
 # Platform-specific certificate verification
-platform-verifier = ["dep:rustls-platform-verifier"]
+platform-verifier = ["native", "dep:rustls-platform-verifier"]
 
 # UPnP IGD port mapping for best-effort NAT traversal assistance.
 # When enabled, the endpoint will opportunistically request a UDP port
 # mapping from a local Internet Gateway Device. Failure is silent and
 # non-fatal — the endpoint behaves identically to a non-UPnP build when
 # no gateway is available.
-upnp = ["dep:igd-next"]
+upnp = ["native", "dep:igd-next"]
 
 # Configure `tracing` to log events via `log` if no `tracing` subscriber exists
 log = ["tracing/log"]
 
 # Enhanced network interface discovery
-network-discovery = ["dep:socket2", "dep:nix"]
+network-discovery = ["native", "dep:socket2", "dep:nix"]
 
 # Fuzzing/testing features
 arbitrary = ["dep:arbitrary"]
@@ -75,47 +124,62 @@ fuzzing = ["arbitrary"]
 # Enables Bluetooth Low Energy transport for short-range P2P
 # - Linux: Uses BlueZ via bluer crate
 # - macOS: Uses Core Bluetooth via btleplug crate
-ble = ["dep:btleplug"]
+ble = ["native", "dep:btleplug"]
+
+# Signaling-free WebRTC DataChannel listener for direct browser clients.
+# The feature is optional so QUIC-only users do not pull in ICE/DTLS/SCTP.
+webrtc-direct = ["native", "webrtc", "dep:stun", "dep:webrtc-stack", "dep:webrtc-rcgen", "dep:x509-parser"]
+
+# Shared browser/native wire profile and post-quantum application session.
+# Does not enable the native QUIC or WebRTC socket runtimes.
+webrtc = [
+    "dep:saorsa-pqc", "dep:blake3", "dep:chacha20poly1305", "dep:hex",
+    "dep:serde", "dep:serde_bytes", "dep:serde_json",
+    "dep:thiserror", "dep:zeroize",
+]
 
 [dependencies]
+chacha20poly1305 = { version = "0.10.1", default-features = false, features = ["alloc"], optional = true }
+serde_bytes = { version = "0.11", optional = true }
 # Core dependencies
-async-trait = "0.1"
-bytes = ">=1.11.1"
-enum_dispatch = "0.3"
-rustc-hash = "2"
-rand = "0.8"
-thiserror = "2.0.3"
-tinyvec = { version = "1.1", features = ["alloc"] }
-tracing = { version = "0.1.10", default-features = false, features = ["std", "attributes", "log"] }
+async-trait = { version = "0.1", optional = true }
+base64 = "0.22"
+bytes = { version = ">=1.11.1", optional = true }
+enum_dispatch = { version = "0.3", optional = true }
+rustc-hash = { version = "2", optional = true }
+rand = { version = "0.8", optional = true }
+thiserror = { version = "2.0.3", optional = true }
+tinyvec = { version = "1.1", features = ["alloc"], optional = true }
+tracing = { version = "0.1.10", default-features = false, features = ["std", "attributes", "log"], optional = true }
 
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-serde_yaml = "0.9"
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+serde_yaml = { version = "0.9", optional = true }
 # Ed25519 removed in v0.2.0+ - Pure PQC uses ML-DSA-65 only
-x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+x25519-dalek = { version = "2.0", features = ["static_secrets"], optional = true }
 
 # Post-Quantum Cryptography - required in v0.12.0+
-saorsa-pqc = { version = "0.5" }
+saorsa-pqc = { version = "0.5", git = "https://github.com/saorsa-labs/saorsa-pqc", rev = "6d57e9dd73d537182fe85b0050e809a224f21154", default-features = false, optional = true }
 
 # Data structures
-slab = "0.4.11"
-indexmap = "2.0"
+slab = { version = "0.4.11", optional = true }
+indexmap = { version = "2.0", optional = true }
 
-lru-slab = "0.1.2"
+lru-slab = { version = "0.1.2", optional = true }
 
 # Bootstrap cache dependencies
-dirs = "6.0"
+dirs = { version = "6.0", optional = true }
 
 # Platform keychain/keyring for secure credential storage
-keyring = "3"
+keyring = { version = "3", optional = true }
 
 # Crypto dependencies (required for PQC)
-rustls = { version = "0.23.35", default-features = false, features = ["std", "aws-lc-rs"] }
-aws-lc-rs = { version = "1.12", default-features = false, features = ["unstable", "aws-lc-sys", "prebuilt-nasm"] }
+rustls = { version = "0.23.35", default-features = false, features = ["std", "aws-lc-rs"], optional = true }
+aws-lc-rs = { version = "1.12", default-features = false, features = ["unstable", "aws-lc-sys", "prebuilt-nasm"], optional = true }
 rustls-platform-verifier = { version = "0.7", optional = true }
 # PQC crypto - required in v0.12.0+
 # v0.2: aws-lc-rs-unstable enables ML-DSA-65 signatures
-rustls-post-quantum = { version = "0.2", features = ["aws-lc-rs-unstable"] }
+rustls-post-quantum = { version = "0.2", features = ["aws-lc-rs-unstable"], optional = true }
 
 # Network discovery dependencies (optional)
 socket2 = { version = "0.6", optional = true, features = ["all"] }
@@ -132,27 +196,34 @@ igd-next = { version = "0.17", default-features = false, features = ["aio_tokio"
 btleplug = { version = "0.11", optional = true }
 
 # Essential dependencies (formerly production-ready)
-rcgen = { version = "0.14" }
-tokio-util = { version = "0.7" }
-futures-util = { version = "0.3" }
+rcgen = { version = "0.14" , optional = true }
+tokio-util = { version = "0.7" , optional = true }
+futures-util = { version = "0.3" , optional = true }
 
-time = { version = "0.3.47" }
-rustls-pemfile = { version = "2.0" }
+# Browser transport primitives. Saorsa owns the transport API and wire
+# profile; these crates provide the standardized ICE/DTLS/SCTP machinery.
+stun = { version = "0.7", optional = true }
+webrtc-stack = { package = "webrtc", version = "0.14", features = ["pem"], optional = true }
+webrtc-rcgen = { package = "rcgen", version = "0.13", optional = true }
+x509-parser = { version = "0.18", optional = true }
+
+time = { version = "0.3.47" , optional = true }
+rustls-pemfile = { version = "2.0" , optional = true }
 
 # Feature-specific dependencies (optional)
 arbitrary = { version = "1.3", optional = true, features = ["derive"] }
 qlog = { version = "0.13", optional = true }
 
 # Essential dependencies
-uuid = { version = "1.0", features = ["v4", "serde"] }
-unicode-width = "=0.2.2"  # Pinned to match ratatui's requirement
-hex = "0.4"
-blake3 = "1"
-once_cell = "1.21"
-dashmap = "6"
+uuid = { version = "1.0", features = ["v4", "serde"], optional = true }
+unicode-width = { version = "=0.2.2", optional = true } # Pinned to match ratatui
+hex = { version = "0.4", optional = true }
+blake3 = { version = "1", optional = true }
+once_cell = { version = "1.21", optional = true }
+dashmap = { version = "6", optional = true }
 # Faster mutexes that don't poison and have fair locking
-parking_lot = "0.12"
-zeroize = { version = "1.8", features = ["derive"] }
+parking_lot = { version = "0.12", optional = true }
+zeroize = { version = "1.8", features = ["derive"], optional = true }
 proptest = { version = "1.5", features = ["std"], optional = true }
 proptest-derive = { version = "0.8", optional = true }
 
@@ -160,17 +231,17 @@ proptest-derive = { version = "0.8", optional = true }
 
 # Dependencies for saorsa-transport binary
 anyhow = "1"
-clap = { version = "4", features = ["derive"] }
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
-tokio = { version = "1.28.1", features = ["full"] }
-tracing-subscriber = { version = "0.3.0", default-features = false, features = ["env-filter", "fmt", "ansi", "time", "local-time", "json"] }
-quinn-udp = { version = "0.6", features = ["tracing", "tracing-log"] }
-pin-project-lite = "0.2"
+clap = { version = "4", features = ["derive"], optional = true }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"], optional = true }
+tokio = { version = "1.28.1", features = ["full"], optional = true }
+tracing-subscriber = { version = "0.3.0", default-features = false, features = ["env-filter", "fmt", "ansi", "time", "local-time", "json"], optional = true }
+quinn-udp = { version = "0.6", features = ["tracing", "tracing-log"], optional = true }
+pin-project-lite = { version = "0.2", optional = true }
 
 # Compliance validator dependencies
-regex = "1.11"
-chrono = { version = "0.4", features = ["serde"] }
-rustls-native-certs = "0.8"
+regex = { version = "1.11", optional = true }
+chrono = { version = "0.4", features = ["serde"], optional = true }
+rustls-native-certs = { version = "0.8", optional = true }
 
 # Platform-specific target dependencies
 [target.'cfg(windows)'.dependencies]
@@ -223,21 +294,25 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)', 'cfg(wasm_brows
 
 # Main P2P binary with NAT traversal support
 [[bin]]
+required-features = ["native"]
 name = "saorsa-transport"
 path = "src/bin/saorsa-transport.rs"
 
 # Interoperability test runner
 [[bin]]
+required-features = ["native"]
 name = "interop-test"
 path = "src/bin/interop-test.rs"
 
 # Public endpoint tester
 [[bin]]
+required-features = ["native"]
 name = "test-public-endpoints"
 path = "src/bin/test_public_endpoints.rs"
 
 # E2E test node with metrics push and data verification
 [[bin]]
+required-features = ["native"]
 name = "e2e-test-node"
 path = "src/bin/e2e-test-node.rs"
 

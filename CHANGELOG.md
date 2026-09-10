@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- WebRTC Direct now interoperates with current Chromium DTLS ClientHello
+  messages that advertise an unsupported post-quantum hybrid group before
+  X25519/P-256/P-384. Updated `webrtc-rs` skips unknown named groups instead of
+  aborting the handshake.
+
 ### Breaking Changes
 
 - Token API unified on `token_v2`: `ServerConfig::token_key` now takes `token_v2::TokenKey`, and legacy HKDF token handling was removed.

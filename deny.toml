@@ -60,6 +60,11 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 # Ignore specific advisories (unmaintained warnings, not vulnerabilities)
 ignore = [
     "RUSTSEC-2025-0134", # rustls-pemfile - unmaintained, migrate to rustls-pki-types
+    # Optional webrtc 0.14 -> dtls 0.13 -> bincode 1.3.3. This is a maintenance
+    # advisory with no patched release, not a vulnerability. DTLS uses bincode
+    # only for state export/import, which Saorsa does not invoke. Track removal:
+    # https://github.com/WithAutonomi/saorsa-transport/issues/164
+    "RUSTSEC-2025-0141",
 ]
 
 [sources]
